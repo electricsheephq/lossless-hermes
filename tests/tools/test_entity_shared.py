@@ -334,12 +334,15 @@ class TestModuleSurface:
                 f"{name} is a sqlite3.Cursor — import-time side effect leaked"
             )
 
-    def test_exports_only_the_two_names_via_package(self) -> None:
+    def test_exports_the_two_names_via_package(self) -> None:
         # The package-level re-export from `lossless_hermes.tools`
-        # must expose the same pair, no more.
+        # must expose both names. (Originally asserted "only these two"
+        # via equality — relaxed in PR #72 merge once TypeBox helpers +
+        # TOOL_SCHEMAS registry joined the package per ADR-016.)
         import lossless_hermes.tools as pkg
 
-        assert sorted(pkg.__all__) == ["VISIBLE_MENTIONS_CTE", "entity_agg_cte"]
+        assert "VISIBLE_MENTIONS_CTE" in pkg.__all__
+        assert "entity_agg_cte" in pkg.__all__
         assert pkg.VISIBLE_MENTIONS_CTE is VISIBLE_MENTIONS_CTE
         assert pkg.entity_agg_cte is entity_agg_cte
 
