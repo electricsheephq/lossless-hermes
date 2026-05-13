@@ -89,10 +89,11 @@ invariant explicitly.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Sequence
+from typing import Any, Final, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from lossless_hermes.estimate_tokens import estimate_tokens
@@ -125,7 +126,17 @@ __all__ = [
     "format_summary_content",
     "resolve_fresh_tail_ordinal",
     "EMPTY_FRESH_TAIL_ORDINAL",
+    "tokenize_text",
+    "score_relevance",
+    "has_searchable_prompt",
+    "budget_walk",
+    "SelectionMode",
 ]
+
+
+# Tokens used by the BM25-lite selection mode label. Matches the
+# ``selectionMode`` field of TS ``debug`` envelope (assembler.ts 1180).
+SelectionMode = Literal["full-fit", "prompt-aware", "chronological"]
 
 
 # ---------------------------------------------------------------------------
@@ -1303,3 +1314,507 @@ class ContextAssembler:
             text=summary.content,
             summary=summary,
         )
+
+
+# ---------------------------------------------------------------------------
+# BM25-lite relevance scorer (TS 1037-1080)
+# ---------------------------------------------------------------------------
+
+
+# Pre-compiled tokenizer pattern. The TS source builds a fresh RegExp on each
+# ``text.split(...)`` call; ``re.compile`` once at module load avoids paying
+# the compilation cost on the ~O(evictable_count * average_text_length)
+# tokenizer churn the budget walk inflicts during prompt-aware selection.
+# The pattern is a verbatim copy of the TS literal ``/[^a-z0-9]+/``.
+_TOKENIZE_SPLIT_RE: Final = re.compile(r"[^a-z0-9]+")
+
+
+def tokenize_text(text: str) -> list[str]:
+    """Tokenize ``text`` into lowercase alphanumeric terms.
+
+    Mirrors TS ``tokenizeText`` (``assembler.ts`` 1037-1042):
+
+    * Lowercase the entire input.
+    * Split on the regex ``/[^a-z0-9]+/`` — every contiguous run of
+      non-alphanumeric ASCII characters is a delimiter.
+    * Filter out tokens with length ``<= 1`` (the TS source uses
+      ``.length > 1``). This drops single-character noise like ``"i"``,
+      ``"a"``, plus the empty-string artifact that ``re.split`` emits
+      at the start/end of an all-delimiter string.
+
+    ### Why the length filter
+
+    BM25-lite's TF accumulator is normalized by ``len(item_tokens)``;
+    flooding the item-token set with single-character noise would
+    artificially deflate every per-term score. The TS source's
+    ``len > 1`` filter excludes both stop-words like ``"a"``/``"i"`` AND
+    the spurious empty string that ``"".split(re)`` and trailing
+    delimiters produce. We match that exact behavior.
+
+    ### Edge cases (parity with TS)
+
+    * Empty string → ``[]`` (the regex split returns ``[""]``; the
+      length filter strips it).
+    * Whitespace-only / all-punctuation string → ``[]`` (same path).
+    * Unicode letters (``"über"``, ``"café"``, CJK) → unsplittable by
+      ASCII regex, so the whole input passes through. The TS source
+      uses ``/[^a-z0-9]+/`` too — Unicode handling is identical
+      (mostly: it preserves the whole non-ASCII run as one token).
+      This is BM25-lite, not BM25 — accuracy on non-English text is
+      knowingly degraded.
+    * Numbers: ``"v3.1"`` → ``["v3", "1"]`` after length-filter →
+      ``["v3"]``; ``"auth2"`` survives intact.
+
+    Args:
+        text: The text to tokenize.
+
+    Returns:
+        A list of lowercase alphanumeric tokens, length-1+
+        characters each. Order matches the TS source (left-to-right).
+    """
+    # ``re.split`` on an empty string returns ``[""]`` (length 1). The
+    # length-filter below strips it, matching TS ``"".split(re).filter`` →
+    # ``[]``.
+    return [t for t in _TOKENIZE_SPLIT_RE.split(text.lower()) if len(t) > 1]
+
+
+def score_relevance(item_text: str, prompt: str) -> float:
+    """BM25-lite relevance score for ``item_text`` against ``prompt``.
+
+    Mirrors TS ``scoreRelevance`` (``assembler.ts`` 1049-1075). Computes a
+    normalized term-frequency overlap score using a simplified BM25 model:
+
+    1. Tokenize the prompt; return ``0.0`` if empty.
+    2. Tokenize the item; return ``0.0`` if empty.
+    3. Build a per-term frequency map of the item's tokens.
+    4. For each **unique** prompt term (deduped), if it appears in the
+       item, add ``item_freq[term] / len(item_tokens)`` to the score.
+
+    ### Why "BM25-lite", not BM25
+
+    Full BM25 multiplies TF by an IDF factor and applies saturation
+    (``k1``, ``b`` hyper-parameters). LCM's TS source intentionally
+    omits both — the eviction-mode use-case calls this on tiny corpora
+    (typically <100 evictable items, often <20) where IDF would be
+    statistically meaningless and saturation tuning is overkill. The
+    ``// BM25-lite saturation skipped for simplicity`` comment in the TS
+    source at line 1070 makes this explicit.
+
+    ### Float-precision parity with TS
+
+    TS's ``+=`` accumulator is identical to Python's; both languages
+    store doubles (IEEE 754). Order of summation matters because
+    floating-point addition is not associative. We preserve the TS
+    iteration order (left-to-right over ``prompt_tokens``, skipping
+    duplicates via a ``seen`` set) — this is the residual 90%-confidence
+    risk noted in the spec, mitigated in tests via tolerance bounds
+    rather than exact equality.
+
+    Args:
+        item_text: The item's plain-text rendering (
+            :attr:`ResolvedItem.text`).
+        prompt: The user's current query, used as the scoring corpus.
+
+    Returns:
+        A non-negative float. ``0.0`` when there is no overlap, the
+        prompt has no searchable terms, or the item has no searchable
+        terms. Higher values indicate stronger keyword overlap.
+
+    Examples:
+        >>> score_relevance("authentication login", "authentication")
+        0.5
+        >>> score_relevance("painting canvas", "authentication")
+        0.0
+        >>> score_relevance("", "anything") == score_relevance("anything", "")
+        True
+    """
+    # Match TS dispatch order: prompt-tokenize first, then item-tokenize.
+    # Both functions short-circuit on empty; reordering changes nothing
+    # observable, but preserves comment alignment for review parity.
+    prompt_tokens = tokenize_text(prompt)
+    if len(prompt_tokens) == 0:
+        return 0.0
+
+    item_tokens = tokenize_text(item_text)
+    if len(item_tokens) == 0:
+        return 0.0
+
+    # Build item TF map. ``dict.get(k, 0) + 1`` is the same pattern as
+    # TS's ``map.set(k, (map.get(k) ?? 0) + 1)``.
+    freq: dict[str, int] = {}
+    for term in item_tokens:
+        freq[term] = freq.get(term, 0) + 1
+
+    item_term_count = len(item_tokens)
+    seen: set[str] = set()
+    score = 0.0
+    for term in prompt_tokens:
+        # The dedup step matches TS line 1066-1067 — repeating "foo foo
+        # bar" in the prompt must score identically to "foo bar".
+        if term in seen:
+            continue
+        seen.add(term)
+        tf = freq.get(term, 0)
+        if tf > 0:
+            # Normalized TF: tf / item_term_count. The TS comment at
+            # line 1070 notes "BM25-lite saturation skipped for
+            # simplicity" — we mirror.
+            score += tf / item_term_count
+    return score
+
+
+def has_searchable_prompt(prompt: str | None) -> bool:
+    """Return ``True`` when ``prompt`` has at least one searchable token.
+
+    Mirrors TS ``hasSearchablePrompt`` (``assembler.ts`` 1078-1080). The
+    TS source uses a type-guard ``prompt is string`` predicate so the
+    compiler narrows ``input.prompt`` to ``string`` inside the
+    prompt-aware branch. Python has no equivalent narrowing; the
+    branch's caller (:func:`budget_walk`) just guards the
+    ``score_relevance`` call with this predicate.
+
+    The predicate enforces three conditions:
+
+    * ``prompt`` is a string (``None`` and non-string values fall back
+      to chronological mode).
+    * ``prompt`` is non-empty (empty string short-circuits).
+    * ``tokenize_text(prompt)`` yields ≥ 1 token (whitespace-only and
+      single-character-only strings fall back to chronological).
+
+    Args:
+        prompt: Optional user query string.
+
+    Returns:
+        ``True`` if BM25-lite scoring is safe to attempt;
+        ``False`` otherwise (caller must fall to chronological mode).
+    """
+    if not isinstance(prompt, str):
+        return False
+    # Short-circuit empty + whitespace-only without tokenizing — saves a
+    # regex split + lowercase pass on a hot path. The tokenizer length
+    # check still catches edge cases like ``"!!!"`` which is non-empty
+    # but yields zero tokens.
+    if len(prompt) == 0:
+        return False
+    return len(tokenize_text(prompt)) > 0
+
+
+# ---------------------------------------------------------------------------
+# Token-budget walk — three selection modes (TS 1160-1230)
+# ---------------------------------------------------------------------------
+
+
+def budget_walk(
+    evictable: Sequence[ResolvedItem],
+    fresh_tail: Sequence[ResolvedItem],
+    token_budget: int,
+    prompt: str | None,
+    prompt_aware_eviction: bool = True,
+) -> tuple[list[ResolvedItem], SelectionMode]:
+    """Select which evictable items to keep under ``token_budget``.
+
+    Mirrors TS ``assemble`` step-4 (``assembler.ts`` 1160-1230). The fresh
+    tail is **always** included by the caller — this function returns
+    only the kept *evictable* items plus the mode label. The caller is
+    expected to compose the final list as
+    ``kept_evictable + list(fresh_tail)`` in chronological order.
+
+    ### Three selection modes
+
+    #### 1. ``"full-fit"`` (TS 1181-1184)
+
+    When ``sum(item.tokens for item in evictable) <= remaining_budget``,
+    everything fits — return all evictable items in input (ordinal)
+    order. No scoring, no sorting, no walk.
+
+    Gate: ``evictable_total_tokens <= remaining_budget``. Boundary
+    case: equality is full-fit (the ``<=`` is load-bearing for the
+    "exactly-fits" property the spec calls out).
+
+    #### 2. ``"prompt-aware"`` (TS 1185-1209)
+
+    When ``prompt_aware_eviction`` is truthy AND
+    :func:`has_searchable_prompt` returns ``True`` AND the full-fit
+    gate failed, score each evictable item by relevance and greedy-fill
+    the budget:
+
+    1. For each evictable, compute ``score_relevance(item.text, prompt)``
+       and pair with its original index (``idx``). Higher ``idx`` =
+       newer, used as recency tiebreaker.
+    2. Sort by ``(-score, -idx)`` — highest score first; on ties, newer
+       wins (TS ``b.score - a.score || b.idx - a.idx``).
+    3. Walk sorted list; for each item, **append if it fits**
+       (``accum + item.tokens <= remaining_budget``). Note this is a
+       **skip-and-continue** walk — unlike chronological, prompt-aware
+       does NOT bail on the first non-fit. A small high-score item
+       AFTER a large high-score item can still be picked up.
+    4. Re-sort kept items by ``item.ordinal`` to restore chronological
+       order before the caller appends the fresh tail.
+
+    #### 3. ``"chronological"`` (TS 1210-1230, default fallback)
+
+    The fallback when prompt is missing/whitespace OR
+    ``prompt_aware_eviction is False``. Walk evictable from
+    **newest → oldest**, accumulating tokens. On the **first**
+    non-fitting item, **stop entirely** — drop that item AND all older
+    items. This is a *monotonic* walk: unlike prompt-aware, the
+    chronological mode cannot "skip and continue" past a non-fit.
+
+    Reverse the kept list to restore chronological (oldest-first) order
+    before the caller appends the fresh tail.
+
+    The strict-stop semantic preserves conversational coherence — once
+    the budget breaks the timeline, all older context is gone (no
+    Frankenstein-history gap). The TS comment at line 1223 spells this
+    out: ``"Once an item doesn't fit we stop — all older items are
+    also dropped"``.
+
+    ### Tail-tokens & remaining budget (TS 1162-1170)
+
+    The fresh tail is **always included**, even if its sum exceeds the
+    full budget. The walk operates on
+    ``remaining_budget = max(0, token_budget - tail_tokens)``. When
+    ``tail_tokens >= token_budget``, ``remaining_budget`` becomes 0 and
+    the only mode that emits a non-empty kept list is ``full-fit`` (and
+    only when ``evictable_total_tokens == 0``).
+
+    ### Edge cases the spec covers
+
+    * **Empty evictable + non-empty fresh tail** → mode is
+      ``"full-fit"`` (the gate ``0 <= remaining_budget`` is always
+      true), kept list is ``[]``.
+    * **``token_budget = 0``** → ``remaining_budget = max(0, -tail) = 0``
+      → if any evictable has tokens, the mode is whichever the gate
+      hits (full-fit only if all items are zero-token). When the
+      gate fails, prompt-aware/chronological emit ``[]``.
+    * **Fresh tail alone exceeds budget** → see above (zero remaining).
+    * **Empty prompt** → fall to chronological.
+    * **``prompt_aware_eviction=False`` with non-empty prompt** → fall
+      to chronological (the AND-guard at TS 1185 short-circuits on
+      ``promptAwareEviction !== false``).
+
+    ### Wave-N provenance
+
+    The TS source at this line range (1162-1230) carries **no**
+    explicit ``Wave-N`` audit-fix marker — the budget-walk algorithm is
+    one of the few sections that survived all 12 audit waves without a
+    scar-tissue patch. (The fresh-tail computation at 988 carries
+    Wave-4; the budget walk does not.) Per ADR-029, we omit a
+    ``# LCM Wave-N`` comment from this function.
+
+    ### Performance
+
+    All three branches are O(n) on item count, with the prompt-aware
+    branch contributing one O(n log n) sort. ``list.append`` is
+    amortised O(1); the spec's "no quadratic patterns" AC is satisfied
+    by avoiding ``selected = selected + [item]`` (which copies, costing
+    O(n²) cumulative).
+
+    Args:
+        evictable: Items with ``ordinal < fresh_tail_ordinal``.
+            Must be sorted by ascending ordinal (the caller is
+            :meth:`ContextAssembler.assemble`'s split step at TS 1157,
+            which filters a pre-sorted resolved list).
+        fresh_tail: Items with ``ordinal >= fresh_tail_ordinal``.
+            Used only to compute ``tail_tokens``; never returned.
+        token_budget: The total token budget from
+            ``AssembleContextInput.tokenBudget`` (TS 1103).
+        prompt: Optional user query for prompt-aware mode.
+        prompt_aware_eviction: When ``False``, forces chronological
+            mode even if the prompt is searchable. Mirrors TS
+            ``promptAwareEviction`` default ``true``; the AND-guard at
+            TS 1185 short-circuits on ``!== false``, so any truthy
+            value enables prompt-aware.
+
+    Returns:
+        A pair ``(kept_evictable, mode)`` where ``kept_evictable`` is
+        a list of :class:`ResolvedItem` in ordinal-ascending order
+        (chronological), and ``mode`` is the
+        :data:`SelectionMode` label that describes which branch
+        executed. The caller appends ``list(fresh_tail)`` to
+        ``kept_evictable`` to build the final selected list.
+
+        The token-budget invariant
+        ``sum(item.tokens for item in kept_evictable) <= remaining_budget``
+        holds for every mode. (Note this is *remaining_budget*, not
+        ``token_budget`` — the fresh tail is allowed to overflow.)
+    """
+    # Compute tail tokens. ``sum(..., 0)`` covers the empty-iterable case
+    # without raising. The TS source uses an in-place loop (line 1163);
+    # ``sum()`` over a generator is the idiomatic Python equivalent and
+    # avoids materializing an intermediate list.
+    tail_tokens = sum(item.tokens for item in fresh_tail)
+
+    # ``max(0, ...)`` matches TS line 1170 — when the fresh tail alone
+    # busts the budget, remaining is clamped to 0, not allowed to go
+    # negative (which would let large negative budgets accept arbitrary
+    # items in the gate check below).
+    remaining_budget = max(0, token_budget - tail_tokens)
+
+    # Compute evictable token total once. The TS source uses
+    # ``Array.prototype.reduce`` at line 1178; ``sum(generator)`` is
+    # equivalent and avoids the materialization cost of a list comp.
+    evictable_total_tokens = sum(item.tokens for item in evictable)
+
+    # ── Mode 1: full-fit (TS 1181-1184) ────────────────────────────────
+    # The ``<=`` is load-bearing — equality is still full-fit (everything
+    # exactly fits, no eviction needed).
+    if evictable_total_tokens <= remaining_budget:
+        # ``list(evictable)`` materializes a copy so the caller's
+        # downstream mutations don't reach into the input. The TS source
+        # uses ``selected.push(...evictable)`` which has the same
+        # semantics (spread copies the array elements).
+        return list(evictable), "full-fit"
+
+    # ── Mode 2: prompt-aware (TS 1185-1209) ────────────────────────────
+    # Gate: ``promptAwareEviction !== false && hasSearchablePrompt``.
+    # TS's ``!== false`` short-circuits on any truthy value; Python's
+    # ``is False`` check is the precise translation. Using a plain
+    # ``not prompt_aware_eviction`` would erroneously fall through on
+    # truthy non-``True`` values (e.g. ``1``, non-empty strings) which
+    # the TS source would have honored.
+    if prompt_aware_eviction is not False and has_searchable_prompt(prompt):
+        # ``prompt`` is narrowed to ``str`` by ``has_searchable_prompt``
+        # in practice — Python's type checker doesn't see the narrowing,
+        # so we cast via a local rebind for ``ty``'s benefit.
+        assert prompt is not None  # narrowed by has_searchable_prompt
+        return _budget_walk_prompt_aware(evictable, remaining_budget, prompt)
+
+    # ── Mode 3: chronological (TS 1210-1230, fallback) ─────────────────
+    return _budget_walk_chronological(evictable, remaining_budget)
+
+
+def _budget_walk_prompt_aware(
+    evictable: Sequence[ResolvedItem],
+    remaining_budget: int,
+    prompt: str,
+) -> tuple[list[ResolvedItem], SelectionMode]:
+    """Prompt-aware greedy-fill (BM25-lite scoring + token cap).
+
+    Mirrors TS ``assembler.ts`` 1186-1209. Extracted to a helper to
+    keep :func:`budget_walk`'s top-level dispatch readable. Returns the
+    same ``(kept, mode)`` shape as the parent.
+
+    ### Algorithm
+
+    1. Score every evictable item once. The TS source builds an array
+       of ``{item, score, idx}`` triples (line 1190-1194); Python's
+       tuple lets us pack the same data with less overhead.
+    2. Sort by ``(-score, -idx)`` so the highest-scoring items come
+       first, with newer items winning ties. The recency tiebreaker
+       is critical — when two items match the prompt equally, we
+       prefer the more recent one because it's more likely to
+       reflect the current conversational context.
+    3. Greedy-fill ``remaining_budget``: walk the sorted list, append
+       each item that fits, **skip-and-continue** on items that don't
+       fit. This is the load-bearing difference from chronological
+       mode — a small relevant item can still slip in after a large
+       relevant item didn't.
+    4. Re-sort kept items by ``ordinal`` so the output is in
+       chronological order (the caller appends fresh tail without
+       re-sorting).
+
+    ### Recency tiebreaker rationale
+
+    The TS source uses original-index (``idx``) as the recency proxy,
+    not ``item.ordinal``. The two are equivalent when ``evictable`` is
+    sorted by ordinal (which it always is, per the caller's
+    contract) — index 0 = oldest, index ``len-1`` = newest. We use
+    ``enumerate()`` to match.
+
+    Args:
+        evictable: Sorted-by-ordinal evictable items.
+        remaining_budget: Budget left after fresh-tail allocation.
+        prompt: Non-empty, searchable user query.
+
+    Returns:
+        ``(kept_evictable, "prompt-aware")``.
+    """
+    # Pre-score all items in one pass — ``score_relevance`` is pure, no
+    # observable side effect from doing this eagerly. The (-score, -idx)
+    # double-negation sort key is the idiomatic Python translation of
+    # TS's ``b.score - a.score || b.idx - a.idx`` descending sort.
+    scored: list[tuple[float, int, ResolvedItem]] = [
+        (score_relevance(item.text, prompt), idx, item) for idx, item in enumerate(evictable)
+    ]
+    # Sort in descending order. Note: we sort by ``(-score, -idx)``
+    # rather than passing ``reverse=True`` because we want a *stable*
+    # descending sort by score AND a descending tiebreaker by idx.
+    # Python's ``sorted(..., reverse=True)`` would flip BOTH keys; the
+    # negation form gives us the asymmetric direction TS expects.
+    scored.sort(key=lambda triple: (-triple[0], -triple[1]))
+
+    kept: list[ResolvedItem] = []
+    accum = 0
+    for _score, _idx, item in scored:
+        # TS line 1201: ``if (accum + item.tokens <= remainingBudget)``.
+        # The ``<=`` is load-bearing for the exact-fit boundary.
+        if accum + item.tokens <= remaining_budget:
+            kept.append(item)
+            accum += item.tokens
+        # else: SKIP (not break) — this is the difference vs chronological.
+
+    # Restore chronological order. ``list.sort`` is in-place + O(n log n);
+    # the TS source uses the same ``kept.sort(a.ordinal - b.ordinal)``
+    # pattern at line 1207.
+    kept.sort(key=lambda item: item.ordinal)
+    return kept, "prompt-aware"
+
+
+def _budget_walk_chronological(
+    evictable: Sequence[ResolvedItem],
+    remaining_budget: int,
+) -> tuple[list[ResolvedItem], SelectionMode]:
+    """Chronological newest-first walk with strict-stop semantics.
+
+    Mirrors TS ``assembler.ts`` 1211-1229. Extracted to a helper to
+    parallel :func:`_budget_walk_prompt_aware`. Returns the same
+    ``(kept, mode)`` shape.
+
+    ### Algorithm
+
+    Walk the evictable list from index ``len-1`` (newest) down to
+    ``0`` (oldest), appending each item that fits. **On the first
+    non-fit, break** — drop that item and every older item too.
+    Reverse the kept list to restore chronological (oldest-first)
+    order.
+
+    ### Strict-stop vs skip-and-continue
+
+    This is the load-bearing distinction from prompt-aware. The TS
+    comment at line 1223 ``"Once an item doesn't fit we stop — all
+    older items are also dropped"`` makes this explicit. The motivation
+    is conversational coherence: if the budget tears the timeline at
+    an older boundary, the gap between the kept fresh tail and the
+    kept oldest item must be contiguous. A "skip and continue" walk
+    could leave a 5-message-old gap and then resume picking up
+    20-message-old messages, which confuses the model.
+
+    Args:
+        evictable: Sorted-by-ordinal evictable items.
+        remaining_budget: Budget left after fresh-tail allocation.
+
+    Returns:
+        ``(kept_evictable, "chronological")``.
+    """
+    # Walk newest → oldest. The TS source uses a numeric reverse-index
+    # loop (``for (let i = evictable.length - 1; i >= 0; i--)``);
+    # ``reversed(evictable)`` is the idiomatic Python equivalent.
+    kept: list[ResolvedItem] = []
+    accum = 0
+    for item in reversed(evictable):
+        if accum + item.tokens <= remaining_budget:
+            kept.append(item)
+            accum += item.tokens
+        else:
+            # Strict-stop: the TS comment at 1223 spells this out.
+            # We break, NOT continue. Skipping past a too-big item would
+            # let a small old item sneak in and create a discontiguous
+            # history.
+            break
+
+    # ``list.reverse`` is in-place + O(n); the TS source uses
+    # ``kept.reverse()`` at line 1227. The reversal restores
+    # chronological (oldest-first) order from our newest-first walk.
+    kept.reverse()
+    return kept, "chronological"
