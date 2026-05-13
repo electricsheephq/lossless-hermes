@@ -1,0 +1,7 @@
+
+  WITH visible_mentions AS (
+    SELECT m.entity_id, m.summary_id, m.surface_form, m.mentioned_at
+      FROM lcm_entity_mentions m
+      JOIN summaries s ON s.summary_id = m.summary_id
+     WHERE s.suppressed_at IS NULL
+  )
