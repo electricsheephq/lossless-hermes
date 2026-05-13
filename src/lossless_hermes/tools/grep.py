@@ -1,11 +1,12 @@
 """Port of ``lcm_grep`` — multi-mode search over compacted conversation history.
 
 Ports ``lossless-claw/src/tools/lcm-grep-tool.ts`` (LCM commit ``1f07fbd`` on
-branch ``pr-613``, 1179 LOC TS → Wave A subset: ~600 LOC Python). The
-TypeBox-declared schema lives at TS lines 43-125; the handler body at
-lines 191-440 (the ``execute`` closure) plus the ``runVerbatimLcmGrep``
-helper at lines 947-1161. Both are translated structurally verbatim per
-ADR-016 (description prose byte-identical from TS source).
+branch ``pr-613``, 1179 LOC TS). The TypeBox-declared schema lives at TS
+lines 43-125; the handler body at lines 191-440 (the ``execute`` closure);
+``runVerbatimLcmGrep`` at lines 947-1161; ``runHybridLcmGrep`` at lines
+474-760; ``runSemanticLcmGrep`` at lines 776-935. All are translated
+structurally verbatim per ADR-016 (description prose byte-identical from
+TS source).
 
 What this tool does
 -------------------
@@ -24,10 +25,14 @@ single schema:
    Bypasses the store layer and runs a custom FTS5/LIKE query against
    ``messages`` so the local ``sanitize_fts5_pattern`` rewrites apply
    (TS lines 154-178).
-4. ``hybrid`` and 5. ``semantic`` — DEFERRED to issue 06-09 (Wave B).
-   The schema advertises the modes so the tool description prose stays
-   verbatim from TS; the dispatch returns an ``"<mode> mode is not yet
-   available..."`` error.
+4. ``hybrid`` — FTS5 + Voyage semantic + Voyage rerank-2.5. PRIMARY for
+   topic-anchored queries. Wraps :func:`run_hybrid_search` from issue
+   05-09 with a tool-side FTS adapter that goes through
+   :meth:`SummaryStore.search_summaries`.
+5. ``semantic`` — pure-vector KNN over Voyage-embedded summaries (no
+   rerank, cheaper than hybrid). Wraps :func:`run_semantic_search` from
+   issue 05-08; scoped to summaries only because semantic doesn't index
+   raw messages.
 
 Wave-12 F5 invariant — middleware-not-decorator
 -----------------------------------------------
@@ -80,11 +85,12 @@ References
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final, Optional, Protocol
+from typing import Any, Final, Optional, Protocol, Sequence
 
 from lossless_hermes.plugin import result_budget as _result_budget
 from lossless_hermes.plugin.result_budget import truncation_notice
@@ -109,10 +115,20 @@ from lossless_hermes.tools._typebox import (
     tool_schema,
 )
 from lossless_hermes.tools.conversation_scope import (
+    LcmConversationScope,
     LcmDependencies,
     parse_iso_timestamp_param,
     resolve_lcm_conversation_scope,
 )
+from lossless_hermes.voyage.client import VoyageClient, VoyageError
+
+# ---------------------------------------------------------------------------
+# Lazy imports — defer the embeddings sub-package to avoid an import cycle.
+# The chain ``engine → tools.__init__ → tools.grep → embeddings.hybrid_search
+# → db.connection → engine`` is the cycle; pulling the embeddings imports
+# at call time breaks it. Pattern mirrors the lazy
+# ``compaction._format_timestamp`` import at the bottom of this module.
+# ---------------------------------------------------------------------------
 
 __all__ = (
     "LCM_GREP_DESCRIPTION",
@@ -362,12 +378,22 @@ class GrepContext(Protocol):
       resolver.
     * ``timezone``: IANA timezone name for the timestamp formatter
       (e.g. ``"UTC"``, ``"America/Los_Angeles"``).
+    * ``voyage``: Optional :class:`VoyageClient` used by hybrid +
+      semantic modes. ``None`` when VOYAGE_API_KEY isn't set — the
+      hybrid / semantic branches degrade or refuse explicitly with the
+      operator-actionable fallback prose (TS line 631 / 813). The engine
+      MUST construct this client with ``max_retries=1`` and
+      ``timeout_s=15.0`` to cap Voyage wall-time on the agent hot path
+      (TS lines 626-627 ``voyageMaxRetries`` / ``voyageTimeoutMs``). The
+      grep tool never constructs its own client; it consumes whatever the
+      engine wired at session-start.
     """
 
     conn: sqlite3.Connection
     summary_store: SummaryStore
     conversation_store: ConversationStore
     timezone: str
+    voyage: Optional[VoyageClient]
 
 
 @dataclass
@@ -430,11 +456,14 @@ def handle_lcm_grep(
     * Invalid timestamp: ``{"error": "<key> must be a valid ISO timestamp."}``.
     * ``since >= before``: ``{"error": "`since` must be earlier than `before`."}``.
     * No conversation scope: ``{"error": "No LCM conversation found..."}``.
-    * ``mode='hybrid'`` / ``mode='semantic'``: ``{"error": "<mode> mode is not yet available..."}`` (deferred to 06-09).
+    * ``mode='hybrid'`` w/ no VoyageClient OR auth-class VoyageError:
+      ``{"error": "Voyage API key is missing or invalid..."}`` (TS line 631).
+    * ``mode='semantic'`` w/ vec0 missing:
+      ``{"error": "Semantic search unavailable..."}`` (TS line 813).
 
     Success payloads are :func:`tool_result`-encoded dicts with the
     rendered text plus a ``details`` slice (mode + counts + truncation
-    flag + role/sort overrides).
+    flag + role/sort overrides + provenance + degradation flags).
     """
     # ----- Param read --------------------------------------------------------
     # Pattern is required and MUST be a non-empty string. The TS source
@@ -457,26 +486,6 @@ def handle_lcm_grep(
         # Unknown mode — TS would default to "regex" implicitly (no validation
         # in the JS layer); we match that behavior.
         mode = "regex"
-
-    # ----- Wave A: defer hybrid + semantic to issue 06-09 --------------------
-    if mode == "hybrid":
-        return tool_result(
-            {
-                "error": (
-                    "hybrid mode is not yet available in this build. "
-                    "Use mode='full_text' for keyword search."
-                ),
-            },
-        )
-    if mode == "semantic":
-        return tool_result(
-            {
-                "error": (
-                    "semantic mode is not yet available in this build. "
-                    "Use mode='full_text' for keyword search."
-                ),
-            },
-        )
 
     scope_raw = args.get("scope")
     scope = scope_raw if isinstance(scope_raw, str) else "both"
@@ -540,6 +549,44 @@ def handle_lcm_grep(
                     "Provide conversationId or set allConversations=true."
                 ),
             },
+        )
+
+    # ----- summaryKinds (hybrid + semantic modes only) ----------------------
+    # Wave-12 audit (W1A5 P1) — TS lines 283-289: summaryKinds was previously
+    # plumbed only through `mode='semantic'` even though the schema description
+    # claims both 'semantic' AND 'hybrid' honor it. Resolved once and passed
+    # to both helper functions.
+    summary_kinds_param: Optional[list[str]] = None
+    raw_summary_kinds = args.get("summaryKinds")
+    if isinstance(raw_summary_kinds, list):
+        cleaned: list[str] = [
+            sk for sk in raw_summary_kinds if isinstance(sk, str) and sk in ("leaf", "condensed")
+        ]
+        if cleaned:
+            summary_kinds_param = cleaned
+
+    # ----- Hybrid mode (TS lines 291-302) -----------------------------------
+    if mode == "hybrid":
+        return _run_hybrid_lcm_grep(
+            ctx=ctx,
+            pattern=pattern,
+            conversation_scope=conversation_scope,
+            since=since,
+            before=before,
+            limit=limit,
+            summary_kinds=summary_kinds_param,
+        )
+
+    # ----- Semantic mode (TS lines 304-315) ---------------------------------
+    if mode == "semantic":
+        return _run_semantic_lcm_grep(
+            ctx=ctx,
+            pattern=pattern,
+            conversation_scope=conversation_scope,
+            since=since,
+            before=before,
+            limit=limit,
+            summary_kinds=summary_kinds_param,
         )
 
     # ----- Verbatim mode ----------------------------------------------------
@@ -746,6 +793,660 @@ def _run_regex_or_full_text_grep(
         details["requestedSort"] = requested_sort
         details["effectiveSort"] = effective_sort
 
+    return tool_result({"text": text, "details": details})
+
+
+# ===========================================================================
+# Hybrid + Semantic helpers (TS lines 474-935)
+# ===========================================================================
+#
+# Both hybrid and semantic modes wrap the embeddings-layer entrypoints
+# (`run_hybrid_search` from 05-09 / `run_semantic_search` from 05-08).
+# The tool's responsibility is:
+#
+# 1. Build the FTS-arm adapter that backs ``run_hybrid_search`` with a
+#    ``SummaryStore.search_summaries`` callback (TS lines 529-593).
+# 2. Translate the resolved :class:`LcmConversationScope` to the filter
+#    shape both helpers expect (conversation_ids for hybrid; session_keys
+#    for semantic, derived from the family ids — TS lines 595-601 +
+#    782-788).
+# 3. Catch :class:`VoyageError`/:class:`SemanticSearchUnavailableError` and
+#    map them to the operator-facing error prose per the spec AC.
+# 4. Render the result as markdown + a structured ``details`` payload
+#    with the four degraded flags + provenance tags + cosine bands.
+#
+# Wave-12 F5 invariant: both helpers are SYNC at this layer and call
+# ``asyncio.run()`` on the embeddings coroutines. The token gate wrapping
+# at 06-02 (``LCMEngine.handle_tool_call``) wraps :func:`handle_lcm_grep`
+# as middleware — these helpers stay free of token-gate calls.
+
+
+def _derive_session_keys_from_conversation_ids(
+    conn: sqlite3.Connection,
+    conversation_ids: Sequence[int],
+) -> list[str]:
+    """Look up session_keys for a list of conversation_ids.
+
+    Port of TS ``deriveSessionKeysFromConversationIds`` (lines 1167-1179).
+    Used by semantic mode to scope KNN to the agent's session family.
+
+    Returns the list of unique non-null session_key values from the
+    ``conversations`` rows matching the supplied ids. Empty list when
+    no rows match or no rows have a session_key.
+    """
+    if not conversation_ids:
+        return []
+    placeholders = ",".join("?" for _ in conversation_ids)
+    rows = conn.execute(
+        f"SELECT DISTINCT session_key FROM conversations "
+        f"WHERE conversation_id IN ({placeholders}) "
+        f"AND session_key IS NOT NULL",
+        tuple(conversation_ids),
+    ).fetchall()
+    return [row[0] for row in rows if row[0]]
+
+
+def _hit_provenance_tag(hit: Any) -> str:
+    """Build the provenance tag for a hybrid hit (TS lines 762-766).
+
+    Returns one of:
+      * ``"[from FTS+semantic]"`` — both arms hit this summary.
+      * ``"[from FTS only]"`` — only FTS hit (no semantic match).
+      * ``"[from semantic only]"`` — only semantic hit (FTS missed).
+
+    Annotated as :class:`Any` because the :class:`HybridHit` type is
+    pulled lazily inside the hybrid handler to avoid the engine-import
+    cycle; the duck-typed ``.from_fts`` / ``.from_semantic`` attributes
+    are all the tag needs.
+    """
+    if hit.from_fts and hit.from_semantic:
+        return "[from FTS+semantic]"
+    if hit.from_fts:
+        return "[from FTS only]"
+    return "[from semantic only]"
+
+
+def _format_voyage_missing_error(detail: Optional[str] = None) -> str:
+    """Operator-facing error prose for missing-Voyage-key in hybrid mode.
+
+    Byte-pinned to TS line 631-635. The fallback-hint prose
+    (``"Use mode='full_text' for keyword-only search."``) is load-bearing
+    because it is what tells the agent how to retry.
+    """
+    payload: dict[str, Any] = {
+        "error": (
+            "Voyage API key is missing or invalid (set VOYAGE_API_KEY) — "
+            "hybrid mode requires it. Use mode='full_text' for keyword-only search."
+        ),
+    }
+    if detail is not None:
+        payload["detail"] = detail
+    return tool_result(payload)
+
+
+def _format_voyage_missing_semantic_error(detail: Optional[str] = None) -> str:
+    """Operator-facing error prose for missing/invalid Voyage key in semantic mode.
+
+    Byte-pinned to TS line 825-828. Note: distinct from the hybrid prose
+    above — semantic mode's fallback hint suggests ``regex`` OR
+    ``full_text`` (no rerank means semantic is a closer substitute for
+    those modes than for hybrid).
+    """
+    payload: dict[str, Any] = {
+        "error": (
+            "Voyage API key is missing or invalid (set VOYAGE_API_KEY) - "
+            "semantic mode requires it. Use mode='regex' or mode='full_text' instead."
+        ),
+    }
+    if detail is not None:
+        payload["detail"] = detail
+    return tool_result(payload)
+
+
+def _conversation_ids_for_filter(
+    scope: LcmConversationScope,
+) -> Optional[list[int]]:
+    """Translate :class:`LcmConversationScope` to the embeddings filter shape.
+
+    Mirrors TS lines 595-601: when ``allConversations`` is True, pass
+    ``undefined`` (no filter); otherwise prefer the multi-id family list,
+    falling back to ``[conversation_id]`` if only an anchor is set.
+    Returns ``None`` for the "no filter" case.
+    """
+    if scope.all_conversations:
+        return None
+    if scope.conversation_ids and len(scope.conversation_ids) > 0:
+        return list(scope.conversation_ids)
+    if scope.conversation_id is not None:
+        return [scope.conversation_id]
+    return None
+
+
+def _run_hybrid_lcm_grep(
+    *,
+    ctx: GrepContext,
+    pattern: str,
+    conversation_scope: LcmConversationScope,
+    since: Optional[datetime],
+    before: Optional[datetime],
+    limit: int,
+    summary_kinds: Optional[list[str]],
+) -> str:
+    """Hybrid mode dispatch: FTS5 + Voyage semantic + Voyage rerank-2.5.
+
+    Mirrors TS ``runHybridLcmGrep`` (lines 474-760). Builds a tool-side
+    FTS adapter backed by :meth:`SummaryStore.search_summaries`, calls
+    :func:`run_hybrid_search` with ``kFts=kSemantic=max(50, limit*3)``
+    (capped at 500 — Wave-7 Auditor #8 P1 over-fetch ratio per TS lines
+    605-613), renders markdown with provenance tags + degraded flags.
+
+    Voyage wall-time: the engine MUST construct :attr:`GrepContext.voyage`
+    with ``max_retries=1`` and ``timeout_s=15.0`` (TS lines 626-627 —
+    ``voyageMaxRetries`` / ``voyageTimeoutMs``). The Python VoyageClient
+    is configured at construction time so the constraint lives on the
+    client, not on the per-call invocation.
+    """
+    # Lazy imports — see top-of-file note on the engine-import cycle.
+    from lossless_hermes.embeddings.hybrid_search import (  # noqa: PLC0415
+        FtsHit,
+        HybridSearchResult,
+        run_hybrid_search,
+    )
+
+    # ----- Pre-flight: voyage client present? -------------------------------
+    # TS source delegates this to the catch-block at line 629 — it tries
+    # the call, sees VoyageError("auth"), and emits the missing-key
+    # message. We short-circuit earlier when ctx.voyage is None because
+    # the Python run_hybrid_search would degrade to FTS-only silently
+    # (rerank skipped because voyage is None), which contradicts the AC:
+    # hybrid mode w/o VOYAGE_API_KEY MUST error explicitly with the
+    # operator-actionable fallback hint.
+    if ctx.voyage is None:
+        return _format_voyage_missing_error(detail="ctx.voyage is None")
+
+    # ----- FTS adapter ------------------------------------------------------
+    # Port of TS lines 529-593. The TS variant over-fetches when caller
+    # supplies sessionKeys/summaryKinds and post-filters the results —
+    # but our SummaryStore.search_summaries already handles all the
+    # filters the embeddings module passes, so we forward them through
+    # and trim to the requested limit. The store-layer FTS5 sanitizer
+    # is invoked once at the store boundary; we DO NOT call
+    # sanitize_fts5_pattern here.
+    conversation_ids_filter = _conversation_ids_for_filter(conversation_scope)
+
+    async def fts_search(
+        query: str,
+        *,
+        limit: int,
+        **filters: Any,
+    ) -> list[FtsHit]:
+        # The embeddings module passes session_keys/summary_kinds/since/before/etc
+        # in **filters. SummaryStore.search_summaries accepts only the
+        # subset of filters it understands; the remaining filters
+        # (session_keys, summary_kinds) are post-filter'd in this adapter
+        # — matching the TS lines 542-579 over-fetch + Set-membership
+        # post-filter pattern.
+        session_keys_filter: Optional[set[str]] = (
+            set(filters["session_keys"]) if filters.get("session_keys") else None
+        )
+        summary_kinds_filter: Optional[set[str]] = (
+            set(filters["summary_kinds"]) if filters.get("summary_kinds") else None
+        )
+        # TS lines 543-545: over-fetch when post-filters are active so
+        # the post-filter survivors aren't crowded out by the FTS top-K.
+        over_fetch_k = (
+            max(limit, limit * 5, 100) if (session_keys_filter or summary_kinds_filter) else limit
+        )
+        sum_input = SummarySearchInput(
+            query=query,
+            mode="full_text",
+            conversation_id=None,
+            conversation_ids=conversation_ids_filter,
+            since=since,
+            before=before,
+            limit=over_fetch_k,
+            sort="relevance",
+        )
+        rows = ctx.summary_store.search_summaries(sum_input)
+        # Hydrate full content + session_key + token_count from the
+        # summaries table (TS lines 479-527 ``hydrateRowsById``). The
+        # store's SearchResult only carries summary_id + snippet + rank.
+        if not rows:
+            return []
+        ids = [r.summary_id for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        hydrated_rows = ctx.conn.execute(
+            f"SELECT summary_id, conversation_id, session_key, kind, content, "
+            f"       token_count, created_at "
+            f"  FROM summaries "
+            f"  WHERE summary_id IN ({placeholders}) "
+            f"    AND suppressed_at IS NULL",
+            tuple(ids),
+        ).fetchall()
+        # Build a lookup so we preserve FTS rank order. v4.1 §10 +
+        # Group C Finding #5 defense-in-depth: hydrate also filters
+        # suppressed_at IS NULL — a row suppressed between FTS and
+        # hydrate is dropped (TS lines 491-500).
+        hydrated_by_id = {h[0]: h for h in hydrated_rows}
+        out: list[FtsHit] = []
+        for rank, row in enumerate(rows):
+            h = hydrated_by_id.get(row.summary_id)
+            if h is None:
+                # Suppressed between FTS and hydrate — drop.
+                continue
+            (
+                summary_id,
+                conv_id,
+                session_key_h,
+                kind_h,
+                content,
+                token_count,
+                created_at,
+            ) = h
+            # TS lines 575-579: post-filter on session_keys + summary_kinds
+            # (Wave-1 Auditor #4 finding #2: required for session-family
+            # scoping invariant per v4.1 §10; without it, cross-session
+            # content leaks into the FTS arm of hybrid search).
+            if session_keys_filter and session_key_h not in session_keys_filter:
+                continue
+            if summary_kinds_filter and kind_h not in summary_kinds_filter:
+                continue
+            out.append(
+                FtsHit(
+                    summary_id=summary_id,
+                    conversation_id=int(conv_id) if conv_id is not None else 0,
+                    session_key=session_key_h or "",
+                    kind=kind_h,
+                    content=content or "",
+                    token_count=int(token_count) if token_count is not None else 0,
+                    created_at=(
+                        created_at.isoformat() if isinstance(created_at, datetime) else created_at
+                    )
+                    or "",
+                    rank=rank,
+                )
+            )
+            # TS line 590: stop when we have ``limit`` post-filtered hits.
+            if len(out) >= limit:
+                break
+        return out
+
+    # ----- Wave-7 Auditor #8 P1: over-fetch ratio (TS lines 605-613) --------
+    # At limit=200, rerank needs headroom. 3x user limit floored at 50,
+    # capped at 500 (Voyage rerank budget — MAX_TOKENS_PER_RERANK_CALL).
+    k_arm = min(500, max(50, limit * 3))
+
+    try:
+        hybrid_result: HybridSearchResult = asyncio.run(
+            run_hybrid_search(
+                ctx.conn,
+                query=pattern,
+                fts_search=fts_search,
+                voyage=ctx.voyage,
+                k_fts=k_arm,
+                k_semantic=k_arm,
+                top_n=limit,
+                conversation_ids=conversation_ids_filter,
+                since=since,
+                before=before,
+                summary_kinds=summary_kinds,  # type: ignore[arg-type]
+                exclude_suppressed=True,
+            )
+        )
+    except VoyageError as e:
+        if e.kind == "auth":
+            return _format_voyage_missing_error(detail=str(e))
+        # TS lines 645-647: non-auth VoyageError (e.g. server, rate_limit)
+        # surfaces as "Hybrid search failed: <msg>". Don't pretend the
+        # whole pipeline worked — let the agent see the error.
+        return tool_result({"error": f"Hybrid search failed: {e}"})
+    except Exception as e:
+        # TS lines 637-643: catch any error mentioning VOYAGE_API_KEY
+        # (e.g. SemanticSearchUnavailableError variants) and map them to
+        # the missing-key prose. Otherwise surface "Hybrid search failed".
+        msg = str(e)
+        if re.search(r"VOYAGE_API_KEY", msg, re.IGNORECASE):
+            return _format_voyage_missing_error(detail=msg)
+        return tool_result({"error": f"Hybrid search failed: {msg}"})
+
+    # ----- Render markdown (TS lines 650-702) -------------------------------
+    lines: list[str] = []
+    lines.append("## LCM Grep Results")
+    lines.append(f"**Pattern:** `{pattern}`")
+    lines.append("**Mode:** hybrid")
+    if conversation_scope.all_conversations:
+        lines.append("**Conversation scope:** all conversations")
+    elif conversation_scope.conversation_id is not None:
+        family_count = (
+            len(conversation_scope.conversation_ids) if conversation_scope.conversation_ids else 0
+        )
+        if family_count > 1:
+            lines.append(
+                f"**Conversation scope:** session family rooted at "
+                f"{conversation_scope.conversation_id} ({family_count} segments)",
+            )
+        else:
+            lines.append(f"**Conversation scope:** {conversation_scope.conversation_id}")
+    if since is not None or before is not None:
+        since_str = (
+            f"since {_format_display_time(since, ctx.timezone)}"
+            if since is not None
+            else "since -∞"
+        )
+        before_str = (
+            f"before {_format_display_time(before, ctx.timezone)}"
+            if before is not None
+            else "before +∞"
+        )
+        lines.append(f"**Time filter:** {since_str} | {before_str}")
+    lines.append(f"**Total matches:** {len(hybrid_result.hits)}")
+    if hybrid_result.degraded_to_fts_only:
+        lines.append("*(semantic search unavailable; degraded to FTS-only)*")
+    if hybrid_result.degraded_skipped_rerank:
+        lines.append("*(rerank failed; using RRF fusion fallback)*")
+    lines.append("")
+
+    current_chars = sum(len(line) for line in lines) + len(lines) - 1
+    truncated = False
+    max_chars = _result_budget.MAX_RESULT_CHARS
+    reason_hint = "narrow query, lower limit, or wait for next-turn compaction"
+
+    if hybrid_result.hits:
+        lines.append("### Summaries")
+        lines.append("")
+        current_chars += len("### Summaries") + 1 + 0 + 1
+        for hit in hybrid_result.hits:
+            provenance = _hit_provenance_tag(hit)
+            snippet = _truncate_snippet(hit.content)
+            score_str = f"{hit.score:.4f}"
+            time_str = _format_display_time(hit.created_at, ctx.timezone)
+            line = (
+                f"- [{hit.summary_id}] {provenance} ({hit.kind}, "
+                f"score={score_str}, {time_str}): {snippet}"
+            )
+            if current_chars + len(line) > max_chars:
+                lines.append(truncation_notice(reason_hint))
+                truncated = True
+                break
+            lines.append(line)
+            current_chars += len(line) + 1
+        lines.append("")
+    else:
+        lines.append("No matches found.")
+
+    text = "\n".join(lines)
+
+    # ----- Details payload (TS lines 707-758) -------------------------------
+    # Wave-4 Auditor #21 P1 + Wave-7 P1: emit confidenceBand for parity with
+    # semantic mode + lcm_semantic_recall. Compute from top hit's
+    # cosineSimilarity when present (calibrated); fall back to rerank score
+    # (heuristic). confidenceBandSource surfaces which path was used.
+    def _band_from_cos(cos: float) -> str:
+        if cos >= 0.65:
+            return "high"
+        if cos >= 0.5:
+            return "medium"
+        if cos >= 0.35:
+            return "low"
+        return "noise"
+
+    confidence_payload: dict[str, Any] = {}
+    if not hybrid_result.hits:
+        confidence_payload = {
+            "confidenceBand": "no-match",
+            "confidenceBandSource": None,
+        }
+    else:
+        top = hybrid_result.hits[0]
+        if top.cosine_similarity is not None:
+            confidence_payload = {
+                "confidenceBand": _band_from_cos(top.cosine_similarity),
+                "confidenceBandSource": "cosine",
+            }
+        else:
+            confidence_payload = {
+                "confidenceBand": _band_from_cos(top.score),
+                "confidenceBandSource": "rerank",
+            }
+
+    details: dict[str, Any] = {
+        "mode": "hybrid",
+        "messageCount": 0,
+        "summaryCount": len(hybrid_result.hits),
+        "totalMatches": len(hybrid_result.hits),
+        # Wave-12 retro N2: top-level truncated for parity with other tools.
+        "truncated": truncated,
+        "candidateCount": hybrid_result.candidate_count,
+        "voyageTokensConsumed": hybrid_result.voyage_tokens_consumed,
+        "degradedToFtsOnly": hybrid_result.degraded_to_fts_only,
+        "degradedSkippedRerank": hybrid_result.degraded_skipped_rerank,
+        "rerankPackTruncated": hybrid_result.rerank_pack_truncated,
+        "rerankPackedCount": hybrid_result.rerank_packed_count,
+        "modelName": hybrid_result.model,
+        **confidence_payload,
+        "hits": [
+            {
+                "summaryId": h.summary_id,
+                "conversationId": h.conversation_id,
+                "sessionKey": h.session_key,
+                "kind": h.kind,
+                # Wave-4 Auditor #21 P1: add cosineSimilarity (computed from
+                # semantic_distance when present) for shape parity with
+                # semantic + recall hits. None when FTS-only (no semantic
+                # distance).
+                "cosineSimilarity": h.cosine_similarity,
+                "score": h.score,
+                "fromFts": h.from_fts,
+                "fromSemantic": h.from_semantic,
+                "semanticDistance": h.semantic_distance,
+                "ftsRank": h.fts_rank,
+            }
+            for h in hybrid_result.hits
+        ],
+    }
+    return tool_result({"text": text, "details": details})
+
+
+def _run_semantic_lcm_grep(
+    *,
+    ctx: GrepContext,
+    pattern: str,
+    conversation_scope: LcmConversationScope,
+    since: Optional[datetime],
+    before: Optional[datetime],
+    limit: int,
+    summary_kinds: Optional[list[str]],
+) -> str:
+    """Semantic mode dispatch: pure Voyage KNN over summary embeddings.
+
+    Mirrors TS ``runSemanticLcmGrep`` (lines 776-935). No rerank — that's
+    the cost-profile distinction from ``mode='hybrid'``. Hits are summaries
+    only because semantic doesn't cover raw messages
+    (``embedded_kinds=("summary",)``).
+
+    Scope is plumbed via ``session_keys`` derived from the conversation
+    family (TS lines 782-788). Voyage wall-time: same constraint as
+    hybrid (engine constructs the VoyageClient with retries=1 / timeout=15s).
+    """
+    # Lazy imports — see top-of-file note on the engine-import cycle.
+    from lossless_hermes.embeddings.semantic_search import (  # noqa: PLC0415
+        SemanticSearchResult,
+        SemanticSearchUnavailableError,
+        run_semantic_search,
+    )
+
+    # ----- Pre-flight: vec0 + voyage --------------------------------------
+    # vec0 absence raises SemanticSearchUnavailableError inside
+    # run_semantic_search; we catch + map below. ctx.voyage missing means
+    # we can't embed the query — surface the missing-key prose explicitly.
+    if ctx.voyage is None:
+        return _format_voyage_missing_semantic_error(detail="ctx.voyage is None")
+
+    # ----- Scope → session_keys (TS lines 782-788) --------------------------
+    session_keys: Optional[list[str]]
+    if conversation_scope.all_conversations:
+        session_keys = None
+    elif conversation_scope.conversation_ids and len(conversation_scope.conversation_ids) > 0:
+        session_keys = _derive_session_keys_from_conversation_ids(
+            ctx.conn,
+            conversation_scope.conversation_ids,
+        )
+    elif conversation_scope.conversation_id is not None:
+        session_keys = _derive_session_keys_from_conversation_ids(
+            ctx.conn,
+            [conversation_scope.conversation_id],
+        )
+    else:
+        session_keys = None
+
+    try:
+        sem_result: SemanticSearchResult = asyncio.run(
+            run_semantic_search(
+                ctx.conn,
+                query=pattern,
+                k=limit,
+                voyage=ctx.voyage,
+                input_type="query",
+                exclude_suppressed=True,
+                embedded_kinds=("summary",),
+                since=since,
+                before=before,
+                session_keys=session_keys if session_keys else None,
+                summary_kinds=summary_kinds,  # type: ignore[arg-type]
+            )
+        )
+    except SemanticSearchUnavailableError:
+        # TS lines 811-815: vec0 missing → operator-facing error with
+        # the regex/full_text fallback hint.
+        return tool_result({
+            "error": (
+                "Semantic search unavailable: vec0 extension not loaded "
+                "or no embedding profile registered. "
+                "Use mode='regex' or mode='full_text' instead."
+            ),
+        })
+    except VoyageError as e:
+        # Wave-9 Agent #4 P1 fix (TS lines 817-833): previously only
+        # ``auth`` was caught; the other transient kinds propagated as
+        # raw exceptions. Mirror the lcm_semantic_recall catch shape:
+        # auth → missing-key prose; everything else → generic Voyage
+        # error with the kind label.
+        if e.kind == "auth":
+            return _format_voyage_missing_semantic_error(detail=str(e))
+        return tool_result({
+            "error": (
+                f"Voyage embed call failed ({e.kind}). Try mode='full_text' or wait and retry."
+            ),
+            "detail": str(e),
+        })
+
+    # ----- Render markdown (TS lines 838-906) -------------------------------
+    lines: list[str] = []
+    lines.append("## LCM Grep Results")
+    lines.append(f"**Pattern:** `{pattern}`")
+    lines.append(
+        "**Mode:** semantic | **Scope:** summaries (semantic doesn't index raw messages)",
+    )
+    if conversation_scope.all_conversations:
+        lines.append("**Conversation scope:** all conversations")
+    elif conversation_scope.conversation_id is not None:
+        lines.append(f"**Conversation scope:** {conversation_scope.conversation_id}")
+    if since is not None or before is not None:
+        since_str = (
+            f"since {_format_display_time(since, ctx.timezone)}"
+            if since is not None
+            else "since -∞"
+        )
+        before_str = (
+            f"before {_format_display_time(before, ctx.timezone)}"
+            if before is not None
+            else "before +∞"
+        )
+        lines.append(f"**Time filter:** {since_str} | {before_str}")
+    lines.append(f"**Total matches:** {len(sem_result.hits)}")
+    lines.append(f"**Voyage tokens consumed:** {sem_result.voyage_tokens_consumed}")
+    lines.append(f"**Model:** {sem_result.model_name or 'unknown'}")
+    lines.append("")
+
+    # Wave-3 Auditor #4 fix #5 (TS lines 859-875): emit confidenceBand based
+    # on top-hit cosineSimilarity. Same calibration as semantic_search.py
+    # (≥0.65 high / ≥0.5 medium / ≥0.35 low / <0.35 noise / no-match).
+    top_cos = sem_result.hits[0].cosine_similarity if sem_result.hits else -1.0
+    if not sem_result.hits:
+        confidence_band = "no-match"
+    elif top_cos >= 0.65:
+        confidence_band = "high"
+    elif top_cos >= 0.5:
+        confidence_band = "medium"
+    elif top_cos >= 0.35:
+        confidence_band = "low"
+    else:
+        confidence_band = "noise"
+
+    if sem_result.hits:
+        lines.append(f"**Confidence (top hit):** {confidence_band} (cosine={top_cos:.3f})")
+    lines.append("")
+
+    current_chars = sum(len(line) for line in lines) + len(lines) - 1
+    truncated_semantic = False
+    max_chars = _result_budget.MAX_RESULT_CHARS
+    reason_hint = "narrow query, lower limit, or wait for next-turn compaction"
+
+    if not sem_result.hits:
+        lines.append(
+            "_No semantic matches. Try mode='hybrid' for rerank-boosted recall, "
+            "or mode='regex'/'full_text' for keyword-only._",
+        )
+    else:
+        if confidence_band in ("low", "noise"):
+            lines.append(
+                f"*Note: top-hit cosine {top_cos:.3f} is below the medium-confidence "
+                f"threshold (0.5). Treat results as candidates, not answers.*",
+            )
+            lines.append("")
+            current_chars = sum(len(line) for line in lines) + len(lines) - 1
+        lines.append("### Hits (ranked by semantic distance — lower = more similar)")
+        lines.append("")
+        current_chars += len("### Hits (ranked by semantic distance — lower = more similar)") + 2
+        for hit in sem_result.hits:
+            snippet = _truncate_snippet(hit.content)
+            cos_str = f"{hit.cosine_similarity:.3f}"
+            time_str = _format_display_time(hit.created_at, ctx.timezone)
+            line = f"- [{hit.summary_id}] ({hit.kind}, cosine={cos_str}, {time_str}): {snippet}"
+            if current_chars + len(line) > max_chars:
+                lines.append(truncation_notice(reason_hint))
+                truncated_semantic = True
+                break
+            lines.append(line)
+            current_chars += len(line) + 1
+
+    text = "\n".join(lines)
+
+    details: dict[str, Any] = {
+        "mode": "semantic",
+        "pattern": pattern,
+        "totalMatches": len(sem_result.hits),
+        # Wave-12 retro N2: top-level truncated for parity with other tools.
+        "truncated": truncated_semantic,
+        "voyageTokensConsumed": sem_result.voyage_tokens_consumed,
+        "modelName": sem_result.model_name,
+        # Wave-3 Auditor #4 fix #5: confidenceBand mirrors lcm_semantic_recall
+        "confidenceBand": confidence_band,
+        # Wave-3 Auditor #4 fix #3: include conversationId + tokenCount.
+        "hits": [
+            {
+                "summaryId": h.summary_id,
+                "conversationId": h.conversation_id,
+                "sessionKey": h.session_key,
+                "kind": h.kind,
+                "distance": h.distance,
+                "cosineSimilarity": h.cosine_similarity,
+                "tokenCount": h.token_count,
+                "createdAt": h.created_at,
+            }
+            for h in sem_result.hits
+        ],
+    }
     return tool_result({"text": text, "details": details})
 
 
