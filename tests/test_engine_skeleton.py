@@ -297,25 +297,31 @@ def test_on_post_llm_call_stub_returns_none() -> None:
     assert not inspect.iscoroutine(result)
 
 
-def test_on_pre_llm_call_stub_returns_none() -> None:
-    """Issue 02-07 demotes the stub from ``NotImplementedError`` to no-op.
+def test_on_pre_llm_call_returns_recall_policy_dict() -> None:
+    """Issue 03-10 lifts the hook from the 02-07 no-op stub to the
+    always-on recall-policy injection per ADR-014.
 
     The hook must be callable without raising so :func:`register` can
     wire it via ``ctx.register_hook("pre_llm_call", engine._on_pre_llm_call)``
     without the agent loop crashing every turn. Per Hermes's hook
-    contract (``hermes_cli/plugins.py:1218-1232``) a ``None`` return is
-    a valid observer-only result that leaves the user message
-    unchanged. Epic 03 replaces this body with the real
-    ``LOSSLESS_RECALL_POLICY_PROMPT`` injection per ADR-014.
+    contract (``hermes_cli/plugins.py:1218-1232``) the dict return is
+    routed to user-message content; ``{"context": <text>}`` is the
+    documented injection shape.
 
     **Sync invariant:** Hermes invokes hooks synchronously; ``async``
     would inject a coroutine instead of policy text. Guarded below.
+    The in-depth ``pre_llm_call`` coverage lives in
+    ``tests/test_pre_llm_call.py``; here we keep the skeleton-level
+    contract that 03-10 did not regress the sync invariant from
+    02-07's PR #34.
     """
+    from lossless_hermes.recall_policy import LOSSLESS_RECALL_POLICY_PROMPT
+
     engine = LCMEngine()
 
     result = engine._on_pre_llm_call(session_id="sess-1", conversation_history=[])
 
-    assert result is None
+    assert result == {"context": LOSSLESS_RECALL_POLICY_PROMPT}
     import inspect
 
     assert not inspect.iscoroutine(result)
