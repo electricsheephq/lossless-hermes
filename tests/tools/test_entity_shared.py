@@ -337,14 +337,9 @@ class TestModuleSurface:
     def test_exports_the_two_names_via_package(self) -> None:
         # The package-level re-export from `lossless_hermes.tools`
         # must expose both names. (Originally asserted "only these two"
-<<<<<<< HEAD
-        # via equality — relaxed in PR #72 merge once TypeBox helpers +
-        # TOOL_SCHEMAS registry joined the package per ADR-016.)
-=======
-        # via equality — relaxed in the 06-01 / 07-01 sibling merge once
-        # TypeBox helpers + TOOL_SCHEMAS registry joined the package per
-        # ADR-016.)
->>>>>>> ec6f906 ([06-01] tools/_typebox: TypeBox → Python dict translation conventions (ADR-016))
+        # via equality — relaxed once TypeBox helpers + TOOL_SCHEMAS
+        # registry joined the package per ADR-016, and again as 06-05
+        # conversation_scope helpers were added.)
         import lossless_hermes.tools as pkg
 
         assert "VISIBLE_MENTIONS_CTE" in pkg.__all__
