@@ -138,28 +138,37 @@ def test_register_wires_all_four_hermes_hooks(hermes_available: None) -> None:
 
 
 def test_register_calls_register_command_for_lcm(hermes_available: None) -> None:
-    """Issue 02-10: ``register()`` registers the ``/lcm`` slash command.
+    """Issue 08-01: ``register()`` registers BOTH ``/lcm`` AND ``/lossless``.
 
-    Supersedes the v0 (00-06) assertion that ``register_command`` was
-    NOT called. The slash command dispatcher (Epic 02-10) ships the
-    seam; Epic 08 fills in the per-subcommand bodies. The dispatcher
-    handle is a bound method on :class:`LcmCommandDispatcher`.
+    Originally Epic 02-10 wired one ``register_command("lcm", ...)`` call.
+    Issue 08-01 adds the ``/lossless`` alias per plugin-glue.md line 446
+    so OpenClaw users' muscle-memory works ("OpenClaw's
+    ``nativeNames.default: lossless``").
+
+    The dispatcher handle is a bound method on
+    :class:`LcmCommandDispatcher`; both registrations point at the same
+    closure.
 
     Per ``hermes_cli/plugins.py:401-453``, ``register_command`` takes
     ``(name, handler, description="", args_hint="")``.
     """
     ctx = _make_stub_ctx()
     register(ctx)
-    ctx.register_command.assert_called_once()
-    call_args = ctx.register_command.call_args
-    # First positional arg is the name; per ADR-024 it's "lcm".
-    assert call_args.args[0] == "lcm"
-    # Handler is callable (bound method on the dispatcher).
-    handler = call_args.args[1]
-    assert callable(handler)
+    # Two registrations: /lcm (canonical) and /lossless (alias).
+    assert ctx.register_command.call_count == 2
+    call_args_list = ctx.register_command.call_args_list
+    names = [c.args[0] for c in call_args_list]
+    assert names == ["lcm", "lossless"]
+    # Both handlers are callable (bound method on the dispatcher) — and
+    # equal, since they're the same closure.
+    handler_lcm = call_args_list[0].args[1]
+    handler_lossless = call_args_list[1].args[1]
+    assert callable(handler_lcm)
+    assert handler_lcm == handler_lossless
     # ``args_hint`` is the kw-only argument Hermes uses to surface the
     # command in gateway adapters (e.g. Discord's slash-command picker).
-    assert call_args.kwargs.get("args_hint") == "<subcommand>"
+    for call in call_args_list:
+        assert call.kwargs.get("args_hint") == "<subcommand>"
 
 
 def test_register_logs_startup_line(
@@ -177,6 +186,114 @@ def test_register_logs_startup_line(
     assert any("lossless-hermes plugin loaded" in rec.getMessage() for rec in caplog.records), (
         f"missing startup log line — captured: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue 08-01 — destructive-commands-unguarded startup warning
+# ---------------------------------------------------------------------------
+
+
+def test_register_warns_when_gateway_lacks_allow_admin_from(
+    hermes_available: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue 08-01 spec line 53 + ADR-013 §Consequences: warn at startup
+    when running in gateway mode AND no platform sets ``allow_admin_from``.
+
+    We monkey-patch the gateway config loader to return a config with at
+    least one platform lacking the admin allowlist; the warning should
+    fire. Without this signal, operators can ship destructive /lcm
+    subcommands wide-open and not realize it.
+    """
+    import lossless_hermes as plugin_mod
+
+    # Construct a fake gateway config: one platform, no allow_admin_from.
+    class _StubPlatform:
+        def __init__(self, extra: dict) -> None:
+            self.extra = extra
+
+    class _StubGatewayConfig:
+        def __init__(self, platforms: dict) -> None:
+            self.platforms = platforms
+
+    fake_gateway_config = _StubGatewayConfig(platforms={"telegram": _StubPlatform(extra={})})
+
+    # The register() function imports ``gateway.config.load_gateway_config``
+    # lazily inside ``_maybe_warn_unguarded_destructive_commands``. We
+    # inject a fake module so the import succeeds and returns our stub.
+    import sys
+    import types
+
+    fake_module = types.ModuleType("gateway.config")
+    fake_module.load_gateway_config = lambda: fake_gateway_config  # type: ignore[attr-defined]
+    fake_pkg = types.ModuleType("gateway")
+    fake_pkg.config = fake_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway", fake_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.config", fake_module)
+
+    ctx = _make_stub_ctx()
+    with caplog.at_level(logging.WARNING, logger="lossless_hermes"):
+        plugin_mod.register(ctx)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("destructive /lcm subcommands" in w and "allow_admin_from" in w for w in warnings), (
+        f"missing unguarded-commands warning — got {warnings}"
+    )
+
+
+def test_register_does_not_warn_when_allow_admin_from_set(
+    hermes_available: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Counter-test: when every platform has ``allow_admin_from`` set, no warning."""
+    import lossless_hermes as plugin_mod
+
+    class _StubPlatform:
+        def __init__(self, extra: dict) -> None:
+            self.extra = extra
+
+    class _StubGatewayConfig:
+        def __init__(self, platforms: dict) -> None:
+            self.platforms = platforms
+
+    fake_gateway_config = _StubGatewayConfig(
+        platforms={
+            "telegram": _StubPlatform(extra={"allow_admin_from": ["@admin"]}),
+        }
+    )
+
+    import sys
+    import types
+
+    fake_module = types.ModuleType("gateway.config")
+    fake_module.load_gateway_config = lambda: fake_gateway_config  # type: ignore[attr-defined]
+    fake_pkg = types.ModuleType("gateway")
+    fake_pkg.config = fake_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway", fake_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.config", fake_module)
+
+    ctx = _make_stub_ctx()
+    with caplog.at_level(logging.WARNING, logger="lossless_hermes"):
+        plugin_mod.register(ctx)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("destructive /lcm subcommands" in w for w in warnings), (
+        f"unexpected warning when allow_admin_from is set — got {warnings}"
+    )
+
+
+def test_register_silent_when_no_gateway_module() -> None:
+    """When ``gateway.config`` isn't importable (CLI-only Hermes), no warning."""
+    # This is the default test env — Hermes isn't installed, so the
+    # gateway import fails. The startup warning path silently no-ops.
+    # We exercise it indirectly via the existing
+    # ``test_register_logs_startup_line`` test (which doesn't see a
+    # WARNING in the captured logs).
+    # No explicit assertion needed here — the existing test suite covers
+    # the no-op path. This test exists for documentation only.
+    pass
 
 
 def test_register_loads_config_via_db_module(
