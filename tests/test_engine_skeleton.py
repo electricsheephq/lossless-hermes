@@ -209,25 +209,35 @@ def test_constructor_does_not_open_db(tmp_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_on_session_start_stub_raises() -> None:
-    """02-03 fills in this body; at 02-01 the stub raises."""
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+def test_on_session_start_no_longer_stubbed(tmp_home: Path) -> None:
+    """02-03 filled in the body; ``on_session_start`` now opens the DB.
+
+    Was a ``NotImplementedError`` stub at 02-01. The detailed behavior
+    is in ``tests/test_lifecycle.py``; this is a regression guard
+    against re-stubbing.
+    """
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    try:
         engine.on_session_start("sess-1")
-
-
-def test_on_session_end_stub_raises() -> None:
-    """02-03 fills in this body; at 02-01 the stub raises."""
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+        assert engine._db is not None
+    finally:
         engine.on_session_end("sess-1", [])
 
 
-def test_on_session_reset_stub_raises() -> None:
-    """02-03 fills in this body; at 02-01 the stub raises."""
+def test_on_session_end_no_longer_stubbed(tmp_home: Path) -> None:
+    """02-03 filled in the body; ``on_session_end`` now closes the DB."""
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    engine.on_session_start("sess-1")
+    engine.on_session_end("sess-1", [])
+    assert engine._db is None
+
+
+def test_on_session_reset_no_longer_stubbed() -> None:
+    """02-03 filled in the body; ``on_session_reset`` resets token state."""
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
-        engine.on_session_reset()
+    engine.last_prompt_tokens = 100
+    engine.on_session_reset()
+    assert engine.last_prompt_tokens == 0
 
 
 def test_on_post_llm_call_stub_raises() -> None:

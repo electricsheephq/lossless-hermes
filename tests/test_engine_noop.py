@@ -249,27 +249,42 @@ def test_update_from_response_computes_total_when_absent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle stubs — raise NotImplementedError
+# Lifecycle methods — bodies landed in Epic 02 issue 02-03
 # ---------------------------------------------------------------------------
+#
+# These were ``NotImplementedError`` stubs at 02-01. Issue 02-03 filled
+# in the heavy-init bodies on ``_LifecycleMixin``. The detailed lifecycle
+# behavior is exercised in ``tests/test_lifecycle.py`` — here we just
+# confirm the surface no longer raises (regression guard that the bodies
+# don't get reverted to stubs).
 
 
-def test_on_session_start_raises_with_epic_pointer() -> None:
-    """AC: lifecycle stubs raise ``NotImplementedError`` naming Epic 02."""
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+def test_on_session_start_no_longer_raises(tmp_home: Path) -> None:
+    """02-03: ``on_session_start`` opens the DB rather than raising."""
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    try:
         engine.on_session_start("session-id")
-
-
-def test_on_session_end_raises_with_epic_pointer() -> None:
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+        # DB connection is now open.
+        assert engine._db is not None
+    finally:
         engine.on_session_end("session-id", [])
 
 
-def test_on_session_reset_raises_with_epic_pointer() -> None:
+def test_on_session_end_no_longer_raises(tmp_home: Path) -> None:
+    """02-03: ``on_session_end`` closes the DB rather than raising."""
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    engine.on_session_start("session-id")
+    engine.on_session_end("session-id", [])
+    # DB closed.
+    assert engine._db is None
+
+
+def test_on_session_reset_no_longer_raises() -> None:
+    """02-03: ``on_session_reset`` zeroes token state rather than raising."""
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
-        engine.on_session_reset()
+    engine.last_prompt_tokens = 100
+    engine.on_session_reset()
+    assert engine.last_prompt_tokens == 0
 
 
 # ---------------------------------------------------------------------------
