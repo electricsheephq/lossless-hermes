@@ -6,14 +6,14 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W1 (Epic 00 Scaffolding) — closing** |
-| **Current milestone** | M1 (plugin loads as no-op) — closes after 00-06 lands |
-| **Last merged PR** | [#6](https://github.com/electricsheephq/lossless-hermes/pull/6) `[00-08] README + CONTRIBUTING` (merged 2026-05-13T11:09:56Z) |
-| **Last commit on main** | `9c2e68c` |
-| **Next issue** | [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) — depends on 00-05 (bridge, merged) + 00-07 (config, merged); ready to dispatch |
+| **Current wave** | **W2 ready to dispatch (Epic 01 Storage)** |
+| **Current milestone** | M1 ✅ achieved (plugin loads as no-op); M2 next (DB layer feature-complete) |
+| **Last merged PR** | [#9](https://github.com/electricsheephq/lossless-hermes/pull/9) `chore(deps): pytest 9.0.2→9.0.3` (merged 2026-05-13T11:32:04Z) |
+| **Last commit on main** | `3d1847e` |
+| **Next batch** | Wave 2 serial chain start: [01-01 db/connection](./epics/01-storage/01-01-db-connection.md) → 01-02 db/config → 01-03 db/features → 01-04a/b/c migration |
 | **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
-| **Dependabot** | 1 moderate vulnerability flagged; triaged post-Wave-1 |
+| **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
 ## Wave 0 — Pre-execution spikes ✅ CLOSED
 
@@ -25,7 +25,7 @@
 | 0d | GitNexus LCM index verified | ✅ done | `openclaw-code-index` MCP server, repo `lossless-claw`, 7382 nodes, 6836 embeddings |
 | 0e | Single-issue dry run on 00-01 | ✅ done | PR #1 merged 2026-05-13; Issue Executor + Pair Reviewer (97% confidence APPROVE) loop validated |
 
-## Wave 1 — Epic 00 Scaffolding (7/8 merged; 00-06 pending)
+## Wave 1 — Epic 00 Scaffolding ✅ CLOSED
 
 | Issue | Status | PR |
 |---|---|---|
@@ -34,11 +34,21 @@
 | [00-03 pre-commit hooks](./epics/00-scaffolding/issues/00-03-precommit-hooks.md) | ✅ merged | [#2](https://github.com/electricsheephq/lossless-hermes/pull/2) |
 | [00-04 test harness fixtures](./epics/00-scaffolding/issues/00-04-test-harness-fixtures.md) | ✅ merged | [#4](https://github.com/electricsheephq/lossless-hermes/pull/4) |
 | [00-05 hermes bridge stub](./epics/00-scaffolding/issues/00-05-hermes-bridge-stub.md) | ✅ merged | [#3](https://github.com/electricsheephq/lossless-hermes/pull/3) |
-| [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) | ⏳ next | — |
+| [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) | ✅ merged | [#8](https://github.com/electricsheephq/lossless-hermes/pull/8) |
 | [00-07 config skeleton](./epics/00-scaffolding/issues/00-07-config-skeleton.md) | ✅ merged | [#7](https://github.com/electricsheephq/lossless-hermes/pull/7) |
 | [00-08 README + docs](./epics/00-scaffolding/issues/00-08-readme-and-docs.md) | ✅ merged | [#6](https://github.com/electricsheephq/lossless-hermes/pull/6) |
 
-**Wave 1 exit gate:** 00-06 merged + CI matrix green on `{macOS-latest, ubuntu-latest} × {python-3.11, 3.12, 3.13}` (currently green on main) + Hermes loads plugin as no-op via `hermes` startup log line.
+**Wave 1 exit gate:** ✅ ALL CRITERIA MET
+- ✅ All 8 issues merged
+- ✅ CI matrix green on `{macOS-latest, ubuntu-latest} × {python-3.11, 3.12, 3.13}` (latest main run all 6 cells SUCCESS)
+- ✅ Plugin registers as no-op via `register(ctx)` → `ctx.register_context_engine(LCMEngine())`
+- ✅ Dependabot alert #1 closed
+
+**Plus 2 chore PRs:**
+- [chore: ruff format tests/test_config_load.py](https://github.com/electricsheephq/lossless-hermes/commit/b81c7e7) (fix-forward for pre-CI format slip)
+- [#9 chore(deps): pytest 9.0.2→9.0.3](https://github.com/electricsheephq/lossless-hermes/pull/9) (dependabot moderate)
+
+**Wave 1 cycle time:** PR #1 merged 10:38Z → PR #9 merged 11:32Z = **~54 minutes** for 9 PRs end-to-end (vs ROADMAP estimate of 1 week).
 
 **Wave 1 operational lessons (recorded for Wave 2+):**
 1. **Per-worktree isolation is mandatory** for 2+ parallel Executors. Shared working tree caused branch-checkout collisions during Wave 1 (mid-commit branch flips, recovered via post-hoc cherry-picks). Now documented in [`CLAUDE.md`](./CLAUDE.md) as the standing convention.
@@ -50,7 +60,7 @@
 | ID | Milestone | Status | Notes |
 |---|---|---|---|
 | M0 | Phase 1 doc set complete | ✅ done | Commit 18e9e03 |
-| M1 | Plugin loads as no-op | 🟡 in progress | Wave 1 |
+| M1 | Plugin loads as no-op | ✅ done | Wave 1 closed 2026-05-13T11:32Z; 9 PRs in 54 min |
 | M2 | DB layer feature-complete | ⏳ pending | Wave 2 |
 | M3 | Engine round-trips messages | ⏳ pending | Wave 3 |
 | M4 | Per-turn ingest + assembly live | ⏳ pending | Wave 4 |
