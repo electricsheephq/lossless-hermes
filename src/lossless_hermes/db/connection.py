@@ -892,10 +892,12 @@ def _open_with_apsw(path: Union[str, Path], role: DbRole) -> Connection:
         conn.enableloadextension(True)
         # sqlite_vec.load's static signature names sqlite3.Connection but
         # the runtime behavior is duck-typed and works on apsw connections
-        # (spike-001 verified). Suppress the ty diagnostic here — the
+        # (spike-001 verified). The PR #38 ty fix-forward made the apsw
+        # import lazy via ``importlib.import_module`` which yields ``Any``
+        # at the type level, so no suppression is needed here. The
         # ``_ApswConnectionAdapter`` wraps the result for the public API
         # so callers never see the apsw-specific type leak through.
-        sqlite_vec.load(conn)  # type: ignore[arg-type]
+        sqlite_vec.load(conn)
         conn.enableloadextension(False)
 
         # Mirror the stdlib path's PRAGMA set: journal_mode WAL + role-based
