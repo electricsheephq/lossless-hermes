@@ -59,11 +59,15 @@ include = ["src/lossless_hermes"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Marker set defined by ADR-028 §Consequences. Live suites are opt-in:
+# the default `pytest` invocation skips them via `addopts` below; CI runs
+# them on `main` pushes only.
 markers = [
-    "integration: marks tests requiring VOYAGE_API_KEY (skipped by default)",
-    "live: marks tests that hit production Voyage (nightly only)",
+    "live: live API integration tests (requires API keys; opt-in)",
+    "live_voyage: live Voyage API tests",
+    "live_llm: live LLM provider tests",
 ]
-addopts = "-m 'not integration and not live'"
+addopts = "-m 'not live and not live_voyage and not live_llm'"
 
 [tool.ruff]
 line-length = 100
