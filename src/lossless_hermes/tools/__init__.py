@@ -154,7 +154,11 @@ TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 # 06-02 dispatch table sees the same order.
 from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
 from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
+<<<<<<< HEAD
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402
+=======
+from lossless_hermes.tools import grep as _grep  # noqa: F401, E402
+>>>>>>> 0572ffe ([06-08] tools/grep: lcm_grep regex + full_text + verbatim modes)
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
