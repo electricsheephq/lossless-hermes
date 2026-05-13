@@ -64,11 +64,60 @@ from typing import Final, Literal
 
 __all__ = [
     "LCM_SUMMARIZER_SYSTEM_PROMPT",
+    "LcmProviderAuthError",
     "SummaryMode",
     "build_condensed_prompt",
     "build_deterministic_fallback",
     "build_leaf_prompt",
 ]
+
+
+# ---------------------------------------------------------------------------
+# LcmProviderAuthError — auth-failure signal from the summarizer (issue 04-07)
+# ---------------------------------------------------------------------------
+#
+# **Forward declaration for issue 04-06.** This issue (04-07 — circuit
+# breaker integration) needs the error class to wire the catch around
+# the engine's ``compact()`` entry point so consecutive auth failures
+# can open the breaker. Issue 04-06 ports the full
+# ``_summarize_with_escalation`` cascade that raises this error from the
+# provider response path; 04-06 will extend (NOT replace) this class
+# with the call-context attributes (provider, model, status_code, etc.)
+# that the cascade carries.
+#
+# Maps to TS ``LcmProviderAuthError`` in ``lossless-claw/src/summarize.ts``
+# (the class itself + the ``extractProviderAuthFailure`` helper at lines
+# 525-560 that produces it). The TS shape: a tagged error with a
+# ``kind: "provider_auth"`` discriminator and a ``status`` field
+# (typically 401). The Python port subclasses :class:`RuntimeError` so
+# callers can use plain ``try / except`` semantics without an
+# error-discriminator dance — Python's class-based exception hierarchy
+# already gives us the same dispatch.
+
+
+class LcmProviderAuthError(RuntimeError):
+    """Auth failure raised by the summarizer on a 401 / explicit provider-auth signal.
+
+    Maps to TS ``LcmProviderAuthError`` in ``summarize.ts``. **Forward-
+    declared in issue 04-07** so the engine's circuit breaker can catch
+    it; issue 04-06 (full ``_summarize_with_escalation`` cascade) will
+    extend this class with the call-context attributes (provider, model,
+    status_code) that the cascade attaches.
+
+    The 04-07 surface is intentionally minimal — a marker exception with
+    no extra attributes — so 04-06 can subclass / extend without
+    breaking the 04-07 catch sites. Callers in 04-07 catch via plain
+    ``except LcmProviderAuthError`` and rely on the class identity
+    alone; 04-06 enrichment is additive.
+
+    See:
+
+    * ``epics/04-compaction/04-06-summarize-fallback-chain.md`` —
+      defines the full error surface this class will carry.
+    * ``epics/04-compaction/04-07-circuit-breaker-integration.md`` —
+      catches it to open the breaker.
+    * TS source: ``lossless-claw/src/summarize.ts`` (commit ``1f07fbd``).
+    """
 
 
 # ---------------------------------------------------------------------------

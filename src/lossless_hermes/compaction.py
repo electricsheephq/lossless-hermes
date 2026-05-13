@@ -316,7 +316,8 @@ class LeafPassResult:
 
 @dataclass(frozen=True)
 class CompactionResult:
-    """The result of :meth:`CompactionEngine.compact_full_sweep`.
+    """The result of :meth:`CompactionEngine.compact_full_sweep` and
+    :meth:`CompactionEngine.compact`.
 
     Mirrors TS ``CompactionResult`` (compaction.ts lines 18-32). 04-04
     lands the shape plus a small addition — ``passes_completed`` — so
@@ -333,6 +334,13 @@ class CompactionResult:
       :meth:`CompactionEngine.compact_full_sweep` aggregation. Empty
       for single-pass results; populated by the sweep so Epic 06's
       ``lcm_compact`` tool can report what each phase did.
+
+    **Issue 04-07** adds the ``reason`` field so the circuit-breaker
+    short-circuit at :meth:`CompactionEngine.compact` can return
+    ``CompactionResult(action_taken=False, reason="circuit breaker open",
+    ...)`` per the spec. Matches TS ``reason`` field on the
+    ``CompactResult`` envelope returned by ``LcmContextEngine.compact``
+    (engine.ts lines 3376-3380, 6895-6899).
 
     Attributes:
         action_taken: ``True`` iff at least one leaf or condensed pass
@@ -362,9 +370,16 @@ class CompactionResult:
             Matches TS ``authFailure`` (optional in TS; ``False`` here
             so the dataclass stays frozen + comparable).
         reason: Human-readable why-not-compacted string for no-op
-            paths. ``None`` on the action-taken path. Added in 04-08;
-            consumed by Epic 06's ``lcm_compact`` tool to surface the
-            "why nothing happened" verdict to the agent.
+            paths. ``None`` on the action-taken path. Added in 04-08
+            (telemetry) and elaborated in 04-07 (circuit breaker
+            integration): the :meth:`CompactionEngine.compact` wrapper
+            uses this to distinguish "circuit breaker open" from
+            "below threshold" / "compacted" without forcing callers
+            to inspect ``auth_failure`` + ``action_taken`` individually.
+            Consumed by Epic 06's ``lcm_compact`` tool to surface the
+            "why nothing happened" verdict to the agent. Matches TS
+            ``reason`` on the ``CompactResult`` envelope at
+            ``engine.ts:3376-3380``.
         phase_results: Per-phase nested :class:`CompactionResult`
             instances. Empty for the single-result no-op paths and for
             04-04 skeletal sweeps that don't yet aggregate phase
