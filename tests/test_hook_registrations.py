@@ -239,9 +239,15 @@ def test_pre_llm_call_accepts_documented_kwargs(hermes_available: None) -> None:
     kwargs documented in ``docs/reference/hermes-hooks.md`` line 91
     (``session_id``, ``user_message``, ``conversation_history``,
     ``is_first_turn``, ``model``, ``platform``, ``sender_id``) without
-    raising. Returns ``None`` at 02-07 (no-op stub); Epic 03 returns
-    ``{"context": <policy text>}`` per ADR-014.
+    raising. Issue 03-10 fills the body — the hook returns
+    ``{"context": LOSSLESS_RECALL_POLICY_PROMPT}`` per ADR-014. The
+    ``test_pre_llm_call*.py`` files exercise the injected text in
+    depth; here we only assert the wired shape (Hermes can call it
+    with the documented kwargs and receives a ``context``-bearing
+    dict).
     """
+    from lossless_hermes.recall_policy import LOSSLESS_RECALL_POLICY_PROMPT
+
     ctx = _make_stub_ctx()
     register(ctx)
     hook = _hooks_registered(ctx)["pre_llm_call"]
@@ -255,10 +261,11 @@ def test_pre_llm_call_accepts_documented_kwargs(hermes_available: None) -> None:
         platform="anthropic",
         sender_id="",
     )
-    # No-op at 02-07 — per ``hermes_cli/plugins.py:1218-1232`` a ``None``
-    # return is a valid observer-only result that leaves the user
-    # message unchanged.
-    assert result is None
+    # Issue 03-10: the hook returns the recall-policy text per ADR-014.
+    # Hermes appends ``result["context"]`` to the current turn's user
+    # message at API-call time.
+    assert isinstance(result, dict)
+    assert result["context"] == LOSSLESS_RECALL_POLICY_PROMPT
 
 
 def test_on_session_end_accepts_interrupted_kwarg(

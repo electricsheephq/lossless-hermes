@@ -27,6 +27,14 @@ unchanged; Epic 03 replaces the body with the real
 treat as a non-``None`` return and append to the results list,
 double-injecting context. Epic 03 returns the policy dict directly.
 
+**Issue 03-10 (Epic 03):** the ``_on_pre_llm_call`` body now returns
+``{"context": LOSSLESS_RECALL_POLICY_PROMPT}`` so Hermes appends the
+LCM recall-policy text to every turn's user-message content per
+ADR-014. The TS source (``lossless-claw/src/plugin/index.ts:2395``)
+uses ``prependSystemContext`` for the same text — Hermes deliberately
+diverges to preserve the Anthropic prompt cache. The user-voice
+rewording lives in :mod:`lossless_hermes.recall_policy`.
+
 Mixin contract (per ADR-027 §Consequences "All state lives on the shell
 class"):
 
@@ -54,6 +62,8 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from lossless_hermes.recall_policy import LOSSLESS_RECALL_POLICY_PROMPT
 
 if TYPE_CHECKING:
     pass
@@ -90,28 +100,44 @@ class _AssembleMixin:
         platform: str = "",
         sender_id: str = "",
         **kwargs: Any,
-    ) -> None:
-        """``pre_llm_call`` Hermes hook — recall-policy injection (Epic 03).
+    ) -> Optional[Dict[str, str]]:
+        """``pre_llm_call`` Hermes hook — recall-policy injection (issue 03-10).
 
         Per ADR-014: every user turn the engine returns a dict
-        ``{"context": <reworded LOSSLESS_RECALL_POLICY_PROMPT>}`` whose
-        text Hermes appends to the current turn's user message (NOT the
-        system prompt, to preserve the Anthropic prompt cache).
+        ``{"context": LOSSLESS_RECALL_POLICY_PROMPT}`` whose text Hermes
+        appends to the current turn's user-message content (NOT the
+        system prompt, to preserve the Anthropic prompt cache). The
+        upstream TS source (``lossless-claw/src/plugin/index.ts:2395``)
+        uses ``prependSystemContext`` for the same text — Hermes
+        deliberately diverges because mutating the system prompt every
+        turn invalidates the cache prefix; user-message-position
+        injection keeps system prompt + tools stable across turns.
 
-        At 02-07 the body is a no-op returning ``None`` so
-        :func:`register` can wire it via
-        ``ctx.register_hook("pre_llm_call", ...)`` without the agent
-        loop crashing every turn. Per Hermes's hook contract
-        (``hermes_cli/plugins.py:1218-1232``) a ``None`` return is a
-        valid observer-only result that leaves the user message
-        unchanged. The kwargs shape matches the ``pre_llm_call``
-        signature in ``docs/reference/hermes-hooks.md`` line 91 — every
-        documented kwarg is accepted and no exception fires.
+        **Idempotency / no double-inject:** Hermes's plugin-context
+        plumbing (``hermes_cli/plugins.py:invoke_hook``) is what builds
+        the joined ``_plugin_user_context`` from every hook callback's
+        return — the engine does not see the in-flight user-message
+        content before injection. So this hook is stateless w.r.t.
+        prior injection and always returns the same payload. If the
+        agent already has the policy text in the conversation
+        (e.g. multi-plugin overlap), it appears as duplicate user-
+        message context, but Hermes does not call this hook with the
+        already-built user message, so the engine has no way to detect
+        and skip — defensive idempotency lives at the Hermes plumbing
+        layer, not here.
 
         **Sync, not async:** Hermes's ``invoke_hook`` does
         ``ret = cb(**kwargs)`` with no ``await``; ``async def`` would
-        return a coroutine that Hermes treats as the injection context.
-        Epic 03 stays sync and returns ``{"context": ...}`` directly.
+        return a coroutine that Hermes treats as the injection context
+        (``str(coroutine)`` would be appended verbatim). Per PR #34's
+        async-to-sync conversion this method stays ``def``.
+
+        **First-turn parity:** the hook fires on every turn including
+        the first. Per ``docs/spike-results/002-hermes-pre-llm-call.md``
+        line 38 ("All non-None returns are concatenated"), Hermes does
+        not gate the injection on ``is_first_turn`` — the policy text
+        ships every turn so the agent retains it after compaction
+        windows or long histories that may drop earlier turns.
 
         Args:
             session_id: The Hermes session identifier.
@@ -126,19 +152,19 @@ class _AssembleMixin:
             **kwargs: Forward-compat for future hook signature additions.
 
         Returns:
-            ``None`` at 02-07 (no-op); Epic 03 returns
-            ``{"context": <policy text>}`` per ADR-014.
+            ``{"context": LOSSLESS_RECALL_POLICY_PROMPT}`` — Hermes
+            appends the ``context`` value to the user-message content
+            for this turn. Never returns ``None`` — the policy text is
+            unconditional per ADR-014 §Decision.
         """
-        # No-op stub. Epic 03 replaces this body with the real recall-
-        # policy injection (returning ``{"context": ...}``). The debug
-        # log gives an operator scanning logs a breadcrumb that the hook
-        # fired with the expected kwargs.
+        # Debug breadcrumb so operators scanning logs can see the hook
+        # fire each turn (the policy injection itself is invisible in
+        # any visible log unless the user is dumping /messages).
         history_len = len(conversation_history) if conversation_history else 0
         logger.debug(
-            "[lcm] pre_llm_call session=%s history_len=%d first_turn=%s "
-            "(Epic 03 will inject recall-policy)",
+            "[lcm] pre_llm_call inject-policy session=%s history_len=%d first_turn=%s",
             session_id,
             history_len,
             is_first_turn,
         )
-        return None
+        return {"context": LOSSLESS_RECALL_POLICY_PROMPT}
