@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lossless-hermes"
+version = "0.1.0"
+description = "Lossless Context Management plugin for hermes-agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Electric Sheep HQ" }]
+
+# Exact pins on every direct runtime dep (see Hermes pyproject.toml lines 14-39
+# for the canonical rationale — same supply-chain risk model applies here).
+# When updating: bump the version below AND regenerate uv.lock with `uv lock`.
+dependencies = [
+    "httpx[socks]==0.28.1",      # Voyage HTTP — matches Hermes pin
+    "sqlite-vec==0.1.9",          # vec0 KNN — see spike 001
+    "pydantic==2.12.5",           # Config + Voyage response validation — matches Hermes pin
+    "pyyaml==6.0.3",              # config.yaml loading — matches Hermes pin
+    "tenacity==9.1.4",            # Non-hot-path retries — matches Hermes pin
+]
+
+[project.optional-dependencies]
+# Cross-platform SQLite fallback. Stdlib sqlite3 covers 100% of mainstream
+# Python builds (per spike 001 + 005); apsw is the documented fallback only.
+apsw = ["apsw==3.53.1.0"]
+
+# Dev/test surface. Pinned to Hermes's versions where overlap exists so
+# plugin authors can run Hermes's test suite alongside ours without conflict.
+dev = [
+    "pytest==9.0.2",              # matches Hermes pin
+    "pytest-asyncio==1.3.0",      # matches Hermes pin
+    "pytest-mock==3.14.0",
+    "pytest-cov==6.0.0",
+    "respx==0.21.1",              # httpx mock router for Voyage tests
+    "ruff==0.15.10",              # matches Hermes pin
+    "ty==0.0.21",                 # matches Hermes pin
+    "pre-commit==4.0.1",
+]
+# Opt-in: legacy type-check via mypy for IDE plugins that don't yet speak ty.
+type-mypy = ["mypy==1.13.0"]
+
+[project.entry-points."hermes_agent.plugins"]
+# Entry point group is canonical — see hermes_cli/plugins.py line 170:
+#   ENTRY_POINTS_GROUP = "hermes_agent.plugins"
+# The Hermes plugin loader iterates entries in this group at startup,
+# imports each callable, and invokes it with a PluginContext. The plugin's
+# register() then calls ctx.register_context_engine(LosslessEngine()).
+lossless-hermes = "lossless_hermes:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lossless_hermes"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lossless_hermes"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring VOYAGE_API_KEY (skipped by default)",
+    "live: marks tests that hit production Voyage (nightly only)",
+]
+addopts = "-m 'not integration and not live'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+preview = true  # mirrors Hermes — needed for PLW1514
+
+[tool.ruff.lint]
+# At minimum, inherit Hermes's load-bearing rule (explicit encoding= on open()).
+# We can add more rules in a follow-up; starting with parity is safest.
+select = ["PLW1514"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLW1514"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.rules]
+unknown-argument = "warn"
+redundant-cast = "ignore"
+
+[tool.coverage.run]
+source = ["lossless_hermes"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
