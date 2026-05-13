@@ -6,12 +6,12 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W4 in flight** — Epic 05 batch A dispatched (05-01 voyage, 05-04 open_db, 05-05 worker_loop, 05-06 worker_lock); Epic 03 batch B pending PR #34 stabilization |
-| **Current milestone** | M1 ✅, M2 ✅, M3 ✅ (engine round-trips through Hermes hooks + slash commands + lifecycle); M4 next (per-turn ingest + assembly live) |
-| **Last merged PR** | [#34](https://github.com/electricsheephq/lossless-hermes/pull/34) `chore(engine): convert post/pre_llm_call hooks async->sync (Epic 03 prep)` |
-| **Last commit on main** | `8c653d0` |
-| **Total PRs merged today** | **36** (Wave 0–3 + chores + 02-07 async→sync follow-up) |
-| **Total tests** | 1101 passing, 2 skipped (live-gated) |
+| **Current wave** | **W5 ready to dispatch** — Wave 4 CLOSED (Epic 03 + Epic 05 complete; 25 Wave-4 PRs merged); Wave 5 = Epic 04 compaction + Epic 06 tools + Epic 07 entity/synth + Epic 08 CLI/ops (max fan-out, up to 8 concurrent executors) |
+| **Current milestone** | M1 ✅, M2 ✅, M3 ✅, **M4 ✅** (per-turn ingest + assembly live: 03-02 ingest body, 03-04..03-08 assembler chain, 03-09 always-on substitution, 03-10 recall-policy, 05-01..05-11 Voyage + vec0 + worker stack); M5 (compaction) + M6 (embeddings lift) + M7 (7 tools) + M8 (entity/synth) + M9 (operator commands) next |
+| **Last merged PR** | [#59](https://github.com/electricsheephq/lossless-hermes/pull/59) `[05-10] embeddings: graceful-degradation contract (4 flags surfaced to callers)` |
+| **Last commit on main** | `1d93355` |
+| **Total PRs merged today** | **59** (Wave 0–4 complete + chores + fix-forwards + spec docs) |
+| **Total tests** | ~2000 passing across 6 OS×Python matrix cells |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
@@ -65,9 +65,9 @@
 | M1 | Plugin loads as no-op | ✅ done | Wave 1 closed 2026-05-13T11:32Z; 9 PRs in 54 min |
 | M2 | DB layer feature-complete | ✅ done | Wave 2 closed 2026-05-13T13:43Z; 13 PRs + 1 chore; 907 tests; schema-diff subset 92/92 |
 | M3 | Engine round-trips messages | ✅ done | Wave 3 closed 2026-05-13; 9 PRs covering 10 issues + 2 fix-forwards; 1101 tests; LCMEngine wired through Hermes ABC + 4 plugin hooks + /lcm slash command |
-| M4 | Per-turn ingest + assembly live | ⏳ pending | Wave 4 |
-| M5 | Compaction working | ⏳ pending | Wave 5 |
-| M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 5 |
+| M4 | Per-turn ingest + assembly live | ✅ done | Wave 4 closed 2026-05-13/14; 25 PRs covering Epic 03 (10 issues: 03-01..03-10) + Epic 05 (11 issues: 05-01..05-11); ContextAssembler.assemble() with full 16-step pipeline; preassemble ABC override (Option B) + experimental force-compress (Option A) coexistent per ADR-010; Voyage HTTP client + sqlite-vec store + WorkerLoop + WorkerLock + backfill cron + semantic + hybrid + degraded-modes contract + autostart |
+| M5 | Compaction working | ⏳ pending | Wave 5 — Epic 04 |
+| M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 5 (eval validation; embeddings stack landed in M4) |
 | M7 | 7 tools wired | ⏳ pending | Wave 5 |
 | M8 | Entity + synthesis green | ⏳ pending | Wave 5 |
 | M9 | All operator commands; import-openclaw verified | ⏳ pending | Wave 5 |
