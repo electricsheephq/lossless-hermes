@@ -45,6 +45,29 @@ from lossless_hermes.db.connection import close_lcm_connection, open_lcm_db
 from lossless_hermes.db.migration import run_lcm_migrations
 from lossless_hermes.store.message_identity import build_message_identity_hash
 
+# ---------------------------------------------------------------------------
+# Skip marker: actions/setup-python macOS builds lack enable_load_extension
+# ---------------------------------------------------------------------------
+#
+# Per ADR-004 §Open questions item 1 and ADR-028 §Decision point 8, the
+# actions/setup-python macOS pre-built CPython ships without
+# ``--enable-loadable-sqlite-extensions``. The import command opens a
+# real ``open_lcm_db`` connection (so it can run the migration ladder
+# against the destination), which fires the Apple-Python guard on those
+# runners. The pure-argparse tests (parser surface, defaults) and the
+# AST-scan import-graph tests still run — they don't touch the DB.
+# Mirrors the ``_skip_no_extension_loading`` pattern in
+# ``tests/test_lifecycle.py`` and ``tests/test_engine_ingest.py``.
+_skip_no_extension_loading = pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "enable_load_extension"),
+    reason=(
+        "actions/setup-python on macOS ships a CPython build without "
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load, so "
+        "open_lcm_db() raises the Apple-Python guard. See ADR-004 §Open "
+        "questions item 1 + ADR-028 §Decision point 8."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixture: a "mini OpenClaw" tree on disk
@@ -97,7 +120,16 @@ def openclaw_root(tmp_path: Path) -> Iterator[Path]:
     The fixture closes any open connections after the test body via
     :func:`close_lcm_connection` so the lcm.db file can be re-opened
     by the import body.
+
+    Skips on macOS GH-Actions runners that lack ``enable_load_extension``
+    (see module-level ``_skip_no_extension_loading``).
     """
+    if not hasattr(sqlite3.Connection, "enable_load_extension"):
+        pytest.skip(
+            "actions/setup-python on macOS ships a CPython build without "
+            "--enable-loadable-sqlite-extensions; cannot build OpenClaw "
+            "fixture DB. See ADR-004 §Open questions item 1."
+        )
     root = tmp_path / "openclaw"
     root.mkdir()
     db_path = root / "lcm.db"
@@ -567,6 +599,7 @@ def test_imported_db_messages_match_recomputed_hashes(openclaw_root: Path, dest_
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 def test_missing_lcm_files_skipped_cleanly(tmp_path: Path) -> None:
     """Source has no lcm-files/ → skipped, not an error."""
     src = tmp_path / "minimal"
@@ -580,6 +613,7 @@ def test_missing_lcm_files_skipped_cleanly(tmp_path: Path) -> None:
     assert "no lcm-files/" in result.report or "skipping" in result.report.lower()
 
 
+@_skip_no_extension_loading
 def test_missing_credentials_skipped_cleanly(tmp_path: Path) -> None:
     """Source has no credentials/ → skipped, not an error."""
     src = tmp_path / "minimal"
