@@ -124,11 +124,27 @@ def register(ctx: Any) -> None:
 
     # TODO(epic-03): wire ``pre_llm_call`` and ``post_llm_call`` hooks
     # once ``LCMEngine._on_pre_llm_call`` and ``_on_post_llm_call`` land.
+    # Issue 02-07 lands the hook registrations separately from this issue
+    # (02-10), which only adds the slash-command dispatcher.
     # ctx.register_hook("pre_llm_call", engine._on_pre_llm_call)
     # ctx.register_hook("post_llm_call", engine._on_post_llm_call)
 
-    # TODO(epic-08): wire the ``/lcm`` slash command once the dispatcher
-    # ports. The 25 subcommands all land in that epic.
-    # ctx.register_command("lcm", lcm_dispatcher, description="LCM operator command")
+    # Slash command registration (issue 02-10). The dispatcher seam is
+    # live; subcommand bodies for purge / doctor / health / worker / eval
+    # / backup / rotate / prompts / db-backup / db-info / reconcile-
+    # session-keys all land in Epic 08. Per ADR-013, owner-gating is
+    # upstream of the handler — the dispatcher receives only ``raw_args``.
+    from lossless_hermes.plugin import LcmCommandDispatcher
 
-    _log.info("lossless-hermes plugin loaded as no-op (engine=%s)", engine.name)
+    dispatcher = LcmCommandDispatcher(engine)
+    ctx.register_command(
+        "lcm",
+        dispatcher.handle,
+        description="LCM subsystem control (status, help, …)",
+        args_hint="<subcommand>",
+    )
+
+    _log.info(
+        "lossless-hermes plugin loaded (engine=%s, /lcm registered)",
+        engine.name,
+    )

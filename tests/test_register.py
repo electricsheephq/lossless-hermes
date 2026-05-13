@@ -118,11 +118,29 @@ def test_register_does_not_call_register_hook_at_v0(hermes_available: None) -> N
     ctx.register_hook.assert_not_called()
 
 
-def test_register_does_not_call_register_command_at_v0(hermes_available: None) -> None:
-    """AC line 41: ``/lcm`` lands in Epic 08 — v0 must not register it."""
+def test_register_calls_register_command_for_lcm(hermes_available: None) -> None:
+    """Issue 02-10: ``register()`` registers the ``/lcm`` slash command.
+
+    Supersedes the v0 (00-06) assertion that ``register_command`` was
+    NOT called. The slash command dispatcher (Epic 02-10) ships the
+    seam; Epic 08 fills in the per-subcommand bodies. The dispatcher
+    handle is a bound method on :class:`LcmCommandDispatcher`.
+
+    Per ``hermes_cli/plugins.py:401-453``, ``register_command`` takes
+    ``(name, handler, description="", args_hint="")``.
+    """
     ctx = _make_stub_ctx()
     register(ctx)
-    ctx.register_command.assert_not_called()
+    ctx.register_command.assert_called_once()
+    call_args = ctx.register_command.call_args
+    # First positional arg is the name; per ADR-024 it's "lcm".
+    assert call_args.args[0] == "lcm"
+    # Handler is callable (bound method on the dispatcher).
+    handler = call_args.args[1]
+    assert callable(handler)
+    # ``args_hint`` is the kw-only argument Hermes uses to surface the
+    # command in gateway adapters (e.g. Discord's slash-command picker).
+    assert call_args.kwargs.get("args_hint") == "<subcommand>"
 
 
 def test_register_logs_startup_line(
