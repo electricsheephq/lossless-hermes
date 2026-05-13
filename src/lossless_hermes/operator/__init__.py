@@ -39,6 +39,15 @@ from lossless_hermes.operator.health import (
     WorkerStatus,
     get_v41_health_snapshot,
 )
+from lossless_hermes.operator.reconcile import (
+    ReconcileArgs,
+    ReconcileCandidate,
+    ReconcileError,
+    ReconcileErrorKind,
+    ReconcileResult,
+    list_legacy_candidates,
+    reconcile_session_keys,
+)
 
 __all__ = [
     "ActiveEmbeddingProfile",
@@ -54,12 +63,19 @@ __all__ = [
     "ExtractionTickFn",
     "ExtractionTickResult",
     "MostRecentEvalRun",
+    "ReconcileArgs",
+    "ReconcileCandidate",
+    "ReconcileError",
+    "ReconcileErrorKind",
+    "ReconcileResult",
     "STARTUP_DELAY_S",
     "SuppressionHealth",
     "SynthesisHealth",
     "V41HealthSnapshot",
     "WorkerStatus",
     "get_v41_health_snapshot",
+    "list_legacy_candidates",
+    "reconcile_session_keys",
     "start_embedding_backfill_autostart",
     "try_start_extraction_autostart",
 ]
