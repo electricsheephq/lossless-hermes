@@ -7,13 +7,16 @@ assembler: it hydrates ordered :class:`ContextItemRecord` rows into
 plus DB metadata, plain text rendering, and an :func:`estimate_tokens`
 budget figure.
 
-### Issue 03-04 + 03-05 scope
+### Issue 03-04 + 03-05 + 03-06 + 03-07a scope
 
 This file covers ``resolveItems`` (TS 1374-1466) plus every helper the
-function transitively depends on, AND the fresh-tail boundary
-calculation (``resolveFreshTailOrdinal``, TS 983-1032). The budget
-walk (03-06), orphan stripping (03-07), and orchestration (03-08)
-land in subsequent issues.
+function transitively depends on, the fresh-tail boundary calculation
+(``resolveFreshTailOrdinal``, TS 983-1032), the three-mode token-budget
+walk (``assemble`` step-4, TS 1160-1230), AND
+``filterNonFreshAssistantToolCalls`` (TS 687-778). The companion
+``sanitizeToolUseResultPairing`` in ``transcript_repair.py``
+(03-07b) and the orchestration that calls both passes (03-08) land
+in subsequent issues.
 
 Helpers covered by 03-04:
 
@@ -131,6 +134,13 @@ __all__ = [
     "has_searchable_prompt",
     "budget_walk",
     "SelectionMode",
+    "AssemblySegment",
+    "TOOL_CALL_TYPES",
+    "FilteredEntry",
+    "FilteredToolCallsResult",
+    "extract_tool_call_id_from_block",
+    "extract_tool_result_id_from_message",
+    "filter_non_fresh_assistant_tool_calls",
 ]
 
 
@@ -1818,3 +1828,479 @@ def _budget_walk_chronological(
     # chronological (oldest-first) order from our newest-first walk.
     kept.reverse()
     return kept, "chronological"
+
+
+# ---------------------------------------------------------------------------
+# Orphan tool-use stripping (TS 687-778)
+# ---------------------------------------------------------------------------
+
+
+# Segment label attached to each surviving entry by
+# :func:`filter_non_fresh_assistant_tool_calls`. ``"freshTail"`` for items
+# whose ordinal is in the fresh-tail set, ``"evictable"`` otherwise. The
+# string literals are part of the debug envelope (TS ``preSanitize*`` hash
+# fields, see ``assembler.ts`` 1295-1300) — porting them verbatim
+# preserves wire compatibility with the TS debug-stream consumers.
+AssemblySegment = Literal["freshTail", "evictable"]
+
+
+# Set of content-block ``type`` strings that represent a tool call across
+# every provider the assembler supports. Sourced verbatim from TS
+# ``TOOL_CALL_TYPES`` (``assembler.ts`` 80-87). The mixed-case variants
+# (``"toolCall"`` / ``"toolUse"``) cover OpenClaw's legacy normalized
+# shapes; the snake_case + kebab variants cover Anthropic, OpenAI Chat,
+# and OpenAI Responses. The set lookup is O(1) per block — the dominant
+# cost in the inner loop is the ``content`` array length, not the type
+# match.
+TOOL_CALL_TYPES: Final[frozenset[str]] = frozenset({
+    "toolCall",
+    "toolUse",
+    "tool_use",
+    "tool-use",
+    "functionCall",
+    "function_call",
+})
+
+
+def extract_tool_call_id_from_block(block: Mapping[str, Any]) -> str | None:
+    """Pick the tool_call_id out of a content block.
+
+    Mirrors TS ``extractToolCallId`` (``assembler.ts`` 642-650). Anthropic
+    ``tool_use`` blocks key the id as ``"id"``; OpenAI Responses
+    ``function_call`` blocks key it as ``"call_id"``. The TS source
+    checks ``id`` first; we preserve that order so a block carrying
+    both keys (which should not happen in practice but is possible in
+    test fixtures) resolves to the Anthropic key.
+
+    Args:
+        block: Mapping representing a single content block. Only the
+            ``id`` and ``call_id`` keys are inspected; all other keys
+            are ignored.
+
+    Returns:
+        The string id when one of the keys carries a non-empty string,
+        else ``None``. Empty strings are treated as absent (TS
+        ``block.id.length > 0`` guard at line 643).
+    """
+    id_value = block.get("id")
+    if isinstance(id_value, str) and len(id_value) > 0:
+        return id_value
+    call_id_value = block.get("call_id")
+    if isinstance(call_id_value, str) and len(call_id_value) > 0:
+        return call_id_value
+    return None
+
+
+def extract_tool_result_id_from_message(message: Mapping[str, Any]) -> str | None:
+    """Pick the tool-result id out of a runtime message dict.
+
+    Mirrors TS ``extractToolResultIdFromMessage`` (``assembler.ts``
+    674-685). The runtime message carries the id on the top-level
+    ``toolCallId`` field (set by
+    :meth:`ContextAssembler._resolve_message_item` when the source role
+    is ``"toolResult"``) — NOT inside a ``content`` block. Some legacy
+    OpenClaw paths use ``toolUseId`` as a synonym; we check both.
+
+    Args:
+        message: Runtime message dict. Only the top-level
+            ``toolCallId`` and ``toolUseId`` keys are inspected.
+
+    Returns:
+        The string id when one of the keys carries a non-empty string,
+        else ``None``. Empty strings are treated as absent.
+    """
+    tool_call_id = message.get("toolCallId")
+    if isinstance(tool_call_id, str) and len(tool_call_id) > 0:
+        return tool_call_id
+    tool_use_id = message.get("toolUseId")
+    if isinstance(tool_use_id, str) and len(tool_use_id) > 0:
+        return tool_use_id
+    return None
+
+
+@dataclass(slots=True)
+class FilteredEntry:
+    """A surviving message paired with its assembly segment label.
+
+    Mirrors the inline anonymous-object shape TS uses at
+    ``assembler.ts`` 693 (``Array<{ message: AgentMessage; segment:
+    AssemblySegment }>``). Promoted to a named dataclass on the Python
+    side so downstream code can pattern-match on field names rather
+    than tuple positions.
+
+    Attributes:
+        message: The runtime message dict (post-filter). When the
+            assistant message survived with a reduced ``content``
+            array, this is a freshly built dict — the input message
+            is never mutated in place.
+        segment: ``"freshTail"`` when the source item's ordinal was in
+            the fresh-tail set, ``"evictable"`` otherwise. Used by the
+            03-08 orchestration step to compute ``preSanitize*`` debug
+            hashes (TS 1295-1300).
+    """
+
+    message: dict[str, Any]
+    segment: AssemblySegment
+
+
+@dataclass(slots=True)
+class FilteredToolCallsResult:
+    """Output of :func:`filter_non_fresh_assistant_tool_calls`.
+
+    Mirrors TS's inline return type at ``assembler.ts`` 692-696:
+    ``{ entries, removedToolUseBlockCount, touchedAssistantMessageCount }``.
+    Promoted to a dataclass for the same reasons as :class:`FilteredEntry`.
+
+    Attributes:
+        entries: Surviving entries in input (ordinal-ascending) order.
+            Each carries the message dict plus its segment label.
+        removed_tool_use_block_count: Number of assistant messages
+            that had at least one tool-use block removed. **NOTE**:
+            this is a per-message counter, not a per-block counter —
+            an assistant message with three orphan blocks removed
+            counts as 1, not 3. This matches the TS source verbatim
+            (``assembler.ts`` 754-764 increments at message granularity).
+        touched_assistant_message_count: Number of assistant messages
+            that were either filtered down to a smaller content array
+            or dropped entirely. Equal to
+            ``removed_tool_use_block_count`` per the TS source — both
+            counters increment together on every touched message.
+    """
+
+    entries: list[FilteredEntry]
+    removed_tool_use_block_count: int
+    touched_assistant_message_count: int
+
+
+def filter_non_fresh_assistant_tool_calls(
+    items: Sequence[ResolvedItem],
+    fresh_tail_ordinals: set[int],
+    orphan_stripping_ordinal: int,
+    all_tool_result_ordinals_by_id: Mapping[str, Sequence[int]],
+) -> FilteredToolCallsResult:
+    """Strip assistant tool-use blocks whose tool_result was evicted.
+
+    Mirrors TS ``filterNonFreshAssistantToolCalls`` (``assembler.ts``
+    687-778). Run between budget-walk (Step 03-06) and the final
+    sanitize pass (Step 03-07b). Removes assistant content blocks of
+    type ``tool_use`` (and provider variants in :data:`TOOL_CALL_TYPES`)
+    when no matching ``tool_result`` survives the budget walk —
+    Anthropic-compatible APIs reject such "orphan" tool-call blocks
+    with a 400 error, so this pass is load-bearing for API call
+    correctness.
+
+    ### Algorithm (TS 696-772)
+
+    1. **Build the selected-tool-result index.** Walk every input
+       ``item``. If the item is a tool_result (top-level
+       ``toolCallId``/``toolUseId``), append its ordinal to the list
+       keyed by that id. The result is
+       ``selected_tool_result_ordinals_by_id: dict[str, list[int]]``
+       — one list per id, ordinals in insertion order (which equals
+       ascending order when the input is sorted by ordinal, the caller's
+       contract).
+
+    2. **Filter each assistant message.** For every item:
+
+       * Non-assistant items pass through unchanged with their segment
+         label.
+       * Assistant items whose ``content`` is not a list (e.g. plain
+         string, or an unexpected shape) pass through unchanged. The
+         TS guard at line 720 protects against ``content: undefined``
+         and ``content: "string"`` — both common in OpenAI-Chat shapes.
+       * For each block in the content array, decide keep-or-strip:
+
+         a. Non-dict or missing ``type`` → KEEP (not our concern;
+            could be ``text``, ``image``, ``thinking``, etc.).
+         b. ``type`` not in :data:`TOOL_CALL_TYPES` → KEEP.
+         c. No extractable tool_call_id (neither ``id`` nor ``call_id``
+            present) → KEEP. The TS source returns ``true`` (keep)
+            here because there's nothing to match against — orphan
+            detection requires an id.
+         d. A selected tool_result with the same id exists at an
+            ordinal **strictly greater** than this item's ordinal
+            (``> item.ordinal``, not ``>=``) → KEEP. The strict
+            inequality is load-bearing: the tool_result must come
+            AFTER the tool_use in the timeline. A tool_result with
+            the same ordinal as the tool_use would be a malformed
+            input (Anthropic emits tool_result on the NEXT turn) and
+            we treat it as no-match.
+         e. Item ordinal is **less than** the orphan-stripping
+            boundary → STRIP. Items below the boundary are aggressively
+            pruned because the boundary advances past them as the
+            conversation grows; cache stability for those items is
+            no longer load-bearing.
+         f. The id has **NO** resolved tool_result anywhere
+            (``all_tool_result_ordinals_by_id`` lookup returns absent
+            or empty) → KEEP. The tool_use is not a stale pairing —
+            there's no evidence a result ever existed, so we preserve
+            the assistant's intent and let the sanitize pass
+            (03-07b) handle it.
+         g. The id HAS resolved tool_result evidence somewhere → STRIP.
+            A subsequent ``assemble()`` call might include the result
+            at a different ordinal; emitting this tool_use now would
+            create a stale-pairing risk across cache reuses.
+
+       NOTE the inversion in branches (f) vs (g): the issue spec text
+       describes this branch in the OPPOSITE direction (presence-of-
+       evidence → KEEP, absence → STRIP). The TS source at line 747
+       (``if (!(...?.length)) return true``) reads the other way: the
+       ``!`` inverts the length check, so absence-of-evidence → KEEP.
+       The TS source is canonical per project policy.
+
+    3. **Decide message-level disposition** (TS 754-771):
+
+       * If the filtered content is empty → DROP the entire message
+         (do not push). Increment both counters.
+       * If nothing was filtered → push the **original** message
+         (no copy) with its segment.
+       * Otherwise (partial-strip with surviving content) → push a
+         **new** message dict with the same fields except for
+         ``content``. Increment both counters.
+
+    ### Cache-marginal protection (load-bearing)
+
+    The two guards at TS 743 and 747 implement the cache-stability
+    strategy. The boundary check (``item.ordinal <
+    orphan_stripping_ordinal``) is the strip-aggressively threshold:
+    items below this ordinal are old enough that the engine no
+    longer protects them across ``assemble()`` calls. The boundary
+    is pinned by the engine shell's
+    :attr:`LcmContextEngine._stable_orphan_stripping_ordinals_by_conversation`
+    map (landing in 03-08).
+
+    The second guard at TS 747 — ``if (!(all_ordinals.length)) keep``
+    — is a sanitize-vs-strip disposition for items AT or ABOVE the
+    boundary that didn't find a selected result. If the id has zero
+    resolved-anywhere evidence, the tool_use is genuinely orphaned
+    (the result was never emitted, or was lost from history); we
+    KEEP the block and let the downstream sanitize pass handle it.
+    If the id HAS resolved evidence somewhere in the full
+    conversation history, the result might surface in a later
+    assembly call at a different ordinal — emitting the tool_use
+    now creates a stale-pairing risk across cache reuses, so we
+    STRIP it.
+
+    ### Provider-agnostic block detection
+
+    The :data:`TOOL_CALL_TYPES` constant covers six provider variants
+    (Anthropic ``tool_use``, OpenAI Chat ``functionCall`` /
+    ``function_call``, OpenAI Responses ``function_call``, OpenClaw
+    legacy ``toolCall`` / ``toolUse``, kebab ``tool-use``). The id
+    extraction logic in :func:`extract_tool_call_id_from_block` covers
+    both Anthropic-style ``id`` and OpenAI-Responses-style ``call_id``.
+    See ``docs/porting-guides/assembler-compaction.md`` §"Provider
+    variants" for the full matrix.
+
+    ### Wave-N provenance
+
+    The TS source at lines 687-778 carries **no** explicit ``Wave-N``
+    audit-fix marker — the orphan-stripping algorithm is one of the
+    sections that survived all 12 audit waves without a scar-tissue
+    patch. (The cache-marginal protections at 743 and 747 are part of
+    the original design, not a Wave-N retro-fix.) Per ADR-029, we
+    omit a ``# LCM Wave-N`` comment from this function.
+
+    ### Performance
+
+    O(n + total_blocks) where ``n = len(items)`` and ``total_blocks``
+    is the sum of content-array lengths across assistant messages.
+    The index-build pass is O(n); the filter pass is O(n) outer +
+    O(blocks) inner. Set membership (``fresh_tail_ordinals``) is
+    O(1). Dict get on the two index maps is O(1). No quadratic
+    patterns — the only mutation is ``list.append`` and dict-key
+    ``list.append``, both amortised O(1).
+
+    Args:
+        items: Items selected by the budget walk, in ordinal-ascending
+            order. The function expects the caller to have already
+            composed ``kept_evictable + list(fresh_tail)`` (TS 1233).
+            Both raw-message items and summary items may appear; only
+            assistant raw-message items are eligible for filtering.
+        fresh_tail_ordinals: Set of ordinals that belong to the fresh
+            tail. Used only to compute the per-entry segment label.
+            Items whose ordinal is in this set get ``"freshTail"``;
+            others get ``"evictable"``.
+        orphan_stripping_ordinal: Boundary below which orphan
+            tool-use blocks are aggressively stripped. The engine
+            shell's
+            ``_stable_orphan_stripping_ordinals_by_conversation`` map
+            pins this across hot-cache turns (03-08 wiring); for
+            cold-cache assemblies the caller passes the current
+            fresh-tail ordinal (the effect is "strip everything
+            outside the fresh tail").
+        all_tool_result_ordinals_by_id: Mapping from tool_call_id to
+            **every** ordinal at which a tool_result with that id
+            resolved — whether or not the budget walk selected it.
+            The caller builds this from the full resolved list, not
+            just the selected items. Read at TS line 747: when this
+            map has resolved evidence for the id, an at-or-above-
+            boundary orphan tool_use is STRIPPED (avoid stale-pairing
+            risk on next assembly). When it has none, the tool_use
+            is KEPT and deferred to the sanitize pass.
+
+    Returns:
+        A :class:`FilteredToolCallsResult` containing the surviving
+        entries (in input order), plus per-message counters for the
+        debug envelope.
+
+        Invariant: every assistant message in
+        ``result.entries`` either had no tool-call blocks to begin
+        with, or every tool-call block that survived has a usable
+        downstream selected tool_result (or is protected by the
+        cache-marginal guards).
+    """
+    # ── Pass 1: index selected tool_results by id ─────────────────────
+    # TS line 697-708. The TS source uses ``Map<string, number[]>``;
+    # the Python equivalent is ``dict[str, list[int]]``. The TS
+    # ``ordinals.push(...)`` pattern is mirrored via
+    # ``selected.setdefault(id, []).append(ord)``.
+    selected_tool_result_ordinals_by_id: dict[str, list[int]] = {}
+    for item in items:
+        tool_result_id = extract_tool_result_id_from_message(item.message)
+        if tool_result_id is None:
+            continue
+        ordinals = selected_tool_result_ordinals_by_id.get(tool_result_id)
+        if ordinals is not None:
+            ordinals.append(item.ordinal)
+        else:
+            selected_tool_result_ordinals_by_id[tool_result_id] = [item.ordinal]
+
+    # ── Pass 2: filter assistant content blocks ───────────────────────
+    filtered_entries: list[FilteredEntry] = []
+    removed_tool_use_block_count = 0
+    touched_assistant_message_count = 0
+
+    for item in items:
+        # Segment label derives purely from ordinal membership in the
+        # fresh-tail set (TS line 714). The label travels with the
+        # entry for downstream ``preSanitize*`` hash computation.
+        segment: AssemblySegment = (
+            "freshTail" if item.ordinal in fresh_tail_ordinals else "evictable"
+        )
+
+        message = item.message
+        # Non-assistant items pass through unchanged. TS line 715-718.
+        if message.get("role") != "assistant":
+            filtered_entries.append(FilteredEntry(message=message, segment=segment))
+            continue
+
+        # Assistant with non-array content (e.g. plain string, missing
+        # key, or unexpected shape) passes through unchanged. TS line
+        # 720-723. The downstream sanitize pass + cleanup at TS 1276
+        # handles empty/blank string content; we don't touch it here.
+        content = message.get("content")
+        if not isinstance(content, list):
+            filtered_entries.append(FilteredEntry(message=message, segment=segment))
+            continue
+
+        # Per-block filter. ``removed_any`` tracks whether at least one
+        # block was stripped so we know whether to copy the message
+        # dict (touched) or push the original reference (untouched).
+        removed_any = False
+        new_content: list[Any] = []
+        for block in content:
+            # Non-dict blocks (str, None, numbers — rare in practice
+            # but possible from malformed fixtures) are kept. TS line
+            # 727-729 short-circuits on ``!block || typeof block !==
+            # "object"``; Python's ``isinstance`` is the equivalent.
+            if not isinstance(block, Mapping):
+                new_content.append(block)
+                continue
+
+            block_type = block.get("type")
+            if not isinstance(block_type, str) or block_type not in TOOL_CALL_TYPES:
+                new_content.append(block)
+                continue
+
+            tool_call_id = extract_tool_call_id_from_block(block)
+            if tool_call_id is None:
+                # No id to match against — keep the block. TS line
+                # 735-737 returns ``true`` here.
+                new_content.append(block)
+                continue
+
+            selected_ordinals = selected_tool_result_ordinals_by_id.get(tool_call_id, [])
+            # TS line 739: strict ``> item.ordinal``. The strict
+            # inequality is load-bearing — a tool_result at the same
+            # ordinal as the tool_use is malformed input (results
+            # always come on a later turn) and counts as no-match.
+            has_usable_selected_result = any(ord_ > item.ordinal for ord_ in selected_ordinals)
+            if has_usable_selected_result:
+                new_content.append(block)
+                continue
+
+            # No usable selected result — check the boundary first.
+            # Items below the boundary are aggressively stripped (the
+            # boundary advances past them as the conversation grows,
+            # so cache-stability concerns no longer apply).
+            if item.ordinal < orphan_stripping_ordinal:
+                removed_any = True
+                continue
+
+            # At/above the boundary — apply the cache-marginal
+            # fallback. TS line 747-749:
+            # ``if (!(allToolResultOrdinalsById.get(toolCallId)?.length))
+            # return true``. The leading ``!`` inverts the length
+            # check. The block is KEPT when there is NO evidence of a
+            # resolved tool_result anywhere (id absent or maps to
+            # empty list) — i.e. the tool_use is not a stale pairing,
+            # just an unresolved call.
+            #
+            # Conversely, when the id DOES have resolved evidence in
+            # the conversation's full history but the result didn't
+            # make it into the selected set, the block is STRIPPED.
+            # The rationale: a subsequent ``assemble()`` call might
+            # include the result at a different ordinal, and emitting
+            # the tool_use here would create a stale-pairing risk
+            # across cache reuses.
+            #
+            # This is the inverse of the algorithm summary in the
+            # issue spec text; the TS source is canonical per project
+            # policy ("TS source is canonical").
+            all_ordinals = all_tool_result_ordinals_by_id.get(tool_call_id)
+            if all_ordinals is None or len(all_ordinals) == 0:
+                new_content.append(block)
+                continue
+
+            # No selected result, at/above boundary, and the id has
+            # resolved evidence elsewhere — strip. TS line 750-751.
+            removed_any = True
+
+        # ── Message-level disposition (TS 754-771) ─────────────────
+        if len(new_content) == 0:
+            # All blocks stripped → drop the entire message. Counters
+            # increment whether or not blocks were actually removed
+            # (e.g. an assistant message with ``content: []`` triggers
+            # both increments per TS line 754-757 — the ``removed_any``
+            # flag is not checked at this branch). We preserve that
+            # quirk verbatim.
+            removed_tool_use_block_count += 1
+            touched_assistant_message_count += 1
+            continue
+
+        if not removed_any:
+            # Nothing changed — push the original message reference,
+            # avoiding the cost of dict materialization. TS line
+            # 759-762 also pushes the original reference (``item.message``).
+            filtered_entries.append(FilteredEntry(message=message, segment=segment))
+            continue
+
+        # Partial strip with surviving content — emit a new message
+        # dict with the filtered content. We copy via ``dict(message)``
+        # to preserve every other field (role, usage envelope,
+        # toolCallId on the assistant turn if any, etc.) without
+        # mutating the input. The TS source uses object spread
+        # (``{ ...item.message, content: ... }``); ``dict(...)`` +
+        # overwrite-key is the Python equivalent.
+        removed_tool_use_block_count += 1
+        touched_assistant_message_count += 1
+        new_message: dict[str, Any] = dict(message)
+        new_message["content"] = new_content
+        filtered_entries.append(FilteredEntry(message=new_message, segment=segment))
+
+    return FilteredToolCallsResult(
+        entries=filtered_entries,
+        removed_tool_use_block_count=removed_tool_use_block_count,
+        touched_assistant_message_count=touched_assistant_message_count,
+    )
