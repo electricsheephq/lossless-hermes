@@ -51,6 +51,14 @@ type-mypy = ["mypy==1.13.0"]
 # register() then calls ctx.register_context_engine(LosslessEngine()).
 lossless-hermes = "lossless_hermes:register"
 
+[project.scripts]
+# Standalone CLI entry — used by operator subcommands that don't need a
+# running Hermes session (e.g. `lossless-hermes import-openclaw` per
+# ADR-025 / epic 08-15). Dispatches to a subcommand main in
+# lossless_hermes.cli. The same subcommand bodies are also wired into
+# the /lcm slash command tree via lossless_hermes.plugin.commands.
+lossless-hermes = "lossless_hermes.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/lossless_hermes"]
 
