@@ -49,9 +49,19 @@ jobs:
           fi
       - name: Run schema-diff verify
         id: verify
+        # Note: during Epic 01 ramp-up (#01-04, #01-05, #01-06, #01-15
+        # land one section at a time), we use --verify-subset to gate
+        # "every Python object matches reference, none unexpected" without
+        # blocking on the sections scheduled for later PRs.
+        #
+        # Once #01-15 lands (the final Epic 01 issue contributing schema),
+        # flip this to `--verify` for strict zero-diff gating.
+        #
+        # Soft-pass on exit 2 stays for the very-early pre-Wave-2 state
+        # where the Python module hasn't been imported yet.
         run: |
           set +e
-          ./scripts/schema_diff.sh --verify
+          ./scripts/schema_diff.sh --verify-subset
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ $rc -eq 2 ]; then

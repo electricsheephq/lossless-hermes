@@ -14,6 +14,17 @@
 #                        committed reference. Exits 0 if zero diff, 1 if delta.
 #                        This is what CI runs on every PR that touches db/migration*.
 #
+#   --verify-subset      Like --verify but exits 0 if Python schema is a
+#                        strict SUBSET of the reference (i.e. every Python
+#                        object exists in the reference and matches
+#                        byte-for-byte modulo whitespace; Python may be
+#                        MISSING objects the reference has — those are
+#                        scheduled for later Epic 01 issues #01-05 / #01-06 /
+#                        #01-15). Used during the Epic 01 ramp-up. Exits 1
+#                        if a Python object DIFFERS from the reference;
+#                        exits 5 if a Python object exists that the reference
+#                        does NOT (forbidden — true schema drift).
+#
 #   --check-reference    Re-extract the TS schema and diff against the committed
 #                        reference (no Python). Exits 0 if reference is fresh,
 #                        1 if stale (i.e., committed reference != current TS source).
@@ -27,10 +38,11 @@
 #
 # Exit codes:
 #   0   schema matches (or scaffold check passed)
-#   1   schema mismatch (CI must fail)
+#   1   schema mismatch (CI must fail) — a Python object diverged from reference
 #   2   Python migrations not yet implemented (Wave 0/Wave 1 expected state)
 #   3   TS migrations not runnable (LCM deps not installed or build broken)
 #   4   bad args / unknown mode
+#   5   --verify-subset: Python created an object the reference does not have
 
 set -euo pipefail
 
@@ -148,6 +160,32 @@ case "$MODE" in
       cat /tmp/schema_diff.txt >&2
       exit 1
     fi
+    ;;
+
+  --verify-subset)
+    if [ ! -f "$REFERENCE_FIXTURE" ]; then
+      echo "❌ Reference fixture missing: $REFERENCE_FIXTURE" >&2
+      echo "   Run: $0 --refresh-reference" >&2
+      exit 1
+    fi
+    tmp_py_schema="$(mktemp)"
+    trap 'rm -f "$tmp_py_schema"' EXIT
+    extract_py_schema "$tmp_py_schema"
+    py_rc=$?
+    if [ $py_rc -eq 2 ]; then
+      echo "⚠️  Python migrations not yet implemented (expected pre-Wave 2)." >&2
+      exit 2
+    elif [ $py_rc -ne 0 ]; then
+      echo "❌ Python schema extraction failed (exit $py_rc)" >&2
+      exit $py_rc
+    fi
+
+    # Subset comparison: every Python object must exist in the reference
+    # with matching SQL (modulo whitespace); reference may have extra
+    # objects (deferred to later Epic 01 issues).
+    "$PYTHON" "${REPO_ROOT}/scripts/schema_subset_check.py" \
+      --reference "$REFERENCE_FIXTURE" \
+      --python "$tmp_py_schema"
     ;;
 
   --check-reference)
