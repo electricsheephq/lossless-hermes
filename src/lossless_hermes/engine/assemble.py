@@ -19,6 +19,14 @@ return is a valid observer-only result that leaves the user message
 unchanged; Epic 03 replaces the body with the real
 ``LOSSLESS_RECALL_POLICY_PROMPT`` injection per ADR-014.
 
+**02-07 fix-forward (Epic 03 prep):** the hook is **synchronous**
+(``def``, not ``async def``). Hermes's ``PluginManager.invoke_hook``
+(``hermes_cli/plugins.py:1218-1232``) calls callbacks via
+``ret = cb(**kwargs)`` with no ``await`` / ``asyncio.run`` — an
+``async def`` callback would return a coroutine that Hermes would
+treat as a non-``None`` return and append to the results list,
+double-injecting context. Epic 03 returns the policy dict directly.
+
 Mixin contract (per ADR-027 §Consequences "All state lives on the shell
 class"):
 
@@ -72,7 +80,7 @@ class _AssembleMixin:
     bodies without touching :class:`LCMEngine` itself.
     """
 
-    async def _on_pre_llm_call(
+    def _on_pre_llm_call(
         self,
         session_id: str = "",
         user_message: Any = None,
@@ -99,6 +107,11 @@ class _AssembleMixin:
         unchanged. The kwargs shape matches the ``pre_llm_call``
         signature in ``docs/reference/hermes-hooks.md`` line 91 — every
         documented kwarg is accepted and no exception fires.
+
+        **Sync, not async:** Hermes's ``invoke_hook`` does
+        ``ret = cb(**kwargs)`` with no ``await``; ``async def`` would
+        return a coroutine that Hermes treats as the injection context.
+        Epic 03 stays sync and returns ``{"context": ...}`` directly.
 
         Args:
             session_id: The Hermes session identifier.

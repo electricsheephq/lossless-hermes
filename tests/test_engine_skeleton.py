@@ -34,10 +34,9 @@ See:
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict
 
 import pytest
 
@@ -270,21 +269,32 @@ def test_on_post_llm_call_stub_returns_none() -> None:
     wire it via ``ctx.register_hook("post_llm_call", engine._on_post_llm_call)``
     without the agent loop crashing every turn. Epic 03 fills in the
     real diff-and-ingest body.
+
+    **Sync invariant:** Hermes's ``invoke_hook`` calls callbacks
+    synchronously (``ret = cb(**kwargs)`` — ``hermes_cli/plugins.py:1218-1232``).
+    ``async def`` would return a coroutine that Hermes treats as a
+    non-``None`` return. This test asserts the direct (sync) call
+    returns ``None``, guarding against accidental re-introduction of
+    ``async def``.
     """
     engine = LCMEngine()
 
-    async def _exercise() -> Any:
-        return await engine._on_post_llm_call(
-            session_id="sess-1",
-            user_message="hi",
-            assistant_response="hello",
-            conversation_history=[],
-            model="claude-haiku",
-            platform="anthropic",
-        )
+    result = engine._on_post_llm_call(
+        session_id="sess-1",
+        user_message="hi",
+        assistant_response="hello",
+        conversation_history=[],
+        model="claude-haiku",
+        platform="anthropic",
+    )
 
-    result = asyncio.run(_exercise())
     assert result is None
+    # Sync guard: a coroutine return would mean someone re-introduced
+    # ``async def``. Hermes would then store the coroutine in its
+    # results list instead of treating the hook as observer-only.
+    import inspect
+
+    assert not inspect.iscoroutine(result)
 
 
 def test_on_pre_llm_call_stub_returns_none() -> None:
@@ -297,14 +307,18 @@ def test_on_pre_llm_call_stub_returns_none() -> None:
     a valid observer-only result that leaves the user message
     unchanged. Epic 03 replaces this body with the real
     ``LOSSLESS_RECALL_POLICY_PROMPT`` injection per ADR-014.
+
+    **Sync invariant:** Hermes invokes hooks synchronously; ``async``
+    would inject a coroutine instead of policy text. Guarded below.
     """
     engine = LCMEngine()
 
-    async def _exercise() -> Any:
-        return await engine._on_pre_llm_call(session_id="sess-1", conversation_history=[])
+    result = engine._on_pre_llm_call(session_id="sess-1", conversation_history=[])
 
-    result = asyncio.run(_exercise())
     assert result is None
+    import inspect
+
+    assert not inspect.iscoroutine(result)
 
 
 # ---------------------------------------------------------------------------

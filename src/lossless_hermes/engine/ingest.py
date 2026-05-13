@@ -15,6 +15,16 @@ so that :func:`lossless_hermes.register` can wire it as a Hermes
 ``post_llm_call`` hook callback without the agent loop crashing on every
 turn. The real diff-and-ingest body still lands in Epic 03.
 
+**02-07 fix-forward (Epic 03 prep):** the hook is **synchronous**
+(``def``, not ``async def``). Hermes's ``PluginManager.invoke_hook``
+(``hermes_cli/plugins.py:1218-1232``) calls callbacks via
+``ret = cb(**kwargs)`` with no ``await`` / ``asyncio.run`` — an
+``async def`` callback would return a coroutine, Hermes would treat
+that coroutine as a non-``None`` return value and append it to the
+results list. The real diff-and-ingest body in Epic 03 acquires
+``self._session_locks[session_id]`` (a ``threading.Lock`` in the
+sync surface) before mutating DB state.
+
 Mixin contract (per ADR-027 §Consequences "All state lives on the shell
 class"):
 
@@ -66,7 +76,7 @@ class _IngestMixin:
     bodies without touching :class:`LCMEngine` itself.
     """
 
-    async def _on_post_llm_call(
+    def _on_post_llm_call(
         self,
         session_id: str = "",
         user_message: Any = None,
@@ -91,6 +101,14 @@ class _IngestMixin:
         ``docs/reference/hermes-hooks.md`` line 92 — every kwarg is
         accepted (defaults provided + ``**kwargs`` catches forward-compat
         additions) and no exception fires.
+
+        **Sync, not async:** Hermes invokes hooks synchronously
+        (``ret = cb(**kwargs)`` in ``hermes_cli/plugins.py:1218-1232``).
+        An ``async def`` callback would return a coroutine that Hermes
+        would treat as a non-``None`` result and append to ``results``.
+        Epic 03's body uses ``threading.Lock`` per session_id (the
+        Hermes hook surface is single-threaded per turn within a
+        process, but cross-process coordination uses SQLite WAL).
 
         Args:
             session_id: The Hermes session identifier.
