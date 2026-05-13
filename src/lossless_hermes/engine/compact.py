@@ -6,10 +6,13 @@ Hosts the ``compress`` overflow-recovery entry point + the
 §Decision "Package structure" — the ``compact.py`` sub-module of
 ``src/lossless_hermes/engine/``.
 
-At issue **02-05** ``should_compress`` carries real logic — the
-conventional threshold gate plus an anti-thrashing back-off — while
-``compress`` remains a passthrough (the noop compress refinement lands
-in 02-06; the real compaction algorithm lands in Epic 04).
+At issue **02-06** ``should_compress`` carries real logic — the
+conventional threshold gate plus an anti-thrashing back-off — and
+``compress`` is a refined passthrough that (a) appends to
+``_compression_history`` for the anti-thrashing gate, (b) increments
+``compression_count`` per ``run_agent.py``'s display contract, and
+(c) emits a debug log so an operator scanning logs sees the no-op
+fire. The real compaction algorithm lands in Epic 04.
 
 Maps to ``engine.ts`` ``compact()`` / ``executeCompactionCore`` (lines
 7185-7243, 3344-3528) and ``evaluateIncrementalCompaction`` (2824-3002).
@@ -22,8 +25,8 @@ class"):
 * No state owned here. Methods read/write
   ``self._compression_history``, ``self._circuit_breakers``,
   ``self._compaction_telemetry_store``, ``self._compaction_maintenance_store``,
-  etc. exclusively via the shell class's attributes declared in
-  :meth:`LCMEngine.__init__`.
+  ``self.compression_count`` etc. exclusively via the shell class's
+  attributes declared in :meth:`LCMEngine.__init__`.
 * No cross-mixin imports. If compaction work needs assemble behavior,
   it goes through ``self.assemble(...)`` (MRO resolves to
   :class:`_AssembleMixin`).
@@ -31,9 +34,9 @@ class"):
 Why ``compress`` and ``should_compress`` have bodies (not stubs):
 
 * These are required ABC methods on :class:`ContextEngine` — they MUST
-  be callable on a freshly-constructed engine. The 02-05 ``compress``
-  passes every input through unchanged; 02-06 / Epic 04 fills in the
-  refinement and the real compaction algorithm. Keeping the bodies
+  be callable on a freshly-constructed engine. The 02-06 ``compress``
+  passes every input through unchanged but updates the counters/log;
+  Epic 04 fills in the real compaction algorithm. Keeping the bodies
   here (rather than the shell class) means subsequent algorithm-fill
   issues touch one file.
 
@@ -47,11 +50,15 @@ See:
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     pass
+
+
+logger = logging.getLogger("lossless_hermes.engine.compact")
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +113,7 @@ class _CompactMixin:
     # is created — the values still come from the shell's ``__init__``.
     last_prompt_tokens: int
     threshold_tokens: int
+    compression_count: int
     _compression_history: Deque[Tuple[int, int]]
 
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
@@ -200,10 +208,15 @@ class _CompactMixin:
 
         Maps to engine.ts ``compact()`` / ``executeCompactionCore``
         (lines 7185-7243, 3344-3528) — the real algorithm ports in Epic
-        04. At 02-05 the body is still a passthrough (the noop compress
-        refinement lands in 02-06), but the call now records a
-        ``(before, after)`` tuple into ``self._compression_history`` so
-        :meth:`should_compress` has data for its anti-thrashing gate.
+        04. At 02-06 the body is still a passthrough but it now (a)
+        records a ``(before, after)`` tuple into
+        ``self._compression_history`` so :meth:`should_compress` has
+        data for its anti-thrashing gate, (b) increments
+        ``self.compression_count`` so ``run_agent.py``'s display stays
+        consistent (per ``docs/reference/hermes-hooks.md`` "Required
+        class-level state" — ``compression_count`` is read at
+        ``run_agent.py:10377``), and (c) emits a debug log so an
+        operator scanning logs sees the no-op fire.
 
         Since 02-05 ``compress`` is a passthrough, ``after == before``
         for every entry — the savings ratio is 0% and the entry is
@@ -215,26 +228,46 @@ class _CompactMixin:
 
         Args:
             messages: The conversation message list. Returned verbatim
-                at 02-05.
+                at 02-06.
             current_tokens: Pre-compression token estimate from the host.
                 Used as the ``before`` value in the history tuple. When
                 ``None`` falls back to ``self.last_prompt_tokens``.
-            focus_topic: Ignored at 02-05; Epic 04 forwards to the
+            focus_topic: Ignored at 02-06; Epic 04 forwards to the
                 guided-compression path.
 
         Returns:
-            The input ``messages`` list, unchanged at 02-05.
+            The input ``messages`` list, unchanged at 02-06.
         """
         # Anti-thrashing telemetry. The host passes ``current_tokens``
         # as the pre-compression count; we fall back to
         # ``last_prompt_tokens`` when absent (e.g., a manual ``/compress``
-        # invocation without a fresh API response). At 02-05 the body is
+        # invocation without a fresh API response). At 02-06 the body is
         # a passthrough so ``after == before``; every entry will be
         # "ineffective" by definition and the gate will trip after
         # ``INEFFECTIVE_RUN_LENGTH`` compress() calls.
         before = current_tokens if current_tokens is not None else self.last_prompt_tokens
-        after = before  # Passthrough — no compaction at 02-05.
+        after = before  # Passthrough — no compaction at 02-06.
         self._compression_history.append((before, after))
+
+        # 02-06: increment compression_count per the hermes-hooks.md
+        # "Required class-level state" contract — Hermes's
+        # ``run_agent.py:10377`` reads this field for the per-turn
+        # display. A "called but did nothing" still counts as one
+        # compress invocation from the host's perspective; Epic 04 may
+        # later split into separate counters for real vs. no-op runs.
+        self.compression_count += 1
+
+        # 02-06: debug breadcrumb so an operator scanning logs sees the
+        # no-op fire. Useful while Epic 04 is still in flight (a real
+        # compaction would produce richer telemetry); for now this
+        # confirms the surface is reached.
+        logger.debug(
+            "[lcm] compress called (no-op): %d messages, current_tokens=%s, focus_topic=%s",
+            len(messages),
+            current_tokens,
+            focus_topic,
+        )
+
         return messages
 
 

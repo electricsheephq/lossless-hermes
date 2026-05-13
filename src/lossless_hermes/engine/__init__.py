@@ -66,10 +66,12 @@ See:
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.hermes_bridge import ContextEngine
@@ -85,7 +87,12 @@ from .ingest import _IngestMixin
 from .lifecycle import _LifecycleMixin
 from .session_locks import SessionLockRegistry
 
-__all__ = ["APPLE_SYSTEM_PYTHON_MSG", "CircuitBreaker", "LCMEngine"]
+__all__ = [
+    "APPLE_SYSTEM_PYTHON_MSG",
+    "CircuitBreaker",
+    "ContextEngineInfo",
+    "LCMEngine",
+]
 
 logger = logging.getLogger("lossless_hermes.engine")
 
@@ -127,6 +134,48 @@ def _check_sqlite_extension_loading() -> None:
     """
     if not _has_sqlite_extension_loading():
         raise RuntimeError(APPLE_SYSTEM_PYTHON_MSG)
+
+
+# ---------------------------------------------------------------------------
+# ContextEngineInfo — identity record (per 02-02 spec)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ContextEngineInfo:
+    """Identity + capability record for the engine.
+
+    Per ``epics/02-engine-skeleton/02-02-engine-state.md`` table, this
+    surface lives on :attr:`LCMEngine.info`. ``owns_compaction`` is
+    ``True`` by default and degrades to ``False`` only if migration
+    fails — Hermes consults it (post Epic 03/04 hook-up) to decide
+    whether to defer compaction to the plugin or fall back to the
+    in-host default. Issue 02-02 declares the field with the default
+    record; Epic 04's compaction-failure handling can swap to a
+    ``replace(self.info, owns_compaction=False)`` if needed.
+
+    Frozen + slots: identity records are immutable (Hermes would not
+    re-read after registration anyway) and the slots optimization
+    keeps memory flat — many short-lived engine instances are created
+    in tests.
+
+    Maps to TS ``LcmContextEngine.info: ContextEngineInfo`` field
+    declared near the top of ``src/engine.ts``.
+
+    Attributes:
+        name: Engine selector string. Matches ``context.engine: lcm``
+            in ``~/.hermes/config.yaml`` (ADR-001 §Consequences).
+        version: Semantic version of the engine.
+        owns_compaction: Whether the engine drives its own compaction
+            (vs. falling back to Hermes's in-host default). True at
+            construction; degrades to False if migrations fail (per
+            spec table row 1, "true unless migration failed"). The
+            Epic-04 compaction-failure handler is the only writer.
+    """
+
+    name: str = "lcm"
+    version: str = "0.1.0"
+    owns_compaction: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +368,86 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self.last_cache_read_tokens: int = 0
         self.last_cache_write_tokens: int = 0
         self.cache_aware: bool = False
+
+        # ------------------------------------------------------------------
+        # 02-02 state fields — identity, migration/feature flags, compiled
+        # session-filter patterns, assembly-state dicts, log-dedup set.
+        # See ``epics/02-engine-skeleton/02-02-engine-state.md`` for the
+        # canonical table. The JSONL-derived TS fields are deliberately
+        # absent per the same spec §Dropped fields.
+        # ------------------------------------------------------------------
+
+        # Identity + capability record. Default ``owns_compaction=True``;
+        # Epic 04's compaction-failure handler may eventually flip this
+        # to False if migrations or stores cannot be brought up (the
+        # ContextEngineInfo dataclass is frozen, so use
+        # ``dataclasses.replace`` in that path).
+        self.info: ContextEngineInfo = ContextEngineInfo()
+
+        # ``migrated`` — True once ``run_lcm_migrations`` succeeds.
+        # Updated by :meth:`_LifecycleMixin.on_session_start` (02-03)
+        # after the migration ladder returns; stays False here at
+        # construction time since heavy init is deferred (ADR-001).
+        self.migrated: bool = False
+
+        # ``fts5_available`` — sqlite FTS5 extension presence.
+        # Updated by :meth:`_LifecycleMixin.on_session_start` (02-03)
+        # from ``get_lcm_db_features(conn).fts5_available`` after the
+        # connection opens. Default ``True`` at construction is the
+        # optimistic case; the lifecycle body will overwrite it based
+        # on the real probe before any store reads run. Epic 03/04
+        # readers consult this when deciding between FTS5 and the
+        # LIKE-fallback paths in the stores.
+        self.fts5_available: bool = True
+
+        # ``ignore_session_patterns`` — compiled regex list from
+        # ``config.ignore_session_patterns`` (a ``list[str]``).
+        # Matched against ``session_id`` to skip the LCM pipeline
+        # entirely for sessions that should never be tracked (CI runs,
+        # benchmark scripts, etc.). Used by Epic 03's ingest gate.
+        self.ignore_session_patterns: List[re.Pattern[str]] = [
+            re.compile(p) for p in self.config.ignore_session_patterns
+        ]
+
+        # ``stateless_session_patterns`` — compiled regex list from
+        # ``config.stateless_session_patterns`` (a ``list[str]``).
+        # Matched against ``session_id`` to bypass DB writes (but still
+        # observe). Used by Epic 03's ingest gate. Separate from
+        # ``ignore_session_patterns`` so an operator can keep the
+        # observability layer (token telemetry, log breadcrumbs) while
+        # skipping the persistence layer.
+        self.stateless_session_patterns: List[re.Pattern[str]] = [
+            re.compile(p) for p in self.config.stateless_session_patterns
+        ]
+
+        # ``_previous_assembled_messages_by_conversation`` — last
+        # assembled message list per conversation id. Used by
+        # :class:`_AssembleMixin` in Epic 03 for prefix-stability
+        # diagnostics (catching cases where the deterministic-assembly
+        # invariant breaks — the same turn assembling to a different
+        # prefix on consecutive calls, which would invalidate the cache
+        # contract). Empty dict at construction; populated per
+        # conversation as the assembly hook runs.
+        self._previous_assembled_messages_by_conversation: Dict[int, Any] = {}
+
+        # ``_stable_orphan_stripping_ordinals_by_conversation`` —
+        # per-conversation boundary for orphan-tool-result stripping
+        # in Epic 03's assembly. Used by :class:`_AssembleMixin` to
+        # guarantee that once an ordinal is declared "stable boundary
+        # for orphan stripping", subsequent assemblies don't move it
+        # backward (which would re-strip already-stable tool-result
+        # rows). Empty dict at construction; populated per conversation.
+        self._stable_orphan_stripping_ordinals_by_conversation: Dict[int, int] = {}
+
+        # ``_cache_context_unknown_logged`` — per-process dedupe set
+        # for the "cache context unknown" info-level log warning.
+        # Without dedupe, every turn on a cache-unaware provider would
+        # emit the same warning, drowning normal logs. Keyed by
+        # conversation id; an entry's presence means the warning
+        # already fired for that conversation this process. Cleared
+        # only on process exit (no per-session reset — the warning
+        # is genuinely once-per-process useful).
+        self._cache_context_unknown_logged: Set[int] = set()
 
     # ABC §Core interface -----------------------------------------------------
     # ``compress`` and ``should_compress`` bodies live in :class:`_CompactMixin`
