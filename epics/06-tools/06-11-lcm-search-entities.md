@@ -29,12 +29,12 @@ labels: 'port, tool'
 - [ ] **Empty-result catalog probe** (TS lines 286–303): if zero results, run two cheap probes:
   - `SELECT EXISTS(SELECT 1 FROM lcm_entities WHERE session_key=? LIMIT 1)` — session-scoped.
   - `SELECT EXISTS(SELECT 1 FROM lcm_entities LIMIT 1)` — global.
-  
+
   Map to `catalogStatus`:
   - `active` — query just didn't match.
   - `empty-for-session` — worker hasn't run on this session.
   - `empty-globally` — worker hasn't run on this DB at all.
-  
+
   This is critical UX — the agent must know "entity doesn't exist" vs "worker hasn't run yet".
 - [ ] **Token-gate estimator** (#06-03): `420 + limit * 85` chars.
 - [ ] PR description cites the LCM commit SHA being ported.

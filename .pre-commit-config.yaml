@@ -1,0 +1,73 @@
+# Pre-commit hooks for lossless-hermes.
+#
+# Fast local gate: ruff (lint + format) + ty (type check) + file hygiene.
+# CI does NOT re-run pre-commit (per epic 00 issue 00-03 acceptance criteria):
+# CI's `ruff check` + `ty check` cover the same ground. This keeps CI from
+# being a slower wrapper around the same checks.
+#
+# Install once after cloning:
+#     pip install -e ".[dev]"
+#     pre-commit install
+#
+# Run on all files:
+#     pre-commit run --all-files
+#
+# Pin policy: every `rev:` is an exact tag matching the corresponding pin in
+# pyproject.toml's [dev] extra (see docs/adr/006-dependency-pinning.md and
+# docs/reference/dependencies.md). No `rev: main`, no floating refs — bumps
+# are intentional PRs.
+#
+# `ty` has no upstream pre-commit hook repo as of 2026-05-13 (it is pre-1.0,
+# `ty==0.0.21`). We invoke it as a `language: system` local hook from the
+# active venv. See docs/adr/008-typechecker.md §Consequences ("pre-commit
+# runs `ty check` as a fast local gate").
+
+minimum_pre_commit_version: '4.0.1'  # matches pyproject.toml [dev] pin
+
+repos:
+  # File hygiene — trailing whitespace, EOF newlines, large-file guard,
+  # YAML/TOML syntax, merge conflict markers, line endings.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # `check-yaml` does not validate workflow YAML semantics (that's
+        # `actionlint`'s job, deferred); it only checks parse cleanliness.
+      - id: check-toml
+        # Validates pyproject.toml is syntactically clean.
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+        # Guards against accidentally committing a large fixture. The 500 KB
+        # ceiling fits the reference SQL schema (~33 KB) with plenty of
+        # headroom; bump deliberately if a legitimate large fixture lands.
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+        # Force LF line endings — mirrors Hermes's repo convention and
+        # avoids cross-platform diff noise.
+
+  # Ruff: lint (with --fix) + format. Pinned to v0.15.10 to match
+  # pyproject.toml [dev] (ruff==0.15.10) — see ADR-006 §Decision.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.10
+    hooks:
+      - id: ruff
+        args: ['--fix']
+      - id: ruff-format
+
+  # ty: type-check src/ only (NOT tests/ — type-strictness on test code is
+  # deferred per ADR-008). Local hook because `ty-pre-commit` doesn't exist
+  # upstream as of 2026-05-13 (ty is pre-1.0). The venv must have ty
+  # installed (`pip install -e ".[dev]"` puts ty==0.0.21 on PATH).
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check (src/)
+        entry: ty check src/
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+        # Run once per commit, not per-file, because ty's import resolution
+        # benefits from seeing the whole src tree at once.
