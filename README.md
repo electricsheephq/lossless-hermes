@@ -1,5 +1,7 @@
 # lossless-hermes
 
+[![CI](https://github.com/electricsheephq/lossless-hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/electricsheephq/lossless-hermes/actions/workflows/ci.yml)
+
 Lossless Context Management for **Hermes-agent**, ported from [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) (TypeScript/OpenClaw) to Python/Hermes.
 
 ## Status: 🟡 Phase 1 — Architecture & Planning

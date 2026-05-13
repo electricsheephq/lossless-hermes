@@ -1,0 +1,151 @@
+name: CI
+
+# Primary CI gate for lossless-hermes. Runs the full lint + type-check + test
+# matrix across {ubuntu-latest, macos-latest} × Python {3.11, 3.12, 3.13} — 6
+# cells. Each cell installs from the committed uv.lock (`uv sync --locked`) so
+# any drift between pyproject.toml and the lockfile fails the build (the
+# supply-chain gate per ADR-006 §Consequences).
+#
+# Live-Voyage tests run as a separate job on push to main only — protects the
+# per-run Voyage API cost from PR spam (per docs/porting-guides/tests-and-config.md
+# lines 519-530 and ADR-028 §Decision point 10).
+#
+# Platform/Python combinations matter because:
+#   - ADR-004 disqualifies Apple system Python (no `enable_load_extension`).
+#     setup-python ships a Homebrew-style build that does NOT have this defect;
+#     we want first-hand confirmation that sqlite-vec loads on every cell.
+#   - ADR-005 declares 3.11 the floor and 3.13 the forward-test ceiling for v0.1.
+#   - dependencies.md lines 142-160 mark every (os, python) cell as "inferred"
+#     until CI lights it green. This workflow converts inferred → tested.
+#
+# Source ADRs/spikes:
+#   - docs/adr/004-sqlite3-backend.md
+#   - docs/adr/005-python-version.md
+#   - docs/adr/006-dependency-pinning.md
+#   - docs/adr/008-typechecker.md
+#   - docs/adr/028-vitest-to-pytest.md
+#   - docs/spike-results/001-sqlite-vec-python.md
+#   - docs/spike-results/005-sqlite3-fts5-trigram.md
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same PR/branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # Keyed on uv.lock — cache hit when neither the lockfile nor the
+          # pyproject changed. First-pull stays short, subsequent pulls are
+          # near-instant on the same cell.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # `uv sync --locked` re-resolves against pyproject.toml and FAILS if the
+      # lockfile is stale. This is the supply-chain "fails closed if a
+      # transitive shifted" gate from ADR-006 §Consequences. It also creates
+      # `.venv/` with the project installed in editable mode by default.
+      - name: Install project (uv sync --locked, includes [dev] extras)
+        run: uv sync --locked --extra dev
+
+      # ruff is invoked via `uv run` to use the synced venv's pinned ruff
+      # (ruff==0.15.10 — matches Hermes pin per ADR-008 §Consequences).
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format --check)
+        run: uv run ruff format --check .
+
+      # ty is the primary type-checker per ADR-008. `ty check` walks the
+      # package per [tool.ty.environment] in pyproject.toml. Failure blocks
+      # merge (no --exit-zero).
+      - name: Type check (ty check)
+        run: uv run ty check
+
+      # Smoke test the plugin entry point. This catches packaging/discovery
+      # regressions before they reach the engine tests: if the
+      # `[project.entry-points."hermes_agent.plugins"]` table in pyproject.toml
+      # ever drifts from the importable callable, this fails fast.
+      - name: Smoke check (plugin entry point resolves)
+        run: |
+          uv run python -c "from importlib.metadata import entry_points; assert any(ep.name == 'lossless-hermes' for ep in entry_points(group='hermes_agent.plugins')), 'lossless-hermes entry point not registered in hermes_agent.plugins'"
+
+      # `-m 'not live'` matches ADR-028 §Decision point 10 — live markers are
+      # opt-in only. The CLI marker expression overrides the
+      # `addopts = "-m 'not integration and not live'"` default in pyproject
+      # only for explicitness in CI logs; the effective set is unchanged.
+      - name: Run tests (pytest -m 'not live')
+        run: uv run pytest -m "not live" --cov=lossless_hermes --cov-report=xml
+
+      # Codecov upload happens on exactly one cell (ubuntu-latest, py3.12) so
+      # the same coverage data isn't double-counted across 6 matrix runs. Per
+      # AC #6.
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  live-voyage:
+    # Live-Voyage hits the production Voyage API and burns real budget — gate
+    # it tightly:
+    #   - Push to main only (PR jobs never run it)
+    #   - Single OS / single Python; cost scales linearly with cells
+    #
+    # Per docs/porting-guides/tests-and-config.md lines 519-530 and ADR-028
+    # §Decision point 10.
+    name: live-voyage (main pushes only)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project (uv sync --locked, includes [dev] extras)
+        run: uv sync --locked --extra dev
+
+      - name: Run live Voyage tests
+        run: uv run pytest -m "live"
