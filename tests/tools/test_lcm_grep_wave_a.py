@@ -13,8 +13,10 @@ Mirrors ``lossless-claw/test/lcm-grep-verbatim-mode.test.ts`` (435 LOC TS →
   ``(`` in pattern), full-row untruncated output.
 * **Empty pattern** → structured error.
 * **since > before** → structured error.
-* **Hybrid / semantic modes** → ``not yet available`` error (regression test
-  deleted when #06-09 ships).
+* **Hybrid / semantic modes** without VoyageClient → missing-VOYAGE_API_KEY
+  error with the operator-facing fallback hint (Wave-A deferral test
+  INVERTED by #06-09; the comprehensive hybrid + semantic test matrix
+  lives in ``test_lcm_grep_wave_b.py``).
 * **Wave-12 N3 regression** — truncation regex matches
   ``MAX_RESULT_CHARS`` overflow notice byte-identically.
 
@@ -57,12 +59,18 @@ from lossless_hermes.tools.grep import (
 
 @dataclass
 class _Ctx:
-    """Concrete :class:`GrepContext` for tests."""
+    """Concrete :class:`GrepContext` for tests.
+
+    ``voyage`` defaults to ``None`` because Wave-A tests don't exercise
+    Voyage. The Wave-B tests construct a stand-in and set it on this
+    field — see ``tests/tools/test_lcm_grep_wave_b.py``.
+    """
 
     conn: sqlite3.Connection
     summary_store: SummaryStore
     conversation_store: ConversationStore
     timezone: str
+    voyage: object | None = None  # VoyageClient | None — duck-typed
 
 
 @pytest.fixture
@@ -326,37 +334,47 @@ class TestErrorPaths:
         assert "No LCM conversation found" in result["error"]
         assert "allConversations=true" in result["error"]
 
-    def test_hybrid_mode_returns_deferred_error(
+    def test_hybrid_mode_without_voyage_returns_missing_key_error(
         self,
         ctx: _Ctx,
         deps: LcmDependencies,
         conv_id: int,
     ) -> None:
-        """Regression test — DELETE when #06-09 ships hybrid mode."""
+        """Inverts the Wave-A deferral test (#06-09 AC): hybrid w/o a
+        VoyageClient must surface the operator-facing missing-key prose
+        with the ``full_text`` fallback hint, not the "not yet available"
+        stub.
+
+        TS line 631 — fallback hint is load-bearing for agent retry."""
         del conv_id
         result = _call(
             {"pattern": "race", "mode": "hybrid"},
             ctx=ctx,
             deps=deps,
         )
-        assert "hybrid mode is not yet available" in result["error"]
-        assert "full_text" in result["error"]
+        assert "VOYAGE_API_KEY" in result["error"]
+        assert "hybrid mode requires it" in result["error"]
+        assert "mode='full_text'" in result["error"]
 
-    def test_semantic_mode_returns_deferred_error(
+    def test_semantic_mode_without_voyage_returns_missing_key_error(
         self,
         ctx: _Ctx,
         deps: LcmDependencies,
         conv_id: int,
     ) -> None:
-        """Regression test — DELETE when #06-09 ships semantic mode."""
+        """Inverts the Wave-A deferral test (#06-09 AC): semantic w/o a
+        VoyageClient surfaces the missing-key prose with the
+        ``regex``/``full_text`` fallback hint (TS line 825-828)."""
         del conv_id
         result = _call(
             {"pattern": "race", "mode": "semantic"},
             ctx=ctx,
             deps=deps,
         )
-        assert "semantic mode is not yet available" in result["error"]
-        assert "full_text" in result["error"]
+        assert "VOYAGE_API_KEY" in result["error"]
+        assert "semantic mode requires it" in result["error"]
+        assert "mode='regex'" in result["error"]
+        assert "mode='full_text'" in result["error"]
 
 
 # ===========================================================================
