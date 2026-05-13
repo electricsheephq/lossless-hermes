@@ -1,0 +1,5 @@
+lcm_ts_path: /Volumes/LEXAR/Claude/lossless-claw
+lcm_ts_ref_pin: 1f07fbd
+lcm_ts_commit_actual: 1f07fbdd38c5e02f33eb5d6d23d7317e22e18500
+generated_at: 2026-05-13T10:22:42Z
+generator: scripts/schema_diff.sh --refresh-reference

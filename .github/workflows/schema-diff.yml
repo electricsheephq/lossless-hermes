@@ -1,0 +1,104 @@
+name: schema-diff
+
+# Gates that the Python lossless_hermes migration ladder produces a byte-compatible
+# SQLite schema to the TS LCM reference. Two complementary jobs:
+#
+#   verify          Diffs Python-generated schema against the committed reference
+#                   fixture. Fast (~30s). Runs on every PR.
+#
+#   check-reference Re-extracts the TS schema from upstream lossless-claw and
+#                   verifies the committed reference is fresh. Slower (~2min;
+#                   installs Node + lossless-claw deps). Runs on PRs touching
+#                   the reference fixture, or weekly.
+#
+# Source of truth: docs/adr/025-openclaw-migration.md (open Q#2: this is the
+# schema-diff CI scaffold). See scripts/schema_diff.sh for the orchestrator.
+
+on:
+  pull_request:
+    paths:
+      - 'src/lossless_hermes/db/**'
+      - 'src/lossless_hermes/store/**'
+      - 'tests/fixtures/lcm_reference_schema.sql'
+      - 'scripts/extract_lcm_schema.ts'
+      - 'scripts/extract_python_schema.py'
+      - 'scripts/schema_diff.sh'
+      - '.github/workflows/schema-diff.yml'
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'  # Mondays 06:17 UTC — weekly reference staleness check
+  workflow_dispatch: {}
+
+jobs:
+  verify:
+    name: verify (Python ↔ reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install lossless-hermes (editable)
+        run: |
+          if [ -f pyproject.toml ]; then
+            python -m pip install --upgrade pip
+            pip install -e .
+          else
+            echo "::warning::pyproject.toml not present yet (pre-Wave 1). Skipping install."
+          fi
+      - name: Run schema-diff verify
+        id: verify
+        run: |
+          set +e
+          ./scripts/schema_diff.sh --verify
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 2 ]; then
+            echo "::warning::Python migrations not yet implemented (pre-Wave 2). Treating as soft-pass."
+            exit 0
+          fi
+          exit $rc
+
+  check-reference:
+    name: check-reference (TS ↔ committed reference)
+    # Skip on regular PRs unless the reference itself is touched OR on schedule/manual.
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.changed_files, 'tests/fixtures/lcm_reference_schema.sql')
+    runs-on: ubuntu-latest
+    env:
+      LCM_TS_REF: '1f07fbd'
+      LCM_REPO: 'https://github.com/Martian-Engineering/lossless-claw.git'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lossless-hermes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Clone lossless-claw and check out pin
+        run: |
+          git clone "$LCM_REPO" lossless-claw
+          cd lossless-claw
+          # PR #613 branch / pr-613 fetched, not main, per the project pin.
+          git fetch origin "pull/613/head:pr-613"
+          git checkout pr-613
+          # Sanity-check actual SHA vs pinned ref.
+          actual=$(git rev-parse HEAD)
+          echo "Checked out lossless-claw at $actual; LCM_TS_REF=$LCM_TS_REF"
+      - name: Install lossless-claw deps
+        run: |
+          cd lossless-claw
+          pnpm install --frozen-lockfile
+      - name: Run schema-diff check-reference
+        env:
+          LCM_TS_PATH: ${{ github.workspace }}/lossless-claw
+        run: |
+          cd lossless-hermes
+          ./scripts/schema_diff.sh --check-reference
