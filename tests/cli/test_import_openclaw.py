@@ -639,3 +639,101 @@ def test_import_result_dataclass_fields() -> None:
     assert r.report == "hi"
     assert r.mismatched == 0
     assert r.validated == 5
+
+
+# ---------------------------------------------------------------------------
+# PR #79 review-fix regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_existing_large_files_dir_blocks_without_force(openclaw_root: Path, tmp_path: Path) -> None:
+    """PR #79 review-fix: a dest with NO lcm.db but a populated large-files/
+    must refuse without --force (previously silently rmtree'd the dir).
+    """
+    dest = tmp_path / "hermes"
+    (dest / "large-files").mkdir(parents=True)
+    (dest / "large-files" / "stale-blob.bin").write_bytes(b"important user data")
+    # No lcm.db in dest — only large-files/.
+
+    result = import_openclaw(source=openclaw_root, destination=dest, force=False)
+
+    assert not result.ok
+    assert "large-files" in result.error
+    assert "--force" in result.error
+    # The stale blob must still exist (refusal protects it).
+    assert (dest / "large-files" / "stale-blob.bin").exists()
+
+
+def test_existing_large_files_dir_overwrites_with_force(
+    openclaw_root: Path, tmp_path: Path
+) -> None:
+    """PR #79 review-fix: --force acknowledges large-files/ overwrite."""
+    dest = tmp_path / "hermes"
+    (dest / "large-files").mkdir(parents=True)
+    (dest / "large-files" / "stale-blob.bin").write_bytes(b"will be overwritten")
+
+    result = import_openclaw(
+        source=openclaw_root, destination=dest, force=True, disk_check_yes=True
+    )
+
+    # Force makes the import proceed.
+    assert result.ok, result.error
+    # The stale blob is gone (rmtree before copytree).
+    assert not (dest / "large-files" / "stale-blob.bin").exists()
+
+
+def test_validate_rows_rejects_negative() -> None:
+    """PR #79 review-fix: ``--validate-rows -1`` must fail at parse time.
+
+    Previously argparse ``type=int`` accepted negatives; the value flowed
+    into ``LIMIT -N`` which SQLite treats as "no limit" → full-table scan,
+    defeating the spec's "sample N rows" intent.
+    """
+    import subprocess
+
+    # Use the console script via `python -m` so we don't depend on
+    # `lossless-hermes` being on PATH in the test env.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "lossless_hermes.cli.import_openclaw",
+            "--validate-rows",
+            "-5",
+            "--from",
+            "/tmp/nonexistent",
+            "--to",
+            "/tmp/nonexistent-dest",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    # argparse exits non-zero on parse failure.
+    assert result.returncode != 0
+    # Error message points at the fix.
+    combined = result.stdout + result.stderr
+    assert "validate-rows" in combined or "validate_rows" in combined
+
+
+def test_validate_rows_rejects_zero() -> None:
+    """PR #79 review-fix: ``--validate-rows 0`` is also invalid (degenerate sample)."""
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "lossless_hermes.cli.import_openclaw",
+            "--validate-rows",
+            "0",
+            "--from",
+            "/tmp/nonexistent",
+            "--to",
+            "/tmp/nonexistent-dest",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "validate-rows" in combined or "validate_rows" in combined

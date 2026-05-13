@@ -382,22 +382,49 @@ def _write_imported_at(conn: sqlite3.Connection, source_path: Path) -> None:
     conn.commit()
 
 
-def _check_destination_state(dest_db: Path, *, force: bool) -> tuple[bool, str]:
+def _check_destination_state(
+    dest_db: Path, *, force: bool, dest_large_files: Path | None = None
+) -> tuple[bool, str]:
     """Return ``(ok_to_proceed, message)`` for the destination DB.
 
-    Step 2 of the spec. The state_meta check runs IFF the destination DB
-    exists; for a fresh destination there's no row to find.
+    Step 2 of the spec. Two destructive targets are checked:
+
+    1. ``dest_db`` (``<dest>/lcm.db``) — if present, any rows recorded
+       since first import would be lost on overwrite.
+    2. ``dest_large_files`` (``<dest>/large-files/``) — if present, any
+       blob files would be lost on ``shutil.rmtree`` before
+       ``copytree`` (see step 4 below).
+
+    PR #79 review-fix: previously this only checked ``dest_db``. A
+    partial-import state where ``lcm.db`` was deleted but
+    ``large-files/`` survived would silently rmtree the large-files dir
+    without ``--force`` consent. ADR-025 §Consequences makes ``--force``
+    the operator-acknowledged destructive path for ANY existing data.
     """
-    if not dest_db.exists():
+    summaries: list[str] = []
+    if dest_db.exists():
+        summaries.append(_existing_data_summary(dest_db))
+    if dest_large_files is not None and dest_large_files.exists():
+        try:
+            entry_count = sum(1 for _ in dest_large_files.rglob("*"))
+        except OSError:
+            entry_count = -1
+        if entry_count == -1:
+            summaries.append(f"{dest_large_files}/ exists (unreadable)")
+        elif entry_count > 0:
+            summaries.append(f"{dest_large_files}/ holds {entry_count} entries")
+
+    if not summaries:
         return True, ""
-    summary = _existing_data_summary(dest_db)
+    summary = "; ".join(summaries)
     if force:
         return True, (
             f"--force given; overwriting destination. {summary}; --force will discard them."
         )
     return False, (
-        f"destination {dest_db} exists; {summary}. Refusing without --force. "
-        f"Re-run with --force to overwrite (acknowledges discarding existing rows)."
+        f"destination {dest_db.parent} holds existing data: {summary}. "
+        f"Refusing without --force. Re-run with --force to overwrite "
+        f"(acknowledges discarding existing rows + large-files)."
     )
 
 
@@ -474,7 +501,9 @@ def import_openclaw(
     _say("source: OK (integrity_check passed)")
 
     # Step 2: destination state check.
-    dest_ok, dest_msg = _check_destination_state(dest_db, force=force)
+    dest_ok, dest_msg = _check_destination_state(
+        dest_db, force=force, dest_large_files=dest_dir / "large-files"
+    )
     if dest_msg:
         _say(dest_msg)
     if not dest_ok:
@@ -643,13 +672,31 @@ def build_parser() -> argparse.ArgumentParser:
             "Hermes-side conversations recorded since first import."
         ),
     )
+
+    def _positive_int(raw: str) -> int:
+        # PR #79 review-fix: argparse `type=int` accepted negative values,
+        # which would silently flow into `LIMIT -N` (SQLite treats negative
+        # LIMIT as no limit → full-table scan, defeating "sample N").
+        # Reject at parse time with an actionable error.
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"must be an integer: {raw!r}") from exc
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--validate-rows must be a positive integer (got {value}). "
+                "Use a value >= 1 to sample N rows. Negative / zero values "
+                "would silently bypass the validation sampler."
+            )
+        return value
+
     parser.add_argument(
         "--validate-rows",
-        type=int,
+        type=_positive_int,
         default=_DEFAULT_VALIDATE_ROWS,
         metavar="N",
         help=(
-            f"Sample N message rows for identity_hash validation "
+            f"Sample N message rows (N >= 1) for identity_hash validation "
             f"(default: {_DEFAULT_VALIDATE_ROWS}). Mismatches are reported "
             f"but non-fatal per ADR-025."
         ),
