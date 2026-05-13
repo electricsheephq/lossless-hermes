@@ -302,22 +302,50 @@ def test_handle_tool_call_includes_name_in_message() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_apple_python_guard_fires_when_extension_loading_absent(
+def test_apple_python_guard_helper_raises_when_extension_loading_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC: guard fires before any DB open attempt.
+    """AC: guard raises before any DB open attempt.
 
-    ``sqlite3.Connection`` is a C-immutable type — :meth:`delattr` raises
-    ``TypeError`` on it. Instead, we monkey-patch
-    ``_has_sqlite_extension_loading`` (the single hook the guard
-    consults) to simulate Apple's system Python. The construction must
-    raise :class:`RuntimeError` with the documented message.
+    The guard is :func:`_check_sqlite_extension_loading`, exposed for
+    :meth:`on_session_start` (Epic 02) to call before its first
+    ``open_lcm_db()`` invocation. At v0 there is no DB open attempt, so
+    the guard is **not** wired into ``LCMEngine.__init__`` — firing it
+    there would reject working Python installations (e.g.
+    ``actions/setup-python``'s macOS pre-built CPython, which lacks
+    ``enable_load_extension`` despite being usable for everything except
+    sqlite-vec) without justification.
+
+    We monkey-patch :func:`_has_sqlite_extension_loading` (the
+    introspection hook the guard consults — ``sqlite3.Connection`` is
+    C-immutable so we can't ``delattr`` it directly) and call the
+    guard. It must raise :class:`RuntimeError` with the documented
+    message.
     """
     import lossless_hermes.engine as engine_mod
 
     monkeypatch.setattr(engine_mod, "_has_sqlite_extension_loading", lambda: False)
     with pytest.raises(RuntimeError, match=r"sqlite3.Connection.enable_load_extension"):
-        LCMEngine()
+        engine_mod._check_sqlite_extension_loading()
+
+
+def test_engine_constructor_does_not_invoke_apple_python_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0 invariant: ``__init__`` does not call the sqlite guard.
+
+    Documented in the class docstring and module-level "Apple system
+    Python guard" section. Verifies the deferral so a regression
+    (re-adding ``_check_sqlite_extension_loading()`` to ``__init__``)
+    surfaces in CI rather than only on the macOS runners.
+    """
+    import lossless_hermes.engine as engine_mod
+
+    # If __init__ called the guard, this stub would block construction
+    # because we force the introspection hook to report False.
+    monkeypatch.setattr(engine_mod, "_has_sqlite_extension_loading", lambda: False)
+    engine = LCMEngine()
+    assert engine.name == "lcm"
 
 
 def test_apple_python_guard_message_is_actionable() -> None:

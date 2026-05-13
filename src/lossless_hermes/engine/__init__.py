@@ -34,9 +34,23 @@ The v0 skeleton honors that — ``__init__`` only stores constructor args.
 
 Per ADR-004 §Consequences, sqlite-vec loading requires
 ``sqlite3.Connection.enable_load_extension``, which Apple's system
-``/usr/bin/python3`` ships without. The guard in :meth:`LCMEngine.__init__`
-fires at construction time so the failure mode is "clear error at
-plugin-load", not "obscure error mid-session when sqlite-vec is needed".
+``/usr/bin/python3`` and some pre-built CPython distributions (notably
+``actions/setup-python``'s macOS builds) ship without.
+
+The guard helper :func:`_check_sqlite_extension_loading` is deliberately
+**not** wired into :meth:`LCMEngine.__init__` at v0 — there is no DB
+open attempt at v0 (heavy init defers to :meth:`on_session_start` per
+ADR-001 §Consequences). Firing the guard at construction time would
+block legitimate Python installations from importing the package even
+though no DB ever opens. Instead, the guard is exposed for the future
+:meth:`on_session_start` implementation (Epic 02) to call before its
+first ``open_lcm_db()`` invocation. ADR-004 §Consequences spec
+("before any DB open attempt") is satisfied because v0 has no DB open
+attempt at all.
+
+The helper is independently unit-tested via
+:func:`_has_sqlite_extension_loading` (the introspection hook tests can
+monkey-patch — ``sqlite3.Connection`` is C-immutable).
 
 See:
 
@@ -168,12 +182,6 @@ class LCMEngine(ContextEngine):
             config: Validated :class:`LcmConfig`. Defaults to ``None``,
                 in which case an empty :class:`LcmConfig` is constructed.
 
-        Raises:
-            RuntimeError: Running under Apple's system Python without
-                ``sqlite3.Connection.enable_load_extension``. The error
-                message tells the operator how to install a working
-                Python (see :data:`APPLE_SYSTEM_PYTHON_MSG`).
-
         Note:
             We deliberately do **not** call ``super().__init__()``. In a
             Hermes-less env (no ``agent.context_engine`` importable) the
@@ -184,9 +192,19 @@ class LCMEngine(ContextEngine):
             line 18 — defines its own ``__init__`` without chaining). So
             skipping ``super().__init__()`` is correct in both Hermes-
             available and Hermes-less envs.
-        """
-        _check_sqlite_extension_loading()
 
+        Note:
+            The Apple-Python sqlite-extension-loading guard
+            (:func:`_check_sqlite_extension_loading`) is **not** invoked
+            here at v0. There is no DB open attempt at v0 (heavy init
+            defers to :meth:`on_session_start`), so firing the guard
+            here would reject perfectly working Python installations
+            that simply cannot load extensions. Epic 02's
+            ``on_session_start`` body will call the guard before its
+            first ``open_lcm_db()`` invocation — matching ADR-004
+            §Consequences' "before any DB open attempt" requirement
+            literally.
+        """
         self.hermes_home: Path = (
             Path(hermes_home) if hermes_home is not None else Path.home() / ".hermes"
         )
