@@ -449,6 +449,99 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # is genuinely once-per-process useful).
         self._cache_context_unknown_logged: Set[int] = set()
 
+        # ------------------------------------------------------------------
+        # 03-09 — ADR-010 always-on substitution mode detection
+        # ------------------------------------------------------------------
+        # Per ADR-010, lossless-hermes has TWO paths for per-turn assembly
+        # substitution:
+        #
+        #   * **Production (Option B)** — Hermes ``ContextEngine`` ABC
+        #     exposes a ``preassemble(messages, budget_tokens)`` method
+        #     (upstream PR #24949). When present, ``run_agent.py`` calls
+        #     it BEFORE ``pre_llm_call`` on every turn. We override it on
+        #     :class:`_AssembleMixin` and route to ``self._assemble(...)``.
+        #
+        #   * **Experimental (Option A)** — when ``preassemble`` is
+        #     ABSENT and the operator sets
+        #     ``experimental.always_on_via_compress: true``, we force
+        #     ``should_compress()`` to return ``True`` every turn so
+        #     ``run_agent.py:10264`` calls ``compress()`` — whose return
+        #     value REPLACES the live message list (the substitution
+        #     mechanism). This path has documented side effects
+        #     (session-ID rotation per turn, memory provider re-extraction,
+        #     compression-count warnings, log spam — see ADR-010 §"Option
+        #     A"). Not production-grade.
+        #
+        # We detect Hermes's ABC capability ONCE at construction time and
+        # cache the result on ``self``. Subsequent ``should_compress`` /
+        # ``compress`` calls branch on these flags without re-importing
+        # or re-attribute-checking.
+        #
+        # Hermes 24949 patch adds ``preassemble`` to ``ContextEngine`` as
+        # a default no-op method. We detect by ``hasattr`` on the ABC
+        # itself — if the merged Hermes installation carries the method,
+        # ``ContextEngine.preassemble`` resolves. The Hermes-less bridge
+        # exposes ``ContextEngine`` as a stub :class:`type` with no
+        # ``preassemble`` attribute, so this evaluates to False (the
+        # Hermes-less story degrades cleanly: assemble is reachable via
+        # tests / engine fixtures but not via a real Hermes hook
+        # invocation).
+        self._has_preassemble: bool = hasattr(ContextEngine, "preassemble")
+
+        # The experimental flag is read from config at construction time
+        # so per-turn ``should_compress`` / ``compress`` paths don't
+        # re-traverse the config object every call. Operators who flip
+        # this at runtime via ``cfg_set`` must restart the engine to take
+        # effect — by design (ADR-010 §Open questions item 1, "mode
+        # switch at runtime"). The flag is gated by ABSENCE of
+        # ``preassemble``: if Hermes has ``preassemble``, the experimental
+        # path is unreachable regardless of the config setting (the
+        # production path is strictly better; we silently prefer it).
+        self._experimental_always_on_via_compress: bool = bool(
+            getattr(self.config, "experimental_always_on_via_compress", False)
+        )
+
+        # Per-process dedupe state for the experimental-mode rate-limited
+        # warning. Per ADR-010 §"Path 2" the warning fires once-per-engine
+        # at startup AND once per minute thereafter (so operators don't
+        # forget the path is broken, but don't drown in log spam either).
+        # We carry a monotonic-clock timestamp of the last warning emission
+        # and the 60s cooldown is a class constant in ``assemble.py``.
+        self._last_experimental_warn_ts: float = 0.0
+
+        # ------------------------------------------------------------------
+        # 03-09 startup-time log: state which always-on substitution mode
+        # is active. The log is informational (production mode), warning
+        # (experimental mode), or warning (mode disabled — overflow-only).
+        # Operators scanning startup logs can confirm which path the
+        # engine took before any per-turn behavior surfaces.
+        # ------------------------------------------------------------------
+        if self._has_preassemble:
+            logger.info(
+                "[lcm] always-on substitution: production mode via "
+                "ContextEngine.preassemble (ADR-010 Option B)."
+            )
+        elif self._experimental_always_on_via_compress:
+            logger.warning(
+                "[lcm] always-on substitution: EXPERIMENTAL mode via "
+                "force-compress (ADR-010 Option A). Session ID rotates "
+                "every turn; memory provider lineage breaks; "
+                "compression-count warnings will fire. NOT FOR PRODUCTION. "
+                "Disable by removing `experimental_always_on_via_compress` "
+                "from $HERMES_HOME/config.yaml under `lossless_hermes:`."
+            )
+        else:
+            logger.warning(
+                "[lcm] always-on substitution DISABLED: upstream Hermes "
+                "lacks `preassemble` ABC method (ADR-010 patch pending — "
+                "see PR #24949), and `experimental_always_on_via_compress` "
+                "is False. Plugin runs as OVERFLOW-COMPACTOR ONLY — no "
+                "per-turn DAG substitution. Set `experimental_always_on_"
+                "via_compress: true` in $HERMES_HOME/config.yaml under "
+                "`lossless_hermes:` to validate substitution behavior "
+                "(at the cost of session-ID rotation per turn)."
+            )
+
     # ABC §Core interface -----------------------------------------------------
     # ``compress`` and ``should_compress`` bodies live in :class:`_CompactMixin`
     # (compact.py). At 02-01 those are no-op passthroughs matching 00-06;
