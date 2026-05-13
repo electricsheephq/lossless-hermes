@@ -318,16 +318,19 @@ def test_on_session_reset_no_longer_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_get_tool_schemas_returns_empty_list() -> None:
-    """AC: tools land in Epic 06 — v0 returns ``[]``.
+def test_get_tool_schemas_returns_list() -> None:
+    """AC: ``get_tool_schemas`` returns a list (formerly empty pre-Wave-5).
 
-    Issue 06-02 (PR #87 follow-on) wired :meth:`get_tool_schemas` to
-    delegate to ``lossless_hermes.tools.get_tool_schemas`` — the v0
-    schemas list is still empty until per-tool issues 06-07..06-14
-    land, so the assertion holds.
+    Issue 06-02 wired :meth:`get_tool_schemas` to delegate to
+    ``lossless_hermes.tools.get_tool_schemas``. The pre-Wave-5 v0
+    "always empty" invariant was relaxed once per-tool issues
+    06-07..06-14 started registering schemas at import time. The
+    invariant that still holds: the method returns a ``list`` and the
+    engine doesn't crash when called.
     """
     engine = LCMEngine()
-    assert engine.get_tool_schemas() == []
+    schemas = engine.get_tool_schemas()
+    assert isinstance(schemas, list)
 
 
 def test_handle_tool_call_returns_json_error_for_unknown_name() -> None:

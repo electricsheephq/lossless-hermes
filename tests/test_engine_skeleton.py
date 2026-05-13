@@ -368,15 +368,26 @@ def test_update_from_response_still_works_on_shell() -> None:
     assert engine.last_total_tokens == 150
 
 
-def test_get_tool_schemas_returns_empty_at_02_01() -> None:
-    """Tools land in Epic 06; the registry returns ``[]`` until then.
+def test_get_tool_schemas_returns_registered_list() -> None:
+    """Tool registry populates as per-tool issues land.
 
     Issue 06-02 wired :meth:`get_tool_schemas` to delegate to
-    ``lossless_hermes.tools.get_tool_schemas`` — empty until per-tool
-    issues 06-07..06-14 register schemas at import time.
+    ``lossless_hermes.tools.get_tool_schemas``. As of Wave 5 several
+    per-tool ports (06-07 describe, 06-08 grep, 06-10 get_entity,
+    06-11 search_entities, 06-14 compact, etc.) have landed and
+    register their schemas at import time. The pre-Wave-5 "must be
+    empty" invariant has been replaced with "every registered schema
+    is well-formed and has a name + description + parameters" — the
+    detailed wellformedness assertions live in
+    ``tests/tools/test_schemas_wellformed.py``.
     """
     engine = LCMEngine()
-    assert engine.get_tool_schemas() == []
+    schemas = engine.get_tool_schemas()
+    assert isinstance(schemas, list)
+    for entry in schemas:
+        assert "name" in entry
+        assert "description" in entry
+        assert "parameters" in entry
 
 
 def test_handle_tool_call_unknown_returns_json_error() -> None:
