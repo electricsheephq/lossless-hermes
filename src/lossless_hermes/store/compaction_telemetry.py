@@ -481,6 +481,127 @@ class CompactionTelemetryStore:
             return None
         return _row_to_record(tuple(row))
 
+    def mark_leaf_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None:
+        """Record a successful leaf compaction.
+
+        Bumps the row's ``last_leaf_compaction_at`` to ``datetime('now')``
+        and resets the running counters that the cache-aware compaction
+        path uses to decide when the *next* incremental pass is worthwhile
+        (``turns_since_leaf_compaction``,
+        ``tokens_accumulated_since_leaf_compaction``).
+
+        Called from :meth:`lossless_hermes.compaction.CompactionEngine.
+        _mark_leaf_compaction_success` after a successful ``_leaf_pass``.
+        See ``epics/04-compaction/04-08-telemetry-write.md``
+        §"Compaction telemetry store updates" for the spec call site.
+
+        The method is a thin convenience wrapper around the SQL UPDATE
+        path so the compaction engine doesn't have to construct a full
+        :class:`UpsertConversationCompactionTelemetryInput` (which would
+        require it to know every other field on the row). The UPDATE
+        only fires when the row exists; the row is created lazily by the
+        cache-aware path when it observes the first cache state for the
+        conversation. If the row doesn't exist yet at the moment of
+        compaction (unusual but possible) this method is a silent no-op.
+
+        Args:
+            conversation_id: The conversation whose telemetry to bump.
+            summary_id: ID of the summary row the leaf pass wrote.
+                Currently informational — recorded only via the
+                structured-log path in
+                :meth:`CompactionEngine._persist_compaction_event`;
+                future schema-additions may persist it on the telemetry
+                row.
+        """
+        # ``summary_id`` is recorded only via the log call (not the
+        # row) per the storage.md §4.3 schema — preserved on the
+        # signature so a future schema addition (e.g. last_leaf_summary_id
+        # column) can wire it without a signature-breaking change.
+        del summary_id
+        self._conn.execute(
+            """
+            UPDATE conversation_compaction_telemetry
+            SET last_leaf_compaction_at = datetime('now'),
+                turns_since_leaf_compaction = 0,
+                tokens_accumulated_since_leaf_compaction = 0,
+                updated_at = datetime('now')
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        )
+
+    def mark_condensed_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None:
+        """Record a successful condensed compaction.
+
+        Counterpart to :meth:`mark_leaf_compaction_success` for depth>=1
+        condensed passes. Currently bumps ``updated_at`` only — the
+        canonical row does not yet carry a ``last_condensed_compaction_at``
+        column (storage.md §4.3 schema). Surfaced as a distinct method
+        so the compaction engine can distinguish phase-1 vs phase-2
+        successes at the call site even when the underlying persistence
+        is a single row touch.
+
+        A future schema addition (column
+        ``last_condensed_compaction_at``) would extend the UPDATE to
+        bump that column without breaking the public signature.
+
+        Args:
+            conversation_id: The conversation whose telemetry to bump.
+            summary_id: ID of the summary row the condensed pass wrote.
+                Same informational status as
+                :meth:`mark_leaf_compaction_success`.
+        """
+        del summary_id
+        self._conn.execute(
+            """
+            UPDATE conversation_compaction_telemetry
+            SET updated_at = datetime('now')
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        )
+
+    def mark_auth_failure(
+        self,
+        *,
+        conversation_id: int,
+    ) -> None:
+        """Record a provider-auth failure observed during compaction.
+
+        Called when the summarizer raises
+        :class:`~lossless_hermes.summarize.LcmProviderAuthError` and a
+        compaction pass short-circuits to preserve DAG integrity. The
+        cache-aware compaction path (Epic 02) consumes this signal to
+        back off the next incremental decision.
+
+        Currently bumps ``updated_at`` only (the canonical row does not
+        yet carry a ``last_auth_failure_at`` column or
+        ``consecutive_auth_failures`` counter — storage.md §4.3 schema).
+        Surfaced as a distinct method so a future schema migration can
+        extend the UPDATE without a signature-breaking change.
+
+        Args:
+            conversation_id: The conversation whose telemetry to bump.
+        """
+        self._conn.execute(
+            """
+            UPDATE conversation_compaction_telemetry
+            SET updated_at = datetime('now')
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        )
+
     def upsert_conversation_compaction_telemetry(
         self, input: UpsertConversationCompactionTelemetryInput
     ) -> None:

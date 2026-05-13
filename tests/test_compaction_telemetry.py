@@ -415,3 +415,137 @@ def test_with_transaction_rolls_back_on_exception(
     # The row should not exist — the BEGIN was rolled back.
     rec = store.get_conversation_compaction_telemetry(conv_id)
     assert rec is None
+
+
+# ---------------------------------------------------------------------------
+# Mark-success / mark-auth-failure helpers (issue 04-08)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_leaf_compaction_success_bumps_row(
+    store: CompactionTelemetryStore, migrated_db: sqlite3.Connection
+) -> None:
+    """``mark_leaf_compaction_success`` updates ``last_leaf_compaction_at`` + resets counters.
+
+    Spec §"Compaction telemetry store updates" — after a successful
+    ``_leaf_pass`` the telemetry row's
+    ``last_leaf_compaction_at`` is bumped + the
+    ``turns_since_leaf_compaction`` / ``tokens_accumulated_since_leaf_compaction``
+    counters are reset to 0 (they accumulate again until the next leaf
+    pass).
+    """
+    conv_id = _make_conversation(migrated_db)
+
+    # Seed the row with non-zero counters + a past leaf-compaction
+    # timestamp so the mark_*_success call has something to bump.
+    past = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    store.upsert_conversation_compaction_telemetry(
+        UpsertConversationCompactionTelemetryInput(
+            conversation_id=conv_id,
+            cache_state="hot",
+            last_leaf_compaction_at=past,
+            turns_since_leaf_compaction=10,
+            tokens_accumulated_since_leaf_compaction=5_000,
+        )
+    )
+
+    store.mark_leaf_compaction_success(
+        conversation_id=conv_id,
+        summary_id="sum_leaf_xyz",
+    )
+
+    rec = store.get_conversation_compaction_telemetry(conv_id)
+    assert rec is not None
+    # Counter resets are the load-bearing behavior.
+    assert rec.turns_since_leaf_compaction == 0
+    assert rec.tokens_accumulated_since_leaf_compaction == 0
+    # last_leaf_compaction_at was bumped (now strictly after the seeded
+    # past value). datetime('now') in SQLite uses second resolution;
+    # we only assert > past, not specific value.
+    assert rec.last_leaf_compaction_at is not None
+    assert rec.last_leaf_compaction_at > past
+
+
+def test_mark_leaf_compaction_success_on_missing_row_is_noop(
+    store: CompactionTelemetryStore,
+) -> None:
+    """``mark_leaf_compaction_success`` on a missing row is a silent no-op.
+
+    A conversation might be compacted before the cache-aware path
+    materializes its first telemetry row. The UPDATE should not raise.
+    """
+    # No INSERT done; conversation row doesn't exist either, but the
+    # UPDATE matches WHERE conversation_id = ? on the telemetry table
+    # which CASCADEs from conversations. The mark_* uses a plain
+    # UPDATE — no rows match → no rows affected → no error.
+    store.mark_leaf_compaction_success(
+        conversation_id=99_999,
+        summary_id="sum_no_row",
+    )
+    # No row materialized (UPDATE doesn't create rows).
+    assert store.get_conversation_compaction_telemetry(99_999) is None
+
+
+def test_mark_condensed_compaction_success_bumps_updated_at(
+    store: CompactionTelemetryStore, migrated_db: sqlite3.Connection
+) -> None:
+    """``mark_condensed_compaction_success`` updates the row.
+
+    The current schema does not yet carry a
+    ``last_condensed_compaction_at`` column (storage.md §4.3) — the
+    method bumps ``updated_at`` only. Verified by observing that the
+    row's ``updated_at`` advances after the call.
+    """
+    import time
+
+    conv_id = _make_conversation(migrated_db)
+    store.upsert_conversation_compaction_telemetry(
+        UpsertConversationCompactionTelemetryInput(
+            conversation_id=conv_id,
+            cache_state="hot",
+        )
+    )
+    before = store.get_conversation_compaction_telemetry(conv_id)
+    assert before is not None
+
+    # SQLite datetime('now') has second resolution; pause briefly so
+    # the post-mark updated_at is observably later.
+    time.sleep(1.01)
+
+    store.mark_condensed_compaction_success(
+        conversation_id=conv_id,
+        summary_id="sum_cond_xyz",
+    )
+
+    after = store.get_conversation_compaction_telemetry(conv_id)
+    assert after is not None
+    assert after.updated_at > before.updated_at
+
+
+def test_mark_auth_failure_bumps_updated_at(
+    store: CompactionTelemetryStore, migrated_db: sqlite3.Connection
+) -> None:
+    """``mark_auth_failure`` updates the row.
+
+    Same as ``mark_condensed_compaction_success``: the current schema
+    doesn't yet carry a dedicated ``last_auth_failure_at`` column.
+    """
+    import time
+
+    conv_id = _make_conversation(migrated_db)
+    store.upsert_conversation_compaction_telemetry(
+        UpsertConversationCompactionTelemetryInput(
+            conversation_id=conv_id,
+            cache_state="hot",
+        )
+    )
+    before = store.get_conversation_compaction_telemetry(conv_id)
+    assert before is not None
+
+    time.sleep(1.01)
+
+    store.mark_auth_failure(conversation_id=conv_id)
+
+    after = store.get_conversation_compaction_telemetry(conv_id)
+    assert after is not None
+    assert after.updated_at > before.updated_at

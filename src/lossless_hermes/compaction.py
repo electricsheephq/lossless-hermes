@@ -127,9 +127,10 @@ carry the ``# LCM Wave-N`` comment per ADR-029.
 
 from __future__ import annotations
 
+import logging
 import sys
-from dataclasses import dataclass
-from typing import Callable, Literal, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Callable, Literal, Protocol
 
 __all__ = [
     "CompactionConfig",
@@ -320,11 +321,24 @@ class CompactionResult:
     Mirrors TS ``CompactionResult`` (compaction.ts lines 18-32). 04-04
     lands the shape plus a small addition — ``passes_completed`` — so
     regression tests can assert "the Wave-12 guard broke us out of the
-    loop after N passes, well below the budget".
+    loop after N passes, well below the budget". 04-08 finalizes the
+    shape per ``docs/porting-guides/assembler-compaction.md``
+    §"Public surface" by adding two more fields:
+
+    * :attr:`reason` — human-readable why-not-compacted string for the
+      no-op paths (``"under threshold"``, ``"no eligible chunk"``,
+      ``"circuit breaker open"``, ``"auth failure"``). Producers may
+      leave it ``None`` when ``action_taken=True``.
+    * :attr:`phase_results` — per-phase nested results for
+      :meth:`CompactionEngine.compact_full_sweep` aggregation. Empty
+      for single-pass results; populated by the sweep so Epic 06's
+      ``lcm_compact`` tool can report what each phase did.
 
     Attributes:
         action_taken: ``True`` iff at least one leaf or condensed pass
-            ran to completion. Matches TS ``actionTaken``.
+            ran to completion. Matches TS ``actionTaken``. ``False`` ↔
+            no-op (under threshold, no eligible chunk, breaker open,
+            auth failure).
         tokens_before: Token count read from the summary store at the
             start of the sweep.
         tokens_after: Token count at the end of the sweep, computed via
@@ -347,6 +361,16 @@ class CompactionResult:
             LLM raised a provider-auth error. ``False`` by default.
             Matches TS ``authFailure`` (optional in TS; ``False`` here
             so the dataclass stays frozen + comparable).
+        reason: Human-readable why-not-compacted string for no-op
+            paths. ``None`` on the action-taken path. Added in 04-08;
+            consumed by Epic 06's ``lcm_compact`` tool to surface the
+            "why nothing happened" verdict to the agent.
+        phase_results: Per-phase nested :class:`CompactionResult`
+            instances. Empty for the single-result no-op paths and for
+            04-04 skeletal sweeps that don't yet aggregate phase
+            output. Reserved for the 04-02/04-03 production sweep to
+            populate (phase-1 leaves, phase-2 condensed) so callers
+            can introspect each phase's verdict separately.
     """
 
     action_taken: bool
@@ -357,6 +381,12 @@ class CompactionResult:
     level: CompactionLevel | None
     passes_completed: int
     auth_failure: bool = False
+    reason: str | None = None
+    # Phase aggregation (per spec §"CompactionResult finalized shape").
+    # ``field(default_factory=list)`` is required for mutable defaults
+    # on frozen dataclasses — the list is freshly constructed per
+    # instance so two CompactionResults don't share the same list.
+    phase_results: list["CompactionResult"] = field(default_factory=list)
 
 
 #: Type alias for the summarize callback ``compact_full_sweep`` /
@@ -552,6 +582,44 @@ class _MessageRecordLike(Protocol):
     token_count: int
 
 
+class _CompactionTelemetryStoreLike(Protocol):
+    """Narrow contract compaction's persistence calls expect on the store.
+
+    The full store contract lives in
+    :class:`lossless_hermes.store.compaction_telemetry.CompactionTelemetryStore`
+    (issue 01-10). This Protocol enumerates only the methods 04-08's call
+    sites invoke. Stores are introspected with ``getattr`` rather than
+    isinstance so a partially-implemented store (e.g., before 01-10's
+    final write-paths land) degrades gracefully — see the
+    :meth:`CompactionEngine._mark_*` helpers below.
+
+    The methods are sync per ADR-017 §"sync stores everywhere". They
+    return ``None`` and surface errors as exceptions; compaction's call
+    sites swallow exceptions defensively (telemetry MUST NOT abort a
+    successful compaction).
+    """
+
+    def mark_leaf_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None: ...
+
+    def mark_condensed_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None: ...
+
+    def mark_auth_failure(
+        self,
+        *,
+        conversation_id: int,
+    ) -> None: ...
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -654,6 +722,24 @@ class CompactionEngine:
         config: The compaction configuration. The caller is responsible
             for projecting :class:`~lossless_hermes.db.config.LcmConfig`
             into a :class:`CompactionConfig` at wiring time.
+        compaction_telemetry_store: Optional telemetry store satisfying
+            :class:`_CompactionTelemetryStoreLike`. When provided, 04-08
+            call sites mark leaf/condensed successes + auth failures
+            after each pass. ``None`` (the default) makes the call
+            sites no-op — Epic 02's cache-aware decision logic depends
+            on these writes but the canonical telemetry path is the
+            structured-log call in :meth:`_persist_compaction_event`,
+            which fires regardless. The store's per-event methods are
+            invoked with ``getattr`` introspection so a partial store
+            (missing one of the three mark methods) degrades to
+            no-op for the missing methods without raising.
+        log: Optional :class:`logging.Logger` for compaction telemetry
+            events. Defaults to a module-level logger named
+            ``lossless_hermes.compaction`` — equivalent to the TS
+            ``this.log`` field which defaults to ``NOOP_LCM_LOGGER``
+            with structured extras when configured. The logger is
+            invoked with ``extra={...}`` kwargs carrying the
+            per-event fields (see :meth:`_persist_compaction_event`).
     """
 
     def __init__(
@@ -661,10 +747,15 @@ class CompactionEngine:
         conversation_store: _ConversationStoreLike,
         summary_store: _SummaryStoreLike,
         config: CompactionConfig,
+        *,
+        compaction_telemetry_store: _CompactionTelemetryStoreLike | None = None,
+        log: logging.Logger | None = None,
     ) -> None:
         self._conversation_store = conversation_store
         self._summary_store = summary_store
         self._config = config
+        self._compaction_telemetry_store = compaction_telemetry_store
+        self._log = log if log is not None else logging.getLogger("lossless_hermes.compaction")
 
     # ------------------------------------------------------------------
     # evaluate() — context-level threshold trigger
@@ -1067,6 +1158,7 @@ class CompactionEngine:
                 condensed=False,
                 level=None,
                 passes_completed=0,
+                reason="under threshold",
             )
 
         # TS lines 649-657: empty-context short-circuit. 04-04 skeleton
@@ -1085,6 +1177,7 @@ class CompactionEngine:
                 condensed=False,
                 level=None,
                 passes_completed=0,
+                reason="no eligible chunk",
             )
 
         action_taken = False
@@ -1095,6 +1188,11 @@ class CompactionEngine:
         previous_tokens = tokens_before
         had_auth_failure = False
         passes_completed = 0
+        # 04-08: per-phase CompactionResult records for the sweep's
+        # ``phase_results`` aggregation. Each successful pass appends
+        # one entry; the no-op-on-entry paths above return without
+        # entries because nothing happened.
+        phase_results: list[CompactionResult] = []
 
         # TS lines 670-713: phase-1 loop. Delta-tracked running token
         # count; on each pass we compute ``pass_tokens_after =
@@ -1126,6 +1224,26 @@ class CompactionEngine:
             previous_summary_content = leaf_result.content
             running_tokens = pass_tokens_after
             passes_completed += 1
+
+            # 04-08: persist the per-pass record + mark the leaf-success
+            # in the telemetry store. The structured-log path runs
+            # always; the store-write degrades to no-op when the
+            # store doesn't implement the method.
+            leaf_pass_record = CompactionResult(
+                action_taken=True,
+                tokens_before=pass_tokens_before,
+                tokens_after=pass_tokens_after,
+                created_summary_id=leaf_result.summary_id,
+                condensed=False,
+                level=leaf_result.level,
+                passes_completed=1,
+            )
+            phase_results.append(leaf_pass_record)
+            self._persist_compaction_event(conversation_id, leaf_pass_record)
+            self._mark_leaf_compaction_success(
+                conversation_id=conversation_id,
+                summary_id=leaf_result.summary_id,
+            )
 
             # TS lines 705-708: under-threshold short-circuit (only
             # honored when not forced). Sets the running floor so the
@@ -1172,6 +1290,25 @@ class CompactionEngine:
             running_tokens = pass_tokens_after
             passes_completed += 1
 
+            # 04-08: persist the per-pass record + mark the condensed-
+            # success in the telemetry store. Same degrade-safe path
+            # as phase-1 above.
+            condensed_pass_record = CompactionResult(
+                action_taken=True,
+                tokens_before=pass_tokens_before,
+                tokens_after=pass_tokens_after,
+                created_summary_id=condense_result.summary_id,
+                condensed=True,
+                level=condense_result.level,
+                passes_completed=1,
+            )
+            phase_results.append(condensed_pass_record)
+            self._persist_compaction_event(conversation_id, condensed_pass_record)
+            self._mark_condensed_compaction_success(
+                conversation_id=conversation_id,
+                summary_id=condense_result.summary_id,
+            )
+
             # TS lines 753-755: under-threshold short-circuit.
             if not force and pass_tokens_after <= threshold:
                 previous_tokens = pass_tokens_after
@@ -1196,6 +1333,7 @@ class CompactionEngine:
             level=level,
             passes_completed=passes_completed,
             auth_failure=had_auth_failure,
+            phase_results=phase_results,
         )
 
     # ------------------------------------------------------------------
@@ -1342,6 +1480,242 @@ class CompactionEngine:
             rounds=self._config.max_rounds,
             final_tokens=last_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Telemetry write paths (issue 04-08)
+    # ------------------------------------------------------------------
+    #
+    # Two surfaces:
+    #
+    # 1. Structured-log telemetry — :meth:`_persist_compaction_event` and
+    #    :meth:`_persist_compaction_events`. Mirrors TS
+    #    ``persistCompactionEvents`` (compaction.ts:1754-1812) +
+    #    ``persistCompactionEvent`` (1815-1830). Per the porting guide
+    #    §"Telemetry write paths" and the spec ``epics/04-compaction/
+    #    04-08-telemetry-write.md``: this is intentionally a structured
+    #    log call, NOT a chat-message-row write. Earlier LCM versions
+    #    appended a synthetic assistant message describing each
+    #    compaction; the LCM team removed that to avoid polluting the
+    #    conversation history. The summary write itself (in
+    #    ``_leafPass`` / ``_condensedPass`` transactions) is the
+    #    canonical persistence point.
+    #
+    # 2. Telemetry-store integration — :meth:`_mark_leaf_compaction_success`,
+    #    :meth:`_mark_condensed_compaction_success`, and
+    #    :meth:`_mark_auth_failure`. These call the optional
+    #    :class:`CompactionTelemetryStore` (issue 01-10) so Epic 02's
+    #    cache-aware ``evaluate_incremental_compaction`` can read
+    #    "when did we last compact this conversation?". The store is
+    #    optional; missing methods on the store degrade to a no-op
+    #    (per spec §"Telemetry-store calls are stubbed-safe").
+
+    def _persist_compaction_event(
+        self,
+        conversation_id: int,
+        result: CompactionResult,
+    ) -> None:
+        """Emit a structured log record for one compaction pass.
+
+        Mirrors TS :meth:`CompactionEngine.persistCompactionEvent`
+        (compaction.ts lines 1815-1830). **Despite the name, no DB row
+        is written** — this is purely a log call. The TS source
+        accumulates the same fields into a ``content`` template string
+        + ``this.log.info``; the Python port emits them as ``extra=``
+        kwargs so structured-logging consumers can index by field
+        rather than parsing the message.
+
+        Why no chat-message row: earlier LCM versions appended a
+        synthetic assistant message describing each compaction
+        ("LCM compaction leaf pass (normal): 100000 -> 60000"). That
+        was removed to prevent compaction events from polluting the
+        canonical conversation history. The summary row itself, written
+        inside the leaf-pass / condensed-pass transactions, is the
+        durable record of what happened.
+
+        Args:
+            conversation_id: The conversation the pass operated on.
+            result: A per-pass :class:`CompactionResult` carrying the
+                fields we want indexed. Producer (typically
+                :meth:`compact_full_sweep`) constructs a one-pass
+                ``CompactionResult`` for each successful pass.
+        """
+        # Compute the post-vs-pre delta once so consumers don't have
+        # to re-derive it from the two raw counts.
+        delta = result.tokens_before - result.tokens_after
+        # TS line 1827: ``this.log.info`` with a templated message. The
+        # template carries the human-readable summary; the extras
+        # carry the structured fields. We mirror the TS message format
+        # so log scrapers that parse it continue to work, AND emit
+        # extras for structured-log consumers.
+        self._log.info(
+            "lcm compaction %s pass (%s): %d -> %d conversation=%d summary=%s",
+            # The "pass" field is condensed=True/False — phase-2 vs
+            # phase-1. We surface a human-readable label here.
+            "condensed" if result.condensed else "leaf",
+            result.level if result.level is not None else "none",
+            result.tokens_before,
+            result.tokens_after,
+            conversation_id,
+            result.created_summary_id if result.created_summary_id is not None else "<none>",
+            extra={
+                "compaction_event": {
+                    "conversation_id": conversation_id,
+                    "action_taken": result.action_taken,
+                    "tokens_before": result.tokens_before,
+                    "tokens_after": result.tokens_after,
+                    "delta": delta,
+                    "level": result.level,
+                    "condensed": result.condensed,
+                    "auth_failure": result.auth_failure,
+                    "created_summary_id": result.created_summary_id,
+                    "reason": result.reason,
+                },
+            },
+        )
+
+    def _persist_compaction_events(
+        self,
+        conversation_id: int,
+        results: list[CompactionResult | None],
+    ) -> None:
+        """Persist a list of per-pass results, skipping ``None`` entries.
+
+        Mirrors TS :meth:`CompactionEngine.persistCompactionEvents`
+        (compaction.ts lines 1754-1812). The TS version takes a richer
+        record bundling leaf+condensed results into a single call; the
+        Python spec at ``epics/04-compaction/04-08-telemetry-write.md``
+        finalizes the shape as a list of :class:`CompactionResult`
+        (or ``None``) so producers that only have one phase's result
+        don't have to synthesize a sentinel for the other.
+
+        Args:
+            conversation_id: The conversation the passes operated on.
+            results: List of per-pass results. ``None`` entries are
+                skipped (matches TS lines 1771-1773 + 1785/1799 None-
+                guards).
+        """
+        for r in results:
+            if r is not None:
+                self._persist_compaction_event(conversation_id, r)
+
+    def _mark_leaf_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None:
+        """Record a successful leaf compaction in the telemetry store.
+
+        Spec §"Compaction telemetry store updates": call after every
+        successful ``_leaf_pass``. Updates the store's
+        ``last_leaf_compaction_at`` and bumps the
+        ``leaf_compaction_count``. The exact field set is defined by
+        :class:`CompactionTelemetryStore` (Epic 01 issue 01-10).
+
+        Defensively introspected with :func:`getattr` so a partial
+        store (missing this method while the rest of the API is
+        present) degrades to a no-op instead of raising. Telemetry
+        failures MUST NOT abort a successful compaction.
+
+        Args:
+            conversation_id: The conversation whose telemetry to bump.
+            summary_id: ID of the summary row the leaf pass wrote.
+                Carried so the store can correlate the bump with the
+                produced summary (the store may use it to ignore a
+                duplicate call from a retry).
+        """
+        self._mark_telemetry(
+            "mark_leaf_compaction_success",
+            conversation_id=conversation_id,
+            summary_id=summary_id,
+        )
+
+    def _mark_condensed_compaction_success(
+        self,
+        *,
+        conversation_id: int,
+        summary_id: str,
+    ) -> None:
+        """Record a successful condensed compaction in the telemetry store.
+
+        Same contract as :meth:`_mark_leaf_compaction_success` but for
+        depth>=1 condensed passes. Updates the store's
+        ``last_condensed_compaction_at`` and the per-depth counters.
+        """
+        self._mark_telemetry(
+            "mark_condensed_compaction_success",
+            conversation_id=conversation_id,
+            summary_id=summary_id,
+        )
+
+    def _mark_auth_failure(
+        self,
+        *,
+        conversation_id: int,
+    ) -> None:
+        """Record a provider-auth failure in the telemetry store.
+
+        Spec §"Compaction telemetry store updates": call when a
+        ``_leaf_pass`` / ``_condensed_pass`` short-circuits because
+        the summarizer raised :class:`LcmProviderAuthError` (the
+        ``auth_failure=True`` path). Bumps the store's
+        ``consecutive_auth_failures`` counter so the cache-aware
+        decision logic can back off.
+
+        Called from production code in issues 04-02 / 04-03 once the
+        leaf-pass body raises ``LcmProviderAuthError``; 04-08 lands
+        only the call-site helper.
+        """
+        self._mark_telemetry(
+            "mark_auth_failure",
+            conversation_id=conversation_id,
+        )
+
+    def _mark_telemetry(
+        self,
+        method_name: str,
+        **kwargs: Any,
+    ) -> None:
+        """Defensively invoke a telemetry-store method by name.
+
+        Centralizes the "store is optional + method may not exist +
+        errors MUST NOT propagate" defensiveness. The three
+        ``_mark_*`` helpers above delegate here. Failure modes
+        handled:
+
+        * ``self._compaction_telemetry_store is None`` — skip silently
+          (the engine was constructed without a telemetry store; Epic
+          01 store may not be wired yet at the call site).
+        * Store doesn't implement ``method_name`` — skip silently (a
+          partial store, e.g., before 01-10's write paths land).
+        * Method raises any exception — swallow it and emit a debug
+          log line. Telemetry MUST NOT abort a successful compaction.
+
+        Args:
+            method_name: One of ``mark_leaf_compaction_success``,
+                ``mark_condensed_compaction_success``,
+                ``mark_auth_failure``. Looked up on the store.
+            **kwargs: Forwarded to the store method as keyword args.
+        """
+        store = self._compaction_telemetry_store
+        if store is None:
+            return
+        method = getattr(store, method_name, None)
+        if method is None:
+            return
+        try:
+            method(**kwargs)
+        except Exception:  # noqa: BLE001 — telemetry must never abort compaction.
+            # Log at debug rather than warning: a missing telemetry
+            # row is not actionable for the operator, and a failing
+            # store call usually means a downstream test-fixture is
+            # mid-port. The caller (Epic 02 cache-aware path) will
+            # observe the missing bump on its next read.
+            self._log.debug(
+                "compaction telemetry call failed: %s",
+                method_name,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Subclass hooks — pluggable leaf/condensed-pass bodies for 04-02/03
