@@ -30,7 +30,7 @@ apsw = ["apsw==3.53.1.0"]
 # Dev/test surface. Pinned to Hermes's versions where overlap exists so
 # plugin authors can run Hermes's test suite alongside ours without conflict.
 dev = [
-    "pytest==9.0.2",              # matches Hermes pin
+    "pytest==9.0.3",              # bumped above Hermes pin to close GHSA tmpdir CVE (dependabot #1, moderate)
     "pytest-asyncio==1.3.0",      # matches Hermes pin
     "pytest-mock==3.14.0",
     "pytest-cov==6.0.0",
