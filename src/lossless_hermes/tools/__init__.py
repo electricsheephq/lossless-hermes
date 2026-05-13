@@ -157,6 +157,7 @@ from lossless_hermes.tools import expand as _expand  # noqa: F401, E402
 from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
 from lossless_hermes.tools import grep as _grep  # noqa: F401, E402
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402
+from lossless_hermes.tools import synthesize_around as _synthesize_around  # noqa: F401, E402
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
