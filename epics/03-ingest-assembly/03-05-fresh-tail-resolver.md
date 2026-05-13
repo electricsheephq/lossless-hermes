@@ -76,7 +76,7 @@ def resolve_fresh_tail_ordinal(
 - Empty `resolved` list — return `len(resolved)` (0).
 - All-summary items (no raw messages) — return `len(resolved)` (effectively empty fresh tail; everything is evictable).
 - Single message — return its ordinal.
-- `fresh_tail_count = 0` — still keep newest (newest-always-preserved invariant).
+- `fresh_tail_count = 0` — return sentinel (`EMPTY_FRESH_TAIL_ORDINAL`); disables the fresh tail entirely. Matches TS `assembler.ts:988-990` which returns `Infinity` when `freshTailCount <= 0` (the 5 TS integration tests at `lcm-integration.test.ts:1510/1567/1628/1688/1761` configure `freshTailCount: 0` to disable the mechanism). PR #45 reviewer-confirmed.
 - `fresh_tail_max_tokens` smaller than the newest message — still keep newest.
 - `fresh_tail_count` larger than the message count — keep everything.
 - Mixed messages + summaries — summaries between kept messages get included.
@@ -90,7 +90,7 @@ def resolve_fresh_tail_ordinal(
 - [ ] `resolve_fresh_tail_ordinal` is a `@staticmethod` on `ContextAssembler` (or module-level — pick one and stay consistent).
 - [ ] Default `fresh_tail_count = 8` applies when caller passes no value (or matches the value in `AssembleInput` dataclass).
 - [ ] Newest message is always kept, even if alone over the token cap.
-- [ ] `fresh_tail_count = 0` still keeps the newest.
+- [ ] `fresh_tail_count = 0` returns sentinel (TS canonical — disables fresh tail; see Edge cases above).
 - [ ] Empty `resolved` returns `len(resolved)` (= 0); a test asserts no division-by-zero or out-of-range.
 - [ ] All-summary input returns `len(resolved)`.
 - [ ] Summaries between kept raw messages end up inside the fresh-tail slice via the `>= boundary` splitter (verify in a #03-08 integration test, not here).
