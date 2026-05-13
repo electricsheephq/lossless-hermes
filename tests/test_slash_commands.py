@@ -189,12 +189,14 @@ def test_unknown_cmd_returns_unknown_message() -> None:
         ("purge", "Epic 08"),
         ("health", "Epic 08"),
         ("doctor", "Epic 08"),
-        ("backup", "Epic 08"),
         ("rotate", "Epic 08"),
         ("eval", "Epic 09"),
         # Note: ``import-openclaw`` was previously stubbed; issue 08-15
         # wired the real body in ``lossless_hermes.cli.import_openclaw``.
         # The dedicated tests live in ``tests/cli/test_import_openclaw.py``.
+        # Note: ``backup`` was previously stubbed; issue 08-09 wired the
+        # real body in ``lossless_hermes.commands.backup``. The dedicated
+        # tests live in ``tests/commands/test_backup.py``.
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
