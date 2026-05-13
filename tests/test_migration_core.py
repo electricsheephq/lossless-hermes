@@ -18,9 +18,12 @@ in scope for the core schema:
   partial-active partial UNIQUE.
 * Belt-and-suspenders: :func:`_ensure_message_parts_table_belt_and_suspenders`
   re-runs idempotently outside the bulk block.
-* Stubs: :func:`_ensure_fts5_tables`, :func:`_run_versioned_backfills`,
-  :func:`_seed_default_prompts` are no-ops (FTS5 lands in #01-05,
-  backfills in #01-15, prompt seeding alongside synthesis).
+* Stubs: :func:`_seed_default_prompts` is a no-op (prompt seeding
+  lands alongside the synthesis epic). :func:`_ensure_fts5_tables`
+  (#01-05) and :func:`_run_versioned_backfills` (#01-15) are now
+  IMPLEMENTED — exercised here at the ledger-row level, with full
+  per-backfill behavior covered in :mod:`tests.test_migration_fts5`
+  and :mod:`tests.test_migration_backfills` respectively.
 * :func:`_ensure_v41_tables` and :func:`_ensure_core_triggers` are
   IMPLEMENTED as of #01-06 — verified by ``test_v41_tables_created_*``
   and ``test_core_triggers_created_*`` here, plus full coverage in
@@ -34,7 +37,7 @@ Out of scope for this test file (covered when the dependent PRs land):
 
 * FTS5 virtual-table creation + seed (in #01-05).
 * v4.1 deep-dive tests — see ``tests/test_migration_v41.py``.
-* Versioned-backfill semantics (in #01-15).
+* Versioned-backfill deep-dive tests — see ``tests/test_migration_backfills.py``.
 * Default-prompt seeding (in synthesis epic).
 
 References:
@@ -1116,12 +1119,32 @@ def test_core_triggers_created_after_migration(migrated_db: sqlite3.Connection) 
     assert triggers == ["lcm_embedding_meta_cleanup_summary"]
 
 
-def test_backfills_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
-    """``_run_versioned_backfills`` is a no-op until #01-15 lands."""
-    rows_before = migrated_db.execute("SELECT * FROM lcm_migration_state").fetchall()
+def test_backfills_run_on_empty_db(migrated_db: sqlite3.Connection) -> None:
+    """``_run_versioned_backfills`` records 3 ledger rows on an empty DB.
+
+    With #01-15 landed, the three algorithm-versioned backfills run on
+    the first migration and each writes one ``lcm_migration_state`` row
+    (algorithm_version=1). The unversioned helpers
+    (identity-hash / session-key) are idempotent SQL and don't produce
+    ledger rows. Detailed behavior — including pre-existing data, the
+    cycle guard, key-precedence chains, and re-run-is-no-op — is
+    covered in :mod:`tests.test_migration_backfills`.
+    """
+    rows = migrated_db.execute(
+        "SELECT step_name, algorithm_version FROM lcm_migration_state ORDER BY step_name"
+    ).fetchall()
+    assert rows == [
+        ("backfillSummaryDepths", 1),
+        ("backfillSummaryMetadata", 1),
+        ("backfillToolCallColumns", 1),
+    ]
+    # A second migration call is a no-op: ledger rows are unchanged and
+    # the SAVEPOINTs short-circuit before doing any UPDATE work.
     _run_versioned_backfills(migrated_db, log=None)
-    rows_after = migrated_db.execute("SELECT * FROM lcm_migration_state").fetchall()
-    assert rows_before == rows_after
+    rows_after = migrated_db.execute(
+        "SELECT step_name, algorithm_version FROM lcm_migration_state ORDER BY step_name"
+    ).fetchall()
+    assert rows_after == rows
 
 
 def test_seed_default_prompts_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
