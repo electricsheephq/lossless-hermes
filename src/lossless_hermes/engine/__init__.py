@@ -324,13 +324,26 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         Returns:
             The :class:`CircuitBreaker` for ``key``.
         """
-        breaker = self._circuit_breakers.get(key)
-        if breaker is None:
-            breaker = CircuitBreaker(
+        # ``dict.setdefault`` is atomic under the CPython GIL — the
+        # lookup-and-insert runs as a single bytecode op, so two
+        # concurrent callers cannot both insert. The earlier
+        # ``get``-then-``[key] =`` pair was a TOCTOU race: both callers
+        # could see ``None`` from ``get`` and the loser's freshly
+        # constructed instance would silently overwrite the winner's
+        # (or vice versa), with already-issued references diverging.
+        # ``setdefault`` collapses both steps into one atomic op.
+        #
+        # The eagerly-constructed-then-discarded loser instance is
+        # acceptable: ``CircuitBreaker`` has no side effects in
+        # ``__init__`` (just a small alloc + ``threading.Lock()``), and
+        # the loser is dropped on return.
+        breaker = self._circuit_breakers.setdefault(
+            key,
+            CircuitBreaker(
                 threshold=self.config.circuit_breaker_threshold,
                 cooldown_s=self.config.circuit_breaker_cooldown_ms / 1000.0,
-            )
-            self._circuit_breakers[key] = breaker
+            ),
+        )
         return breaker
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:

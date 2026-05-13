@@ -29,6 +29,39 @@ Per the issue spec, the threshold + cooldown come from
 defaults to 5; ``circuit_breaker_cooldown_ms`` defaults to 1_800_000 =
 30 min). Callers pass these in to :func:`CircuitBreaker.__init__`.
 
+Deferred to Epic 04 (the first real caller — Epic 02 has none)
+----------------------------------------------------------------
+
+The Pair Reviewer for issue 02-09 flagged two items that we deliberately
+defer until Epic 04 wires the auth-failure catch around the summarizer.
+Documenting them here so the next agent picks them up rather than
+rediscovering them.
+
+* **TODO(Epic 04): half_open multi-probe concurrency.** :meth:`is_open`
+  performs the ``open → half_open`` transition under the breaker's
+  internal lock, but the *probe call* itself runs outside the lock.
+  Two concurrent callers can therefore both observe ``is_open() ==
+  False`` for the same half-open state and both issue a probe against
+  the (still potentially unhealthy) upstream — defeating the
+  single-probe semantics. The TS source has the same race, but Epic 04
+  callers should serialize the probe via an additional
+  ``_half_open_probe_lock`` (or ``asyncio.Lock`` if the caller is
+  async) before invoking the summarizer. The fix belongs with the
+  caller (Epic 04 summarize.py wiring), not the primitive, because
+  only the caller knows the probe boundary. Cross-reference engine.ts
+  ``executeCompactionWithBreaker`` at line ~2040 for the TS shape.
+
+* **TODO(Epic 04): half-threshold WARN log.** Epic 04 wants an early
+  operator signal once consecutive failures cross ``threshold / 2``
+  (i.e. "headed toward circuit-open"), distinct from the ``OPENED``
+  WARN that fires on the threshold itself. We did not add it here
+  because the primitives have no caller yet and adding a third log
+  level would clutter the test surface. Suggested implementation:
+  log INFO (or WARN) inside :meth:`record_failure` when
+  ``self.failures == self.threshold // 2 + 1`` (the first failure
+  past the halfway mark, fires exactly once per open cycle). Pair
+  with a Prometheus/StatsD gauge in Epic 04 telemetry.
+
 See:
 
 * ``docs/adr/027-engine-splitting.md`` — engine package layout.

@@ -373,8 +373,16 @@ def test_concurrent_mixed_calls_keep_state_consistent() -> None:
         t.join()
 
     # Invariant check — state must agree with bookkeeping fields.
+    # ``state == "closed"`` only guarantees "not open"; the breaker is
+    # closed both at ``failures == 0`` (fresh / just-reset) and at
+    # ``0 < failures < threshold`` (transient failures that have not
+    # yet crossed the trip line). Only ``record_success`` zeros
+    # ``failures``, so we cannot assert ``failures == 0`` here — a
+    # ``record_failure`` may be the last interleaved op. The accurate
+    # invariant is: while closed, the breaker has not yet tripped, so
+    # ``failures < threshold`` and ``open_since`` is unset.
     if breaker.state == "closed":
-        assert breaker.failures == 0
+        assert breaker.failures < breaker.threshold
         assert breaker.open_since is None
     elif breaker.state == "open":
         # Could have been opened then partially decremented by a success
