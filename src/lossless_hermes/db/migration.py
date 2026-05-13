@@ -7,7 +7,7 @@ and ADR-026.
 
 ### What this module ships
 
-Issues ``#01-04`` and ``#01-05`` (the core schema + FTS5):
+Issues ``#01-04`` (core schema) and ``#01-05`` (FTS5):
 
 * **12 always-on tables** (#01-04) — ``conversations``, ``messages``,
   ``message_parts``, ``summaries``, ``summary_messages``,
@@ -26,33 +26,45 @@ Issues ``#01-04`` and ``#01-05`` (the core schema + FTS5):
   tables and seeds them from the existing ``messages`` / ``summaries``
   rows on first run.
 
+Issue ``#01-06`` (this PR) lands the **v4.1 schema layer**:
+
+* **17 v4.1 tables** — Support layer (``lcm_worker_lock``,
+  ``lcm_feature_flags``, ``lcm_extraction_queue``, ``lcm_session_key_audit``);
+  Synthesis layer (``lcm_prompt_registry``, ``lcm_synthesis_cache``,
+  ``lcm_cache_leaf_refs``, ``lcm_synthesis_audit``); Eval harness
+  (``lcm_eval_query_set``, ``lcm_eval_query``, ``lcm_eval_run``,
+  ``lcm_eval_drift``); Entity layer (``lcm_entity_type_registry``,
+  ``lcm_entities``, ``lcm_entity_mentions``); Embedding registry
+  (``lcm_embedding_profile``, ``lcm_embedding_meta``).
+* **24 v4.1 indexes** — incl. partial indexes for the extraction-queue
+  pending/dead-letter, synthesis-cache status='building', synthesis-audit GC
+  sweeps, embedding-meta archived=0, the null-safe COALESCE UNIQUE index on
+  ``lcm_prompt_registry``, and the Wave-10 hardened UNIQUE on
+  ``lcm_synthesis_cache`` (includes ``tier_label`` + ``prompt_id``).
+* **1 trigger** — ``lcm_embedding_meta_cleanup_summary`` (AFTER DELETE ON
+  summaries) cleans polymorphic ``lcm_embedding_meta`` sidecar rows.
+* **Cache-recreate path** — drop+recreate ``lcm_synthesis_cache`` if the old
+  narrow ``tier_label`` CHECK is detected, pruning orphaned
+  ``lcm_synthesis_audit`` rows first.
+
 ### Section-stub pattern (ADR-027 analogue)
 
-The orchestrator is split into seven section helpers so issues #01-05 / #01-06 /
-#01-15 / synthesis can land in parallel without touching each other's regions:
+The orchestrator is split into seven section helpers so issues land in parallel
+without touching each other's regions:
 
-* :func:`_ensure_core_tables` — body lives here (this PR).
-* :func:`_ensure_core_indexes` — body lives here (this PR).
-* :func:`_ensure_fts5_tables` — body landed in #01-05 (3 FTS5 virtual tables:
-  ``messages_fts``, ``summaries_fts``, ``summaries_fts_cjk`` (gated on the
-  trigram tokenizer being available)).
-* :func:`_ensure_v41_tables` — **stub** in this PR; body lands in #01-06 (the 13
-  v4.1 tables: ``lcm_worker_lock``, ``lcm_extraction_queue``,
-  ``lcm_session_key_audit``, ``lcm_prompt_registry``, ``lcm_synthesis_cache``,
-  ``lcm_cache_leaf_refs``, ``lcm_synthesis_audit``, 4 eval tables, 3 entity
-  tables, 2 embedding registry tables, ``lcm_feature_flags`` + their indexes +
-  the polymorphic-cleanup trigger).
-* :func:`_ensure_core_triggers` — **stub** in this PR; body lands alongside
-  #01-06 because the only core trigger (``lcm_embedding_meta_cleanup_summary``)
-  references ``lcm_embedding_meta`` which is created in #01-06. SQLite accepts
-  ``CREATE TRIGGER`` referencing a missing table at DDL parse time but fires on
-  delete fail at runtime — so deferring the body keeps every interim state
-  usable.
-* :func:`_run_versioned_backfills` — **stub** in this PR; body lands in #01-15
+* :func:`_ensure_core_tables` — body lives here (#01-04).
+* :func:`_ensure_core_indexes` — body lives here (#01-04).
+* :func:`_ensure_fts5_tables` — body landed in #01-05 (3 FTS5 virtual tables).
+* :func:`_ensure_v41_tables` — body lives here (#01-06): the 17 v4.1 tables
+  (synthesis / eval / entity / embedding-registry layers).
+* :func:`_ensure_core_triggers` — body lives here (#01-06). Runs AFTER
+  :func:`_ensure_v41_tables` because the only core trigger
+  (``lcm_embedding_meta_cleanup_summary``) references ``lcm_embedding_meta``.
+* :func:`_run_versioned_backfills` — **stub**; body lands in #01-15
   (``backfillSummaryDepths`` / ``backfillSummaryMetadata`` /
   ``backfillToolCallColumns``, each gated by ``lcm_migration_state``).
-* :func:`_seed_default_prompts` — **stub** in this PR; body lands alongside the
-  synthesis epic (depends on ``lcm_prompt_registry`` from #01-06).
+* :func:`_seed_default_prompts` — **stub**; body lands alongside the
+  synthesis epic (depends on ``lcm_prompt_registry`` from this PR).
 
 ### Idempotency invariant (ADR-026 §"Structural state")
 
@@ -73,10 +85,22 @@ already-applied schema, making its run a no-op.
 
 ### Wave-N provenance (ADR-029)
 
-The TS source carries a handful of Wave-N comments inside the v4.1 section
-(Wave-1/3/10 cache-CHECK widening, prompt-registry COALESCE UNIQUE). Those
-comments belong to the #01-06 body and ship with that PR. The core scope in
-THIS PR has **no Wave-N markers** in the TS source — the core schema landed
+The TS source carries four Wave-N comments inside the v4.1 section that ship
+with #01-06:
+
+* **Wave-1** (migration.ts:1470) — cache-recreate prunes orphaned audit rows
+  before DROPing the table, so FK_OFF migrations don't leave dangling refs.
+* **Wave-2** (migration.ts:1477) — narrow the orphan-prune catch to the
+  expected "no such table" error, not any error.
+* **Wave-10** (migration.ts:1535) — UNIQUE index on ``lcm_synthesis_cache``
+  includes ``tier_label`` + ``prompt_id`` so distinct (tier, prompt) pairs
+  get distinct cache rows.
+* **Wave-3** (migration.ts:1634) — parallel ``completed/failed`` GC partial
+  index on ``lcm_synthesis_audit`` so the inline GC sweep is O(log n).
+
+Each Wave-N marker carries a comment of the form
+``# LCM Wave-N (YYYY-MM-DD): description`` per ADR-029. The core scope in
+#01-04 had **no Wave-N markers** in the TS source — the core schema landed
 pre-Wave-1.
 
 See:
@@ -455,6 +479,481 @@ _CORE_INDEX_CREATIONS: tuple[str, ...] = (
     *_CORE_INDEX_CREATIONS_EARLY,
     *_CORE_INDEX_CREATIONS_LATE,
 )
+
+
+# ---------------------------------------------------------------------------
+# SQL constants — v4.1 tables (per storage.md §2.3-§2.7 and migration.ts:1268-1885)
+# ---------------------------------------------------------------------------
+#
+# 17 v4.1 always-on additions:
+# * Support layer (storage.md §2.3): lcm_feature_flags, lcm_worker_lock,
+#   lcm_extraction_queue, lcm_session_key_audit.
+# * Synthesis layer (storage.md §2.4): lcm_prompt_registry,
+#   lcm_synthesis_cache, lcm_cache_leaf_refs, lcm_synthesis_audit.
+# * Eval layer (storage.md §2.5): lcm_eval_query_set, lcm_eval_query,
+#   lcm_eval_run, lcm_eval_drift.
+# * Entity layer (storage.md §2.6): lcm_entity_type_registry, lcm_entities,
+#   lcm_entity_mentions.
+# * Embedding registry (storage.md §2.7): lcm_embedding_profile,
+#   lcm_embedding_meta.
+#
+# Layout notes:
+# * Each CREATE TABLE is a separate string constant so future schema audits
+#   can ``grep -A30 "^_SQL_TABLE_<name> ="`` and read one table at a time.
+# * Whitespace inside the strings matches `migration.ts` byte-for-byte
+#   (modulo Python r-string conventions); this minimizes schema-diff noise
+#   when ``./scripts/schema_diff.sh --verify`` compares ``sqlite_master.sql``.
+# * IF NOT EXISTS is mandatory per ADR-026 §"Structural state".
+# * Dependency order: lcm_prompt_registry MUST precede lcm_synthesis_cache
+#   (FK on prompt_id); lcm_synthesis_cache MUST precede lcm_synthesis_audit
+#   (FK on target_cache_id) and lcm_cache_leaf_refs (FK on cache_id);
+#   lcm_eval_query_set MUST precede the other 3 eval tables (FKs);
+#   lcm_entities MUST precede lcm_entity_mentions; lcm_embedding_profile
+#   MUST precede lcm_embedding_meta.
+
+
+# v4.1.1 A9 — lcm_worker_lock: cross-process job lock for the worker
+# sidecar (condensation, extraction, embedding backfill, theme
+# consolidation, eval, profile rebuild). `last_heartbeat_at` is required
+# by §0.5 fallback rule (gateway can take over only when BOTH
+# `expires_at < now` AND `last_heartbeat_at < now - 300s`).
+# Ports migration.ts:1277-1287.
+_SQL_TABLE_LCM_WORKER_LOCK = """
+    CREATE TABLE IF NOT EXISTS lcm_worker_lock (
+      job_kind TEXT NOT NULL PRIMARY KEY,
+      worker_id TEXT NOT NULL,
+      acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      last_heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')),
+      job_session_key TEXT,
+      job_metadata TEXT
+    )
+"""
+
+# v4.1.1 A8 — lcm_feature_flags: runtime-disable for optional features
+# (e.g. semantic retrieval if vec0 fails to load). Ports migration.ts:189-195.
+_SQL_TABLE_LCM_FEATURE_FLAGS = """
+    CREATE TABLE IF NOT EXISTS lcm_feature_flags (
+      flag TEXT NOT NULL PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+"""
+
+# v4.1.1 A3 — lcm_extraction_queue: entity-coref + procedure-recheck queue.
+# Ports migration.ts:1313-1325.
+_SQL_TABLE_LCM_EXTRACTION_QUEUE = """
+    CREATE TABLE IF NOT EXISTS lcm_extraction_queue (
+      queue_id TEXT NOT NULL PRIMARY KEY,
+      leaf_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('entity', 'procedure-recheck')),
+      queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+      picked_at TEXT,
+      worker_id TEXT,
+      completed_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    )
+"""
+
+# v4.1.1 §C — lcm_session_key_audit: log of session_key re-keys for
+# `/lcm undo-session-key-rekey`. Ports migration.ts:1357-1367.
+_SQL_TABLE_LCM_SESSION_KEY_AUDIT = """
+    CREATE TABLE IF NOT EXISTS lcm_session_key_audit (
+      audit_id TEXT NOT NULL PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      original_session_key TEXT,
+      new_session_key TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+      applied_by TEXT NOT NULL DEFAULT 'migration'
+    )
+"""
+
+# v4.1 §3 + v4.1.1 D — lcm_prompt_registry: versioned prompts per
+# memory_type × tier × pass_kind. Append-only (old versions deactivated,
+# never deleted). Ports migration.ts:1384-1406.
+_SQL_TABLE_LCM_PROMPT_REGISTRY = """
+    CREATE TABLE IF NOT EXISTS lcm_prompt_registry (
+      prompt_id TEXT NOT NULL PRIMARY KEY,
+      memory_type TEXT NOT NULL CHECK (memory_type IN (
+        'episodic-leaf',
+        'episodic-condensed',
+        'episodic-yearly',
+        'procedural-extract',
+        'entity-extract',
+        'theme-consolidation'
+      )),
+      tier_label TEXT,
+      pass_kind TEXT NOT NULL CHECK (pass_kind IN ('single', 'verify_fidelity', 'best_of_n_judge')),
+      version INTEGER NOT NULL,
+      template TEXT NOT NULL,
+      model_recommendation TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      active INTEGER NOT NULL DEFAULT 1,
+      bundle_version INTEGER NOT NULL DEFAULT 1,
+      notes TEXT,
+      UNIQUE(memory_type, tier_label, pass_kind, version)
+    )
+"""
+
+# v3.1 A8 + v4.1.1 B4 — lcm_synthesis_cache: rebuildable derived layer
+# for ad-hoc synthesize() output. UNIQUE lookup index enables INSERT OR
+# IGNORE cross-process single-flight. Ports migration.ts:1505-1530.
+_SQL_TABLE_LCM_SYNTHESIS_CACHE = """
+    CREATE TABLE IF NOT EXISTS lcm_synthesis_cache (
+      cache_id TEXT NOT NULL PRIMARY KEY,
+      session_key TEXT NOT NULL,
+      range_start TEXT NOT NULL,
+      range_end TEXT NOT NULL,
+      grep_filter TEXT,
+      leaf_fingerprint TEXT NOT NULL,
+      content TEXT,
+      entity_index TEXT NOT NULL DEFAULT '{}',
+      model_used TEXT NOT NULL,
+      prompt_id TEXT NOT NULL REFERENCES lcm_prompt_registry(prompt_id) ON DELETE RESTRICT,
+      tier_label TEXT NOT NULL CHECK (tier_label IN ('year', 'yearly', 'monthly', 'weekly', 'daily', 'custom', 'filtered')),
+      source_leaf_ids TEXT NOT NULL,
+      source_condensed_ids TEXT,
+      built_at TEXT NOT NULL DEFAULT (datetime('now')),
+      source_token_count INTEGER NOT NULL,
+      output_token_count INTEGER NOT NULL,
+      actual_range_covered TEXT NOT NULL,
+      leaf_count_synthesized INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ready'
+        CHECK (status IN ('building', 'ready', 'failed')),
+      building_started_at TEXT,
+      failure_reason TEXT
+    )
+"""
+
+# v3.1 A3 (extension) — lcm_cache_leaf_refs: inverse index cache_id → leaves.
+# CASCADE both directions. Ports migration.ts:1575-1580.
+_SQL_TABLE_LCM_CACHE_LEAF_REFS = """
+    CREATE TABLE IF NOT EXISTS lcm_cache_leaf_refs (
+      cache_id TEXT NOT NULL REFERENCES lcm_synthesis_cache(cache_id) ON DELETE CASCADE,
+      leaf_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      PRIMARY KEY (cache_id, leaf_summary_id)
+    )
+"""
+
+# v4.1.1 B1 — lcm_synthesis_audit: per-pass synthesis log (draft,
+# verify_fidelity, best-of-N drafts, judge). pass_output is NULLable so
+# it can be inserted BEFORE the LLM call (status='started'); post-LLM
+# UPDATE sets pass_output + status. Ports migration.ts:1595-1613.
+_SQL_TABLE_LCM_SYNTHESIS_AUDIT = """
+    CREATE TABLE IF NOT EXISTS lcm_synthesis_audit (
+      audit_id TEXT NOT NULL PRIMARY KEY,
+      pass_session_id TEXT NOT NULL,
+      target_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      target_cache_id TEXT REFERENCES lcm_synthesis_cache(cache_id) ON DELETE CASCADE,
+      prompt_id TEXT NOT NULL REFERENCES lcm_prompt_registry(prompt_id) ON DELETE RESTRICT,
+      pass_kind TEXT NOT NULL,
+      pass_input_truncated TEXT NOT NULL,
+      pass_output TEXT,
+      status TEXT NOT NULL DEFAULT 'started'
+        CHECK (status IN ('started', 'completed', 'failed')),
+      model_used TEXT NOT NULL,
+      latency_ms INTEGER,
+      cost_usd_cents INTEGER,
+      last_error TEXT,
+      ran_at TEXT NOT NULL DEFAULT (datetime('now')),
+      CHECK (target_summary_id IS NOT NULL OR target_cache_id IS NOT NULL)
+    )
+"""
+
+# v4.1 §11 + v4.1.1 — lcm_eval_query_set: versioned query-set roots.
+# Ports migration.ts:1654-1659.
+_SQL_TABLE_LCM_EVAL_QUERY_SET = """
+    CREATE TABLE IF NOT EXISTS lcm_eval_query_set (
+      query_set_id TEXT NOT NULL PRIMARY KEY,
+      version INTEGER NOT NULL,
+      description TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+"""
+
+# v4.1 §11 — lcm_eval_query: individual queries with stratum CHECK.
+# Ports migration.ts:1665-1675.
+_SQL_TABLE_LCM_EVAL_QUERY = """
+    CREATE TABLE IF NOT EXISTS lcm_eval_query (
+      query_id TEXT NOT NULL PRIMARY KEY,
+      query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+      query_text TEXT NOT NULL,
+      stratum TEXT NOT NULL CHECK (stratum IN ('fts-easy', 'fts-medium', 'paraphrastic')),
+      expected_topics TEXT NOT NULL,
+      expected_sources TEXT,
+      reference_summary TEXT,
+      must_not_regress INTEGER NOT NULL DEFAULT 0,
+      rubric TEXT NOT NULL
+    )
+"""
+
+# v4.1 §11 — lcm_eval_run: eval execution log. per_query_scores +
+# judge_models are JSON. Ports migration.ts:1690-1701.
+_SQL_TABLE_LCM_EVAL_RUN = """
+    CREATE TABLE IF NOT EXISTS lcm_eval_run (
+      run_id TEXT NOT NULL PRIMARY KEY,
+      query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+      prompt_bundle_version INTEGER NOT NULL,
+      ran_at TEXT NOT NULL DEFAULT (datetime('now')),
+      retrieval_recall_score REAL NOT NULL,
+      synthesis_quality_score REAL NOT NULL,
+      per_query_scores TEXT NOT NULL,
+      judge_models TEXT NOT NULL,
+      noise_floor_sd REAL,
+      trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'prompt-update', 'model-update', 'ci', 'nightly'))
+    )
+"""
+
+# v4.1 §11 — lcm_eval_drift: cumulative regression delta.
+# Ports migration.ts:1711-1717.
+_SQL_TABLE_LCM_EVAL_DRIFT = """
+    CREATE TABLE IF NOT EXISTS lcm_eval_drift (
+      drift_id TEXT NOT NULL PRIMARY KEY,
+      query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+      cumulative_delta REAL NOT NULL,
+      window_runs INTEGER NOT NULL,
+      computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+"""
+
+# v4.1 §7 — lcm_entity_type_registry: type_name registry; freeform types
+# (no CHECK enum per v4.1.1 §C). Ports migration.ts:1739-1743.
+_SQL_TABLE_LCM_ENTITY_TYPE_REGISTRY = """
+    CREATE TABLE IF NOT EXISTS lcm_entity_type_registry (
+      type_name TEXT NOT NULL PRIMARY KEY,
+      first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      occurrence_count INTEGER NOT NULL DEFAULT 1
+    )
+"""
+
+# v4.1 §7 + v4.1.1 B4 — lcm_entities: simplified entity schema (no separate
+# alias table; alternate surface forms denormalized into alternate_surfaces
+# JSON). Ports migration.ts:1750-1762.
+_SQL_TABLE_LCM_ENTITIES = """
+    CREATE TABLE IF NOT EXISTS lcm_entities (
+      entity_id TEXT NOT NULL PRIMARY KEY,
+      session_key TEXT NOT NULL,
+      canonical_text TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      first_seen_in_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+      occurrence_count INTEGER NOT NULL DEFAULT 1,
+      alternate_surfaces TEXT,
+      metadata TEXT
+    )
+"""
+
+# v4.1 §7 — lcm_entity_mentions: entity occurrences within summaries.
+# Ports migration.ts:1775-1784.
+_SQL_TABLE_LCM_ENTITY_MENTIONS = """
+    CREATE TABLE IF NOT EXISTS lcm_entity_mentions (
+      mention_id TEXT NOT NULL PRIMARY KEY,
+      entity_id TEXT NOT NULL REFERENCES lcm_entities(entity_id) ON DELETE CASCADE,
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      surface_form TEXT NOT NULL,
+      span_start INTEGER,
+      span_end INTEGER,
+      mentioned_at TEXT NOT NULL
+    )
+"""
+
+# v4.1 §1 + v4.1.1 A5/A7 — lcm_embedding_profile: registry of embedding
+# models (active/archive). Seed rows added by Group B (embeddings/store).
+# Ports migration.ts:1823-1830.
+_SQL_TABLE_LCM_EMBEDDING_PROFILE = """
+    CREATE TABLE IF NOT EXISTS lcm_embedding_profile (
+      model_name TEXT NOT NULL PRIMARY KEY,
+      dim INTEGER NOT NULL,
+      registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+      active INTEGER NOT NULL DEFAULT 1,
+      archive_after TEXT
+    )
+"""
+
+# v4.1 §1 + v4.1.1 A5/A7 — lcm_embedding_meta: sidecar for non-vector
+# queries. Composite PK supports parallel rows during model-bump cutover.
+# NO FK on embedded_id (polymorphic — can also reference lcm_entities or
+# lcm_themes). Polymorphic cleanup via trigger
+# `lcm_embedding_meta_cleanup_summary` (see _ensure_core_triggers).
+# Ports migration.ts:1842-1850.
+_SQL_TABLE_LCM_EMBEDDING_META = """
+    CREATE TABLE IF NOT EXISTS lcm_embedding_meta (
+      embedded_id TEXT NOT NULL,
+      embedded_kind TEXT NOT NULL CHECK (embedded_kind IN ('summary', 'entity', 'theme')),
+      embedding_model TEXT NOT NULL REFERENCES lcm_embedding_profile(model_name) ON DELETE RESTRICT,
+      embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
+      source_token_count INTEGER NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (embedded_id, embedded_kind, embedding_model)
+    )
+"""
+
+# Tuple of (constant_name, sql) pairs in dependency-aware creation order.
+# Iteration order matters: lcm_prompt_registry must precede lcm_synthesis_cache
+# (FK on prompt_id); lcm_synthesis_cache must precede lcm_synthesis_audit and
+# lcm_cache_leaf_refs (FKs); lcm_eval_query_set must precede the other 3 eval
+# tables; lcm_entities must precede lcm_entity_mentions; lcm_embedding_profile
+# must precede lcm_embedding_meta.
+_V41_TABLE_CREATIONS: tuple[tuple[str, str], ...] = (
+    # Support layer (storage.md §2.3)
+    ("lcm_worker_lock", _SQL_TABLE_LCM_WORKER_LOCK),
+    ("lcm_feature_flags", _SQL_TABLE_LCM_FEATURE_FLAGS),
+    ("lcm_extraction_queue", _SQL_TABLE_LCM_EXTRACTION_QUEUE),
+    ("lcm_session_key_audit", _SQL_TABLE_LCM_SESSION_KEY_AUDIT),
+    # Synthesis layer (storage.md §2.4) — order is load-bearing for FKs.
+    ("lcm_prompt_registry", _SQL_TABLE_LCM_PROMPT_REGISTRY),
+    ("lcm_synthesis_cache", _SQL_TABLE_LCM_SYNTHESIS_CACHE),
+    ("lcm_cache_leaf_refs", _SQL_TABLE_LCM_CACHE_LEAF_REFS),
+    ("lcm_synthesis_audit", _SQL_TABLE_LCM_SYNTHESIS_AUDIT),
+    # Eval layer (storage.md §2.5) — query_set must precede the others.
+    ("lcm_eval_query_set", _SQL_TABLE_LCM_EVAL_QUERY_SET),
+    ("lcm_eval_query", _SQL_TABLE_LCM_EVAL_QUERY),
+    ("lcm_eval_run", _SQL_TABLE_LCM_EVAL_RUN),
+    ("lcm_eval_drift", _SQL_TABLE_LCM_EVAL_DRIFT),
+    # Entity layer (storage.md §2.6) — entities precedes mentions.
+    ("lcm_entity_type_registry", _SQL_TABLE_LCM_ENTITY_TYPE_REGISTRY),
+    ("lcm_entities", _SQL_TABLE_LCM_ENTITIES),
+    ("lcm_entity_mentions", _SQL_TABLE_LCM_ENTITY_MENTIONS),
+    # Embedding registry (storage.md §2.7) — profile precedes meta.
+    ("lcm_embedding_profile", _SQL_TABLE_LCM_EMBEDDING_PROFILE),
+    ("lcm_embedding_meta", _SQL_TABLE_LCM_EMBEDDING_META),
+)
+
+
+# ---------------------------------------------------------------------------
+# SQL constants — v4.1 indexes
+# ---------------------------------------------------------------------------
+#
+# 24 v4.1 indexes covering:
+# * Support layer: 3 indexes (extraction_queue pending/dead_letter,
+#   session_key_audit conv).
+# * Synthesis layer: 9 indexes (prompt_registry active + null-safe UNIQUE,
+#   synthesis_cache built + UNIQUE lookup + status_building,
+#   synthesis_audit target_summary + target_cache + session + started_gc +
+#   completed_gc, cache_leaf_refs by_leaf).
+# * Eval layer: 4 indexes (query stratum + must_not_regress,
+#   run recent, drift recent).
+# * Entity layer: 4 indexes (entities lookup + canonical UNIQUE,
+#   mentions by_entity + by_summary).
+# * Embedding registry: 2 indexes (meta active, meta by_kind).
+#
+# Iteration order matches TS migration.ts so schema-diff stays stable.
+
+
+_V41_INDEX_CREATIONS: tuple[str, ...] = (
+    # Support layer
+    """CREATE INDEX IF NOT EXISTS lcm_extraction_queue_pending_idx
+      ON lcm_extraction_queue (queued_at)
+      WHERE picked_at IS NULL""",
+    """CREATE INDEX IF NOT EXISTS lcm_extraction_queue_dead_letter_idx
+      ON lcm_extraction_queue (attempts)
+      WHERE attempts >= 5""",
+    """CREATE INDEX IF NOT EXISTS lcm_session_key_audit_conv_idx
+      ON lcm_session_key_audit (conversation_id, applied_at DESC)""",
+    # Synthesis layer — prompt registry
+    """CREATE INDEX IF NOT EXISTS lcm_prompt_registry_active_idx
+      ON lcm_prompt_registry (memory_type, tier_label, pass_kind)
+      WHERE active = 1""",
+    # Null-safe COALESCE UNIQUE index for prompt lookup. Per migration.ts:1418
+    # — SQLite's plain UNIQUE treats multiple NULLs as distinct; this index
+    # closes the NULL-tier_label collision gap.
+    """CREATE UNIQUE INDEX IF NOT EXISTS lcm_prompt_registry_uniq_lookup
+      ON lcm_prompt_registry (
+        memory_type, COALESCE(tier_label, ''), pass_kind, version
+      )""",
+    # Synthesis cache — 3 indexes, UNIQUE includes prompt_id + tier_label.
+    # LCM Wave-10 (2026-03-22): include tier_label and prompt_id in the UNIQUE
+    # index so distinct (tier, prompt) combinations get distinct cache rows.
+    # Without this, INSERT OR IGNORE silently returned wrong-tier cached text;
+    # and the cache continued serving text from the OLD prompt after
+    # registerPrompt() bumped the active prompt.
+    # Original: lossless-claw/src/db/migration.ts:1535.
+    """CREATE UNIQUE INDEX IF NOT EXISTS lcm_synthesis_cache_lookup_uniq
+      ON lcm_synthesis_cache (session_key, range_start, range_end,
+                              leaf_fingerprint,
+                              COALESCE(grep_filter, ''),
+                              tier_label,
+                              prompt_id)""",
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_cache_built_idx
+      ON lcm_synthesis_cache (session_key, built_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_cache_status_building_idx
+      ON lcm_synthesis_cache (building_started_at)
+      WHERE status = 'building'""",
+    # Cache leaf refs — single non-PK index.
+    """CREATE INDEX IF NOT EXISTS lcm_cache_leaf_refs_by_leaf_idx
+      ON lcm_cache_leaf_refs (leaf_summary_id)""",
+    # Synthesis audit — 5 indexes (target_summary, target_cache, session,
+    # started_gc, completed_gc). The two _gc indexes are partial for cheap
+    # inline GC sweeps on every dispatchSynthesis call.
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_target_summary_idx
+      ON lcm_synthesis_audit (target_summary_id, ran_at DESC)
+      WHERE target_summary_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_target_cache_idx
+      ON lcm_synthesis_audit (target_cache_id, ran_at DESC)
+      WHERE target_cache_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_session_idx
+      ON lcm_synthesis_audit (pass_session_id)""",
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_started_gc_idx
+      ON lcm_synthesis_audit (ran_at)
+      WHERE status = 'started'""",
+    # LCM Wave-3 (2026-01-09): add a parallel index for the 30-day GC sweep
+    # on `completed`/`failed` rows. Without this, the inline-per-call GC
+    # runs a full table scan on every lcm_synthesize_around call.
+    # Original: lossless-claw/src/db/migration.ts:1634.
+    """CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_completed_gc_idx
+      ON lcm_synthesis_audit (ran_at)
+      WHERE status IN ('completed', 'failed')""",
+    # Eval layer
+    """CREATE INDEX IF NOT EXISTS lcm_eval_query_set_stratum_idx
+      ON lcm_eval_query (query_set_id, stratum)""",
+    """CREATE INDEX IF NOT EXISTS lcm_eval_query_must_not_regress_idx
+      ON lcm_eval_query (query_set_id)
+      WHERE must_not_regress = 1""",
+    """CREATE INDEX IF NOT EXISTS lcm_eval_run_recent_idx
+      ON lcm_eval_run (query_set_id, ran_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS lcm_eval_drift_recent_idx
+      ON lcm_eval_drift (query_set_id, computed_at DESC)""",
+    # Entity layer
+    """CREATE INDEX IF NOT EXISTS lcm_entities_lookup_idx
+      ON lcm_entities (session_key, entity_type, last_seen_at DESC)""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS lcm_entities_canonical_uniq
+      ON lcm_entities (session_key, canonical_text COLLATE NOCASE)""",
+    """CREATE INDEX IF NOT EXISTS lcm_entity_mentions_by_entity_idx
+      ON lcm_entity_mentions (entity_id, mentioned_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS lcm_entity_mentions_by_summary_idx
+      ON lcm_entity_mentions (summary_id)""",
+    # Embedding registry
+    """CREATE INDEX IF NOT EXISTS lcm_embedding_meta_active_idx
+      ON lcm_embedding_meta (embedding_model, embedded_at DESC)
+      WHERE archived = 0""",
+    """CREATE INDEX IF NOT EXISTS lcm_embedding_meta_by_kind_idx
+      ON lcm_embedding_meta (embedded_kind, embedded_id)""",
+)
+
+
+# ---------------------------------------------------------------------------
+# SQL constants — core triggers (only one: lcm_embedding_meta_cleanup_summary)
+# ---------------------------------------------------------------------------
+#
+# Polymorphic-orphan cleanup trigger. lcm_embedding_meta has no FK on
+# embedded_id (the column is polymorphic — can reference summaries,
+# entities, or themes). So FK CASCADE on summaries DELETE cannot reach
+# corresponding lcm_embedding_meta rows. This AFTER DELETE trigger fires
+# on every summaries delete and removes only the rows with
+# embedded_kind='summary' (so entity/theme rows are never touched).
+# Ports migration.ts:1877-1884.
+_SQL_TRIGGER_LCM_EMBEDDING_META_CLEANUP_SUMMARY = """
+    CREATE TRIGGER IF NOT EXISTS lcm_embedding_meta_cleanup_summary
+      AFTER DELETE ON summaries
+      BEGIN
+        DELETE FROM lcm_embedding_meta
+          WHERE embedded_id = OLD.summary_id
+            AND embedded_kind = 'summary';
+      END
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1250,76 +1749,167 @@ def _ensure_fts5_tables(db: sqlite3.Connection, *, fts5_available: bool) -> None
 
 
 def _ensure_v41_tables(db: sqlite3.Connection) -> None:
-    """Create the 13 v4.1 tables + their indexes + the polymorphic-cleanup
-    trigger.
+    """Create the 17 v4.1 tables + their 24 indexes.
 
-    **STUB**: body lands in #01-06. Currently a no-op.
+    Ports the v4.1 schema additions in ``migration.ts:1264-1861`` (the
+    six ``ensureXxx`` helpers + their inline index DDL):
 
-    Tables out of scope for this PR (will land in #01-06):
-
-    * ``lcm_worker_lock``, ``lcm_extraction_queue``,
-      ``lcm_session_key_audit``, ``lcm_prompt_registry``,
+    * **Support layer** (storage.md §2.3): ``lcm_worker_lock``,
+      ``lcm_feature_flags``, ``lcm_extraction_queue``,
+      ``lcm_session_key_audit``.
+    * **Synthesis layer** (storage.md §2.4): ``lcm_prompt_registry``,
       ``lcm_synthesis_cache``, ``lcm_cache_leaf_refs``,
       ``lcm_synthesis_audit``.
-    * 4 eval tables: ``lcm_eval_query_set``, ``lcm_eval_query``,
-      ``lcm_eval_run``, ``lcm_eval_drift``.
-    * 3 entity tables: ``lcm_entity_type_registry``, ``lcm_entities``,
-      ``lcm_entity_mentions``.
-    * 2 embedding registry tables: ``lcm_embedding_profile``,
+    * **Eval harness** (storage.md §2.5): ``lcm_eval_query_set``,
+      ``lcm_eval_query``, ``lcm_eval_run``, ``lcm_eval_drift``.
+    * **Entity layer** (storage.md §2.6): ``lcm_entity_type_registry``,
+      ``lcm_entities``, ``lcm_entity_mentions``.
+    * **Embedding registry** (storage.md §2.7): ``lcm_embedding_profile``,
       ``lcm_embedding_meta``.
-    * ``lcm_feature_flags``.
+
+    Idempotent via ``IF NOT EXISTS`` on every CREATE. Re-running on an
+    already-migrated DB is a no-op.
+
+    Tables created in dependency-aware order so FKs work on the first
+    run (e.g. ``lcm_prompt_registry`` precedes ``lcm_synthesis_cache``
+    which precedes ``lcm_synthesis_audit``; ``lcm_eval_query_set``
+    precedes the other eval tables; ``lcm_embedding_profile`` precedes
+    ``lcm_embedding_meta``).
+
+    **Out of scope** (storage.md §2.9 — first-principles removals):
+    ``lcm_purge_rebuild_queue``, ``lcm_voyage_rate_state``,
+    ``lcm_procedures``, ``lcm_intentions``, ``lcm_themes``,
+    ``lcm_theme_sources``. The TS comments at lines 1338-1351, 1796-1807,
+    1887-1900 document these removals.
+
+    **Cache-recreate path** (TS migration.ts:1454-1496): widens
+    ``lcm_synthesis_cache.tier_label`` CHECK from the old narrow
+    ``('year','custom','filtered')`` form to the v4.1 full set
+    ``('year','yearly','monthly','weekly','daily','custom','filtered')``.
+    Only fires on DBs that have the old narrow form (detected by
+    absence of ``'monthly'`` in the existing CREATE SQL). When fired:
+    deletes orphaned ``lcm_synthesis_audit`` rows referencing
+    ``target_cache_id``, then DROPs and recreates the cache table.
+
+    Args:
+        db: Open :class:`sqlite3.Connection` inside the migration txn.
+
+    Raises:
+        sqlite3.DatabaseError: any DDL failure during the ladder. The
+            failure propagates up to ``run_lcm_migrations`` which rolls
+            back the entire BEGIN EXCLUSIVE transaction.
+    """
+    # Step 1: cache-recreate path. Drop old narrow-CHECK lcm_synthesis_cache
+    # if detected, after pruning orphaned audit rows. Safe because cache is
+    # rebuildable by design.
+    _widen_lcm_synthesis_cache_tier_check(db)
+
+    # Step 2: create all 17 tables in dependency-aware order.
+    for table_name, sql in _V41_TABLE_CREATIONS:
+        try:
+            db.execute(sql)
+        except sqlite3.DatabaseError as exc:
+            raise sqlite3.DatabaseError(
+                f"_ensure_v41_tables: failed to create table {table_name!r}: {exc}"
+            ) from exc
+
+    # Step 3: create all 24 v4.1 indexes. Order matches TS migration.ts.
+    # LCM Wave-10 (2026-03-22): the synthesis cache lookup UNIQUE index
+    # changed shape — drop any old version first so re-runs on legacy DBs
+    # rebuild with the new (tier_label, prompt_id) keys.
+    # Original: lossless-claw/src/db/migration.ts:1548.
+    db.execute("DROP INDEX IF EXISTS lcm_synthesis_cache_lookup_uniq")
+    for sql in _V41_INDEX_CREATIONS:
+        db.execute(sql)
+
+
+def _widen_lcm_synthesis_cache_tier_check(db: sqlite3.Connection) -> None:
+    """Drop ``lcm_synthesis_cache`` if it has the old narrow ``tier_label`` CHECK.
+
+    Ports ``migration.ts:1454-1496`` ``widenLcmSynthesisCacheTierCheck_v413``.
+
+    The original v4.1 CHECK only allowed ``('year', 'custom', 'filtered')``;
+    the dispatch tier vocabulary later expanded to
+    ``('daily', 'weekly', 'monthly', 'yearly', 'custom', 'filtered')``.
+    Latent BLOCKER: yearly synthesis would crash on cache write because
+    ``tier_label='yearly'`` was rejected by the old CHECK.
+
+    SQLite can't ALTER a CHECK constraint, so we DROP + recreate. SAFE
+    because ``lcm_synthesis_cache`` is REBUILDABLE by design (it's a
+    cache, not bedrock).
+
+    Idempotent: only fires if the existing CHECK is the old narrow form
+    (detected by absence of ``'monthly'`` in the stored CREATE SQL).
 
     Args:
         db: Open :class:`sqlite3.Connection` inside the migration txn.
     """
-    # TODO(epic-01 issue 01-06): body lands in #01-06 (v4.1 tables + indexes).
-    # When this lands, also add the lcm_embedding_meta_cleanup_summary
-    # trigger inside _ensure_core_triggers (it references lcm_embedding_meta
-    # which is created here).
-    _ = db
-    return
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='lcm_synthesis_cache'"
+    ).fetchone()
+    if row is None:
+        # Table doesn't exist yet — next step creates it with the new CHECK.
+        return
+    existing_sql: str = row[0] or ""
+    # Detect the OLD CHECK signature. The new CHECK contains 'monthly'
+    # (one of the new values); old does not. Skip-if-already-widened.
+    if "'monthly'" in existing_sql or '"monthly"' in existing_sql:
+        return
+    # Old CHECK detected → rebuildable, just DROP. Cache rows are derivable
+    # from primary sources (raw leaves + prompts).
+    #
+    # LCM Wave-1 (2025-11-08): if `foreign_keys = OFF` during migration
+    # (the common pattern for ratchet steps), `lcm_synthesis_audit` rows
+    # referencing the dropped cache_ids become DANGLING — they survive
+    # the DROP but their target_cache_id no longer exists. Clean them up
+    # BEFORE the DROP so we never leave orphans pointing to recreated
+    # cache_ids that might be re-used. Audit rows are themselves
+    # rebuildable (re-run the synthesis pass and the new audits land).
+    # Original: lossless-claw/src/db/migration.ts:1470.
+    #
+    # LCM Wave-2 (2025-12-04): narrow the catch to the expected error
+    # ("no such table"). Previously the bare catch swallowed any error
+    # (corrupted DB, schema mismatch, etc.) — too broad.
+    # Original: lossless-claw/src/db/migration.ts:1477.
+    try:
+        db.execute("DELETE FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL")
+    except sqlite3.OperationalError as exc:
+        # Audit table doesn't exist yet (first migration of an old DB);
+        # nothing to clean. Re-raise anything else (corrupted DB, etc.).
+        if "no such table" not in str(exc).lower() or "lcm_synthesis_audit" not in str(exc).lower():
+            raise
+    db.execute("DROP TABLE IF EXISTS lcm_synthesis_cache")
 
 
 def _ensure_core_triggers(db: sqlite3.Connection) -> None:
     """Create the core triggers.
 
-    **STUB**: body lands alongside #01-06.
+    Today's only core trigger is ``lcm_embedding_meta_cleanup_summary``
+    (storage.md §2.8) — an AFTER DELETE ON ``summaries`` trigger that
+    cleans polymorphic ``lcm_embedding_meta`` sidecar rows.
 
-    The only core trigger today is ``lcm_embedding_meta_cleanup_summary``
-    (storage.md §2.8) — an AFTER DELETE ON summaries trigger that cleans
-    polymorphic ``lcm_embedding_meta`` sidecar rows.
+    **Why the trigger is here (not next to summaries)**: The trigger
+    references ``lcm_embedding_meta``, which is created by
+    :func:`_ensure_v41_tables`. SQLite's ``CREATE TRIGGER`` accepts a
+    reference to a missing table at DDL parse time, but the trigger
+    fails at fire time. So this function MUST run AFTER
+    :func:`_ensure_v41_tables`; the order in :func:`run_lcm_migrations`
+    reflects that.
 
-    **Why the body is deferred**: The trigger references ``lcm_embedding_meta``,
-    which is created by :func:`_ensure_v41_tables` in #01-06. SQLite's
-    ``CREATE TRIGGER`` accepts a reference to a missing table at DDL parse
-    time, but the trigger fails at fire time. Creating the trigger now would
-    break every ``DELETE FROM summaries`` until #01-06 lands (cascading FK
-    deletes from ``conversations`` would also fail). Deferring keeps every
-    interim state usable.
+    **Why a trigger and not an FK CASCADE**: ``lcm_embedding_meta`` has
+    no FK on ``embedded_id`` (the column is polymorphic — can reference
+    summaries, entities, or themes). So FK CASCADE on a summaries DELETE
+    cannot reach the corresponding meta rows. The trigger filters
+    explicitly on ``embedded_kind='summary'`` so entity/theme rows are
+    never accidentally deleted.
 
-    When the trigger body is added (in #01-06), this function MUST run AFTER
-    :func:`_ensure_v41_tables` so the table exists first. The order in
-    :func:`run_lcm_migrations` already reflects that placement.
+    **Idempotency**: ``CREATE TRIGGER IF NOT EXISTS`` makes re-runs a
+    no-op.
 
     Args:
         db: Open :class:`sqlite3.Connection` inside the migration txn.
     """
-    # TODO(epic-01 issue 01-06): body lands in #01-06 (depends on
-    # lcm_embedding_meta from _ensure_v41_tables). The full DDL:
-    #
-    #   CREATE TRIGGER IF NOT EXISTS lcm_embedding_meta_cleanup_summary
-    #     AFTER DELETE ON summaries
-    #     BEGIN
-    #       DELETE FROM lcm_embedding_meta
-    #         WHERE embedded_id = OLD.summary_id
-    #           AND embedded_kind = 'summary';
-    #     END
-    #
-    # Note: SQLite accepts CREATE TRIGGER with a missing referenced table,
-    # but the trigger errors at fire time. Keep this stub a no-op until
-    # _ensure_v41_tables ships its body.
-    _ = db
-    return
+    db.execute(_SQL_TRIGGER_LCM_EMBEDDING_META_CLEANUP_SUMMARY)
 
 
 def _run_versioned_backfills(db: sqlite3.Connection, log: MigrationLogger | None) -> None:
@@ -1484,18 +2074,22 @@ def run_lcm_migrations(
             >>> conn.execute('PRAGMA foreign_keys = ON').fetchall()
             [(0,)]
             >>> run_lcm_migrations(conn)
+            >>> # 12 core tables + 17 v4.1 tables = 29 (excluding internal
+            >>> # `sqlite_sequence` and FTS5 shadow tables).
             >>> conn.execute(
-            ...     "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+            ...     "SELECT COUNT(*) FROM sqlite_master "
+            ...     "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ... ).fetchone()[0]
-            12
+            29
 
         Idempotency::
 
             >>> run_lcm_migrations(conn)  # second run is a no-op
             >>> conn.execute(
-            ...     "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+            ...     "SELECT COUNT(*) FROM sqlite_master "
+            ...     "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ... ).fetchone()[0]
-            12
+            29
     """
     # BEGIN EXCLUSIVE serializes concurrent migration runs (ADR-026 §OQ.2).
     # Note: BEGIN EXCLUSIVE in SQLite is "begin a write transaction holding
@@ -1608,8 +2202,49 @@ def list_core_index_names() -> tuple[str, ...]:
         A tuple of index names in the order :func:`_ensure_core_indexes`
         creates them.
     """
+    return _extract_index_names(_CORE_INDEX_CREATIONS)
+
+
+def list_v41_tables() -> tuple[str, ...]:
+    """Return the names of the 17 v4.1 tables in creation order.
+
+    Useful for tests that need to assert the exact v4.1 table set created
+    by :func:`_ensure_v41_tables`. See storage.md §2.3-§2.7 for the
+    logical groupings (support / synthesis / eval / entity / embedding).
+
+    Returns:
+        A tuple of table names in the order :func:`_ensure_v41_tables`
+        creates them.
+    """
+    return tuple(name for name, _sql in _V41_TABLE_CREATIONS)
+
+
+def list_v41_index_names() -> tuple[str, ...]:
+    """Return the names of the 24 v4.1 indexes in creation order.
+
+    Returns:
+        A tuple of index names in the order :func:`_ensure_v41_tables`
+        creates them.
+    """
+    return _extract_index_names(_V41_INDEX_CREATIONS)
+
+
+def _extract_index_names(creations: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse the leading tokens of each ``CREATE INDEX`` statement to extract names.
+
+    Shared helper for :func:`list_core_index_names` and
+    :func:`list_v41_index_names`. The canonical layout is::
+
+        CREATE [UNIQUE ]INDEX IF NOT EXISTS <name> ON ...
+
+    Args:
+        creations: Tuple of CREATE INDEX SQL strings.
+
+    Returns:
+        A tuple of index names in input order.
+    """
     names: list[str] = []
-    for sql in _CORE_INDEX_CREATIONS:
+    for sql in creations:
         # Parse the leading tokens to find the index name. Robust enough
         # for the controlled set of strings in this module — not a
         # general-purpose SQL parser.
@@ -1624,10 +2259,22 @@ def list_core_index_names() -> tuple[str, ...]:
 
 
 def _iter_core_object_names() -> Iterable[str]:
-    """Iterator over (tables ∪ indexes) names this PR creates.
+    """Iterator over (tables ∪ indexes) names from the core PR (01-04).
 
-    Used by tests for exact-set assertions. Doesn't include the trigger
-    (deferred to #01-06 per :func:`_ensure_core_triggers`).
+    Used by tests for exact-set assertions on the core schema. Does NOT
+    include v4.1 objects (use :func:`_iter_v41_object_names` for those)
+    nor triggers (handled separately).
     """
     yield from list_core_tables()
     yield from list_core_index_names()
+
+
+def _iter_v41_object_names() -> Iterable[str]:
+    """Iterator over (tables ∪ indexes) names from the v4.1 layer (01-06).
+
+    Used by tests for exact-set assertions on the v4.1 schema. Does NOT
+    include the trigger ``lcm_embedding_meta_cleanup_summary`` (handled
+    separately by :func:`_ensure_core_triggers`).
+    """
+    yield from list_v41_tables()
+    yield from list_v41_index_names()
