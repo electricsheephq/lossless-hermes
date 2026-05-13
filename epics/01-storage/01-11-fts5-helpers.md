@@ -5,6 +5,17 @@ title: '[epic-01] storage: port FTS5 + scope + parse-utc helpers → store/'
 labels: 'port, epic-01-storage'
 ---
 
+> **Status: SUBSUMED — closed without a dedicated PR.** The 5 helper modules
+> (`fts5_sanitize`, `full_text_sort`, `full_text_fallback`,
+> `parse_utc_timestamp`, `conversation_scope`) plus the `store/__init__.py`
+> barrel were ported as part of [PR #21][pr21] (`[01-08] conversation store`)
+> and [PR #22][pr22] (`[01-09] summary store`). Tests for all 5 helpers landed
+> in PR #21 (`tests/test_{conversation_scope,fts5_sanitize,full_text_fallback,
+> full_text_sort,parse_utc_timestamp}.py`). No additional PR needed.
+>
+> [pr21]: https://github.com/electricsheephq/lossless-hermes/pull/21
+> [pr22]: https://github.com/electricsheephq/lossless-hermes/pull/22
+
 ## Source (TypeScript)
 
 Five small pure-function modules:

@@ -60,9 +60,12 @@ without touching each other's regions:
 * :func:`_ensure_core_triggers` — body lives here (#01-06). Runs AFTER
   :func:`_ensure_v41_tables` because the only core trigger
   (``lcm_embedding_meta_cleanup_summary``) references ``lcm_embedding_meta``.
-* :func:`_run_versioned_backfills` — **stub**; body lands in #01-15
-  (``backfillSummaryDepths`` / ``backfillSummaryMetadata`` /
-  ``backfillToolCallColumns``, each gated by ``lcm_migration_state``).
+* :func:`_run_versioned_backfills` — body lives here (#01-15): the 3
+  ledger-gated backfills (``backfillSummaryDepths``,
+  ``backfillSummaryMetadata``, ``backfillToolCallColumns``, all at
+  ``algorithm_version=1``) plus four unversioned idempotent helpers
+  (identity-hash rehash, conversation/summary session-key backfills,
+  fork-side ``lcm_rollups`` no-op).
 * :func:`_seed_default_prompts` — **stub**; body lands alongside the
   synthesis epic (depends on ``lcm_prompt_registry`` from this PR).
 
@@ -119,10 +122,13 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from lossless_hermes.db.features import get_lcm_db_features
+from lossless_hermes.store.message_identity import build_message_identity_hash
+from lossless_hermes.store.parse_utc_timestamp import parse_utc_timestamp_or_null
 
 __all__ = [
     "MigrationLogger",
@@ -1271,9 +1277,9 @@ def _ensure_summary_v41_columns(db: sqlite3.Connection) -> None:
 def _ensure_message_identity_hash_column(db: sqlite3.Connection) -> None:
     """Add ``identity_hash`` column to ``messages`` if absent.
 
-    Ports ``migration.ts:324-330``. Used by the dedup ingest path; backfilled
-    by ``backfillMessageIdentityHashes`` (out of scope for this PR — lands
-    in #01-15 as part of versioned backfills).
+    Ports ``migration.ts:324-330``. Used by the dedup ingest path;
+    legacy rows are populated by :func:`_backfill_message_identity_hashes`
+    inside :func:`_run_versioned_backfills` (#01-15).
     """
     if not _has_column(db, "messages", "identity_hash"):
         db.execute("ALTER TABLE messages ADD COLUMN identity_hash TEXT")
@@ -1912,45 +1918,739 @@ def _ensure_core_triggers(db: sqlite3.Connection) -> None:
     db.execute(_SQL_TRIGGER_LCM_EMBEDDING_META_CLEANUP_SUMMARY)
 
 
+# ---------------------------------------------------------------------------
+# Versioned backfill ledger (ADR-026 §"Algorithm-versioned state")
+# ---------------------------------------------------------------------------
+#
+# Each step has a name + an algorithm_version. When the algorithm changes
+# (e.g. a bug in the depth computation needs a re-pass on already-migrated
+# DBs), bump the version and the ladder re-runs the step exactly once.
+#
+# Ports TS ``VERSIONED_BACKFILL_STEPS`` (``migration.ts:54-58``).
+
+VERSIONED_BACKFILL_STEPS: dict[str, int] = {
+    "backfillSummaryDepths": 1,
+    "backfillSummaryMetadata": 1,
+    "backfillToolCallColumns": 1,
+}
+
+
+def _has_completed_versioned_backfill(
+    db: sqlite3.Connection,
+    step_name: str,
+    algorithm_version: int,
+) -> bool:
+    """Return ``True`` if ``lcm_migration_state`` has a row for this step.
+
+    Ports ``hasCompletedVersionedBackfill`` (``migration.ts:404-418``).
+    Matches on ``step_name == ? AND algorithm_version == ?`` (exact-version
+    semantics — bumping the algorithm version causes a re-run rather than
+    "any prior run is good enough").
+    """
+    row = db.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ? AND algorithm_version = ? LIMIT 1",
+        (step_name, algorithm_version),
+    ).fetchone()
+    return row is not None
+
+
+def _mark_versioned_backfill_complete(
+    db: sqlite3.Connection,
+    step_name: str,
+    algorithm_version: int,
+) -> None:
+    """Upsert a ledger row recording completion of one backfill step.
+
+    Ports ``markVersionedBackfillComplete`` (``migration.ts:420-431``).
+    On conflict (re-marking the same step+version) the ``completed_at``
+    timestamp is refreshed so operators can see the most recent completion.
+    """
+    db.execute(
+        "INSERT INTO lcm_migration_state (step_name, algorithm_version, completed_at) "
+        "VALUES (?, ?, datetime('now')) "
+        "ON CONFLICT(step_name, algorithm_version) "
+        "DO UPDATE SET completed_at = excluded.completed_at",
+        (step_name, algorithm_version),
+    )
+
+
+def _describe_migration_error(error: BaseException) -> str:
+    """Render an exception for the log line. Ports ``migration.ts:377-379``."""
+    return str(error) if str(error) else type(error).__name__
+
+
+def _log_info(log: MigrationLogger | None, message: str) -> None:
+    """Conditionally invoke the optional :class:`MigrationLogger`."""
+    if log is not None:
+        log.info(message)
+
+
+def _run_versioned_backfill_step(
+    db: sqlite3.Connection,
+    step_name: str,
+    log: MigrationLogger | None,
+    step: Callable[[], None],
+) -> None:
+    """Skip-if-complete + savepoint-wrapped step runner.
+
+    Ports ``runVersionedBackfillStep`` (``migration.ts:441-474``). Looks up
+    the algorithm version from :data:`VERSIONED_BACKFILL_STEPS`, short-circuits
+    if a matching ledger row exists, and otherwise runs the step inside a
+    nested ``SAVEPOINT`` so a partial failure rolls back to the savepoint
+    without aborting the outer ``BEGIN EXCLUSIVE``.
+
+    Args:
+        db: Open :class:`sqlite3.Connection` inside the migration txn.
+        step_name: Key into :data:`VERSIONED_BACKFILL_STEPS`.
+        log: Optional :class:`MigrationLogger` for per-step progress.
+        step: Zero-arg callable performing the backfill UPDATEs.
+
+    Raises:
+        sqlite3.DatabaseError: Re-raised from ``step``. The savepoint is
+            rolled back before propagation so the outer txn stays consistent.
+    """
+    algorithm_version = VERSIONED_BACKFILL_STEPS[step_name]
+    if _has_completed_versioned_backfill(db, step_name, algorithm_version):
+        _log_info(
+            log,
+            f"[lcm] migration step skipped: step={step_name} "
+            f"algorithmVersion={algorithm_version} reason=already-complete",
+        )
+        return
+
+    started_at = time.monotonic()
+    savepoint_name = f"lcm_backfill_{step_name}"
+    db.execute(f"SAVEPOINT {savepoint_name}")
+    try:
+        step()
+        _mark_versioned_backfill_complete(db, step_name, algorithm_version)
+        db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        _log_info(
+            log,
+            f"[lcm] migration step complete: step={step_name} "
+            f"algorithmVersion={algorithm_version} durationMs={duration_ms}",
+        )
+    except BaseException as error:
+        # Best-effort rollback then release; matches TS ``rollbackSavepoint``
+        # (migration.ts:433-439). RELEASE after ROLLBACK TO discards the
+        # savepoint frame; without RELEASE the savepoint stays on the stack.
+        try:
+            db.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+        finally:
+            try:
+                db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            except sqlite3.Error:  # pragma: no cover - defensive
+                pass
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        _log_info(
+            log,
+            f"[lcm] migration step failed: step={step_name} "
+            f"algorithmVersion={algorithm_version} durationMs={duration_ms} "
+            f"error={_describe_migration_error(error)}",
+        )
+        raise
+
+
+def _run_unversioned_migration_step(
+    log: MigrationLogger | None,
+    step_name: str,
+    step: Callable[[], None],
+) -> None:
+    """Log-wrapped runner for steps without an algorithm-version ledger row.
+
+    Ports ``runMigrationStep`` (``migration.ts:381-398``). Used for the
+    identity-hash rehash + the session-key / fork-rollups backfills, which
+    are structurally idempotent (re-runs are no-ops on already-populated
+    rows) and don't carry an algorithm version.
+    """
+    started_at = time.monotonic()
+    try:
+        step()
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        _log_info(
+            log,
+            f"[lcm] migration step complete: step={step_name} durationMs={duration_ms}",
+        )
+    except BaseException as error:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        _log_info(
+            log,
+            f"[lcm] migration step failed: step={step_name} durationMs={duration_ms} "
+            f"error={_describe_migration_error(error)}",
+        )
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Backfill implementations (ports of migration.ts:332-811 + 1912-1981)
+# ---------------------------------------------------------------------------
+
+
+def _backfill_message_identity_hashes(db: sqlite3.Connection) -> None:
+    """Populate ``messages.identity_hash`` for any NULL/empty rows.
+
+    Ports ``backfillMessageIdentityHashes`` (``migration.ts:332-375``).
+    Chunk-streams 1,000 rows at a time keyed on ``message_id > ?`` so a
+    very large legacy DB doesn't pull the whole ``messages`` table into
+    memory. Each chunk's UPDATEs run inside the outer migration
+    ``BEGIN EXCLUSIVE`` (we pass ``managesOwnTransaction: false`` semantics
+    by omitting any nested BEGIN/COMMIT — the TS source's own-transaction
+    branch is for direct callers outside the migration ladder, which
+    Python doesn't expose).
+
+    Idempotent: rows that already have a non-empty ``identity_hash`` are
+    filtered out by the SELECT predicate, so a re-run finds zero rows.
+
+    Spike-003 §"Remaining 5% risk" row 3 confirms hash recomputation on
+    already-correct rows is a no-op (the recipe is deterministic and
+    byte-identical to Node + Go).
+    """
+    select_sql = (
+        "SELECT message_id, role, content FROM messages "
+        "WHERE message_id > ? "
+        "AND (identity_hash IS NULL OR identity_hash = '') "
+        "ORDER BY message_id LIMIT ?"
+    )
+    update_sql = "UPDATE messages SET identity_hash = ? WHERE message_id = ?"
+    last_processed_message_id = 0
+    chunk_size = 1_000
+
+    while True:
+        rows = db.execute(select_sql, (last_processed_message_id, chunk_size)).fetchall()
+        if not rows:
+            return
+        # Buffer the param tuples so a sqlite Row → tuple coercion happens
+        # once before the executemany.
+        updates = [
+            (
+                build_message_identity_hash(row[1], row[2]),
+                row[0],
+            )
+            for row in rows
+        ]
+        db.executemany(update_sql, updates)
+        last_processed_message_id = rows[-1][0]
+
+
+def _backfill_summary_depths(db: sqlite3.Connection) -> None:
+    """Compute ``summaries.depth`` from the ``summary_parents`` DAG.
+
+    Ports ``backfillSummaryDepths`` (``migration.ts:476-577``).
+
+    Algorithm (per conversation, since cross-conversation parent edges are
+    rare/malformed):
+
+    1. Set every leaf row to ``depth = 0`` (regardless of any prior value).
+    2. For each conversation that has condensed summaries, load all summaries
+       + their parent edges from ``summary_parents``.
+    3. Topologically walk: a condensed summary's depth is
+       ``max(parent_depths) + 1``. Orphan condensed (no parents) get
+       ``depth = 1``.
+    4. Cycle guard: if a sweep makes no progress, assign ``depth = 1`` to
+       all remaining unresolved rows and bail (matches TS — malformed DAGs
+       are treated as flat depth-1 rather than left NULL).
+
+    Idempotent: the algorithm is purely functional over current
+    ``summary_parents`` state; re-running computes the same depths.
+    """
+    # 1. Leaves always have depth 0.
+    db.execute("UPDATE summaries SET depth = 0 WHERE kind = 'leaf'")
+
+    conversation_rows = db.execute(
+        "SELECT DISTINCT conversation_id FROM summaries WHERE kind = 'condensed'"
+    ).fetchall()
+    if not conversation_rows:
+        return
+
+    update_depth_sql = "UPDATE summaries SET depth = ? WHERE summary_id = ?"
+
+    for (conversation_id,) in conversation_rows:
+        summaries = db.execute(
+            "SELECT summary_id, kind FROM summaries WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+
+        depth_by_summary_id: dict[str, int] = {}
+        unresolved_condensed: set[str] = set()
+        for summary_id, kind in summaries:
+            if kind == "leaf":
+                depth_by_summary_id[summary_id] = 0
+                continue
+            unresolved_condensed.add(summary_id)
+
+        # Edges only for this conversation's condensed summaries.
+        edges = db.execute(
+            "SELECT summary_id, parent_summary_id FROM summary_parents "
+            "WHERE summary_id IN ("
+            "  SELECT summary_id FROM summaries "
+            "  WHERE conversation_id = ? AND kind = 'condensed'"
+            ")",
+            (conversation_id,),
+        ).fetchall()
+        parents_by_summary_id: dict[str, list[str]] = {}
+        for child_id, parent_id in edges:
+            parents_by_summary_id.setdefault(child_id, []).append(parent_id)
+
+        # Topological pass: iterate until every summary is resolved (or a
+        # cycle is detected, in which case fall back to depth=1).
+        while unresolved_condensed:
+            progressed = False
+            for summary_id in list(unresolved_condensed):
+                parent_ids = parents_by_summary_id.get(summary_id, [])
+                if not parent_ids:
+                    # Orphan condensed (no parents) → depth 1.
+                    depth_by_summary_id[summary_id] = 1
+                    unresolved_condensed.discard(summary_id)
+                    progressed = True
+                    continue
+                max_parent_depth = -1
+                all_resolved = True
+                for parent_id in parent_ids:
+                    parent_depth = depth_by_summary_id.get(parent_id)
+                    if parent_depth is None:
+                        all_resolved = False
+                        break
+                    if parent_depth > max_parent_depth:
+                        max_parent_depth = parent_depth
+                if not all_resolved:
+                    continue
+                depth_by_summary_id[summary_id] = max_parent_depth + 1
+                unresolved_condensed.discard(summary_id)
+                progressed = True
+            if not progressed:
+                # Malformed cycle or cross-conv reference — flatten the rest
+                # to depth 1 and break (matches TS migration.ts:561-566).
+                for summary_id in unresolved_condensed:
+                    depth_by_summary_id[summary_id] = 1
+                unresolved_condensed.clear()
+
+        # Write back depth for every summary in this conversation.
+        updates = [
+            (depth_by_summary_id[summary_id], summary_id)
+            for summary_id, _kind in summaries
+            if summary_id in depth_by_summary_id
+        ]
+        if updates:
+            db.executemany(update_depth_sql, updates)
+
+
+def _backfill_summary_metadata(db: sqlite3.Connection) -> None:
+    """Compute summary aggregate metadata from the descendant-leaf chain.
+
+    Ports ``backfillSummaryMetadata`` (``migration.ts:579-749``).
+
+    For every summary, computes:
+
+    * ``earliest_at`` / ``latest_at`` — min/max of the descendant leaves'
+      ``messages.created_at`` (for leaves: direct from
+      ``summary_messages`` JOIN ``messages``; for condensed: aggregated
+      from parents' already-computed metadata).
+    * ``descendant_count`` — total summaries below this one in the DAG.
+    * ``descendant_token_count`` — Σ(token_count) over all descendants.
+    * ``source_message_token_count`` — for leaves: Σ(messages.token_count);
+      for condensed: rolled up from parents.
+
+    Iterates conversations and walks in ``ORDER BY depth ASC, created_at ASC``
+    so by the time a condensed summary is processed its parents'
+    metadata is already in the working map.
+
+    Idempotent: aggregates are recomputed each run; the same input data
+    produces the same numbers.
+    """
+    conversation_rows = db.execute("SELECT DISTINCT conversation_id FROM summaries").fetchall()
+    if not conversation_rows:
+        return
+
+    update_metadata_sql = (
+        "UPDATE summaries "
+        "SET earliest_at = ?, latest_at = ?, descendant_count = ?, "
+        "    descendant_token_count = ?, source_message_token_count = ? "
+        "WHERE summary_id = ?"
+    )
+
+    for (conversation_id,) in conversation_rows:
+        summaries = db.execute(
+            "SELECT summary_id, kind, token_count, created_at FROM summaries "
+            "WHERE conversation_id = ? "
+            "ORDER BY depth ASC, created_at ASC",
+            (conversation_id,),
+        ).fetchall()
+        if not summaries:
+            continue
+
+        leaf_ranges = db.execute(
+            "SELECT sm.summary_id, "
+            "       MIN(m.created_at) AS earliest_at, "
+            "       MAX(m.created_at) AS latest_at, "
+            "       COALESCE(SUM(m.token_count), 0) AS source_message_token_count "
+            "FROM summary_messages sm "
+            "JOIN messages m ON m.message_id = sm.message_id "
+            "JOIN summaries s ON s.summary_id = sm.summary_id "
+            "WHERE s.conversation_id = ? AND s.kind = 'leaf' "
+            "GROUP BY sm.summary_id",
+            (conversation_id,),
+        ).fetchall()
+        leaf_range_by_summary_id: dict[str, tuple[str | None, str | None, int]] = {
+            row[0]: (row[1], row[2], int(row[3] or 0)) for row in leaf_ranges
+        }
+
+        edges = db.execute(
+            "SELECT summary_id, parent_summary_id FROM summary_parents "
+            "WHERE summary_id IN ("
+            "  SELECT summary_id FROM summaries WHERE conversation_id = ?"
+            ")",
+            (conversation_id,),
+        ).fetchall()
+        parents_by_summary_id: dict[str, list[str]] = {}
+        for child_id, parent_id in edges:
+            parents_by_summary_id.setdefault(child_id, []).append(parent_id)
+
+        token_count_by_summary_id = {row[0]: max(0, int(row[2] or 0)) for row in summaries}
+
+        metadata_by_summary_id: dict[
+            str,
+            tuple[str | None, str | None, int, int, int],
+        ] = {}
+
+        for summary_id, kind, _token_count, created_at in summaries:
+            fallback_iso = _format_iso_or_none(created_at)
+            if kind == "leaf":
+                range_row = leaf_range_by_summary_id.get(summary_id)
+                earliest_iso = (
+                    _format_iso_or_none(range_row[0] if range_row else None) or fallback_iso
+                )
+                latest_iso = (
+                    _format_iso_or_none(range_row[1] if range_row else None) or fallback_iso
+                )
+                source_tokens = max(0, range_row[2]) if range_row else 0
+                metadata_by_summary_id[summary_id] = (
+                    earliest_iso,
+                    latest_iso,
+                    0,
+                    0,
+                    source_tokens,
+                )
+                continue
+
+            parent_ids = parents_by_summary_id.get(summary_id, [])
+            if not parent_ids:
+                metadata_by_summary_id[summary_id] = (
+                    fallback_iso,
+                    fallback_iso,
+                    0,
+                    0,
+                    0,
+                )
+                continue
+
+            earliest_iso: str | None = None
+            latest_iso: str | None = None
+            descendant_count = 0
+            descendant_token_count = 0
+            source_message_token_count = 0
+            for parent_id in parent_ids:
+                parent_meta = metadata_by_summary_id.get(parent_id)
+                if parent_meta is None:
+                    continue
+                p_earliest, p_latest, p_dcount, p_dtokens, p_source_tokens = parent_meta
+                if p_earliest and (earliest_iso is None or p_earliest < earliest_iso):
+                    earliest_iso = p_earliest
+                if p_latest and (latest_iso is None or p_latest > latest_iso):
+                    latest_iso = p_latest
+                descendant_count += max(0, p_dcount) + 1
+                parent_tokens = token_count_by_summary_id.get(parent_id, 0)
+                descendant_token_count += max(0, parent_tokens) + max(0, p_dtokens)
+                source_message_token_count += max(0, p_source_tokens)
+
+            metadata_by_summary_id[summary_id] = (
+                earliest_iso or fallback_iso,
+                latest_iso or fallback_iso,
+                max(0, descendant_count),
+                max(0, descendant_token_count),
+                max(0, source_message_token_count),
+            )
+
+        updates: list[tuple[str | None, str | None, int, int, int, str]] = []
+        for summary_id, _kind, _token_count, _created_at in summaries:
+            meta = metadata_by_summary_id.get(summary_id)
+            if meta is None:
+                continue
+            earliest_iso, latest_iso, dcount, dtokens, source_tokens = meta
+            updates.append((earliest_iso, latest_iso, dcount, dtokens, source_tokens, summary_id))
+        if updates:
+            db.executemany(update_metadata_sql, updates)
+
+
+def _format_iso_or_none(value: str | None) -> str | None:
+    """Re-emit a SQLite timestamp as a canonical ISO-8601 UTC string.
+
+    Mirrors TS ``isoStringOrNull(parseTimestamp(value))`` (migration.ts:97-103):
+    parses with :func:`parse_utc_timestamp_or_null` (which handles both
+    SQLite's ``datetime('now')`` shape and ISO-8601 with ``Z``) and reformats
+    as ``YYYY-MM-DDTHH:MM:SS[.ffffff]+00:00``. Returns ``None`` on a
+    ``None`` or unparseable input.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = parse_utc_timestamp_or_null(value)
+    except ValueError:
+        return None
+    if parsed is None:
+        return None
+    return parsed.isoformat()
+
+
+def _backfill_tool_call_columns(db: sqlite3.Connection) -> None:
+    """Extract tool_call_id / tool_name / tool_input from ``metadata`` JSON.
+
+    Ports ``backfillToolCallColumns`` (``migration.ts:757-811``). Covers
+    legacy text-type ``message_parts`` rows where the string-content
+    ingestion path stored tool info only in the metadata JSON (per LCM
+    issue #158).
+
+    Key precedence (matches TS ``COALESCE`` chains exactly):
+
+    * ``tool_call_id`` ← ``$.toolCallId`` → ``$.raw.id`` → ``$.raw.call_id``
+      → ``$.raw.toolCallId`` → ``$.raw.tool_call_id``.
+    * ``tool_name`` ← ``$.toolName`` → ``$.raw.name`` → ``$.raw.toolName``
+      → ``$.raw.tool_name``.
+    * ``tool_input`` ← ``$.raw.input`` → ``$.raw.arguments`` → ``$.raw.toolInput``.
+
+    Each UPDATE filters on the destination column being NULL AND
+    ``metadata IS NOT NULL`` AND the COALESCE chain producing a non-NULL
+    value — so re-runs find zero rows once the columns are populated.
+    """
+    db.execute(
+        """
+        UPDATE message_parts
+        SET tool_call_id = COALESCE(
+          json_extract(metadata, '$.toolCallId'),
+          json_extract(metadata, '$.raw.id'),
+          json_extract(metadata, '$.raw.call_id'),
+          json_extract(metadata, '$.raw.toolCallId'),
+          json_extract(metadata, '$.raw.tool_call_id')
+        )
+        WHERE tool_call_id IS NULL
+          AND metadata IS NOT NULL
+          AND COALESCE(
+            json_extract(metadata, '$.toolCallId'),
+            json_extract(metadata, '$.raw.id'),
+            json_extract(metadata, '$.raw.call_id'),
+            json_extract(metadata, '$.raw.toolCallId'),
+            json_extract(metadata, '$.raw.tool_call_id')
+          ) IS NOT NULL
+        """
+    )
+    db.execute(
+        """
+        UPDATE message_parts
+        SET tool_name = COALESCE(
+          json_extract(metadata, '$.toolName'),
+          json_extract(metadata, '$.raw.name'),
+          json_extract(metadata, '$.raw.toolName'),
+          json_extract(metadata, '$.raw.tool_name')
+        )
+        WHERE tool_name IS NULL
+          AND metadata IS NOT NULL
+          AND COALESCE(
+            json_extract(metadata, '$.toolName'),
+            json_extract(metadata, '$.raw.name'),
+            json_extract(metadata, '$.raw.toolName'),
+            json_extract(metadata, '$.raw.tool_name')
+          ) IS NOT NULL
+        """
+    )
+    db.execute(
+        """
+        UPDATE message_parts
+        SET tool_input = COALESCE(
+          json_extract(metadata, '$.raw.input'),
+          json_extract(metadata, '$.raw.arguments'),
+          json_extract(metadata, '$.raw.toolInput')
+        )
+        WHERE tool_input IS NULL
+          AND metadata IS NOT NULL
+          AND COALESCE(
+            json_extract(metadata, '$.raw.input'),
+            json_extract(metadata, '$.raw.arguments'),
+            json_extract(metadata, '$.raw.toolInput')
+          ) IS NOT NULL
+        """
+    )
+
+
+def _backfill_conversation_session_keys(db: sqlite3.Connection) -> None:
+    """NULL ``conversations.session_key`` → ``legacy:conv_<id>`` + audit row.
+
+    Ports ``backfillConversationSessionKeys`` (``migration.ts:1912-1935``).
+    Inserts an ``lcm_session_key_audit`` row BEFORE re-keying so the audit
+    exists even if the UPDATE later fails. Uses ``INSERT OR IGNORE`` on a
+    deterministic ``audit-backfill-conv-<id>`` audit_id so re-runs don't
+    duplicate audit rows.
+
+    Idempotent: rows with non-NULL ``session_key`` are filtered out of both
+    the INSERT (WHERE session_key IS NULL) and UPDATE (same).
+    """
+    db.execute(
+        """
+        INSERT OR IGNORE INTO lcm_session_key_audit
+          (audit_id, conversation_id, original_session_key, new_session_key, reason, applied_by)
+        SELECT
+          'audit-backfill-conv-' || conversation_id,
+          conversation_id,
+          NULL,
+          'legacy:conv_' || conversation_id,
+          'v4.1 A.09: NULL session_key backfilled with legacy: prefix to enable cross-conv lookups',
+          'migration'
+        FROM conversations
+        WHERE session_key IS NULL
+        """
+    )
+    db.execute(
+        """
+        UPDATE conversations
+        SET session_key = 'legacy:conv_' || conversation_id
+        WHERE session_key IS NULL
+        """
+    )
+
+
+def _backfill_summary_session_keys(db: sqlite3.Connection) -> None:
+    """Fill ``summaries.session_key=''`` from the parent conversation.
+
+    Ports ``backfillSummarySessionKeys`` (``migration.ts:1937-1950``). Targets
+    rows that were created with the A.02 default empty-string value. After
+    :func:`_backfill_conversation_session_keys` runs, every conversation has
+    a non-NULL session_key, so this JOIN populates all dependent summaries.
+
+    Idempotent: the WHERE clause filters out non-empty session_keys.
+    """
+    db.execute(
+        """
+        UPDATE summaries
+        SET session_key = (
+          SELECT c.session_key FROM conversations c
+          WHERE c.conversation_id = summaries.conversation_id
+        )
+        WHERE session_key = ''
+        """
+    )
+
+
+def _backfill_fork_rollups_session_keys(db: sqlite3.Connection) -> None:
+    """Fork-side ``lcm_rollups.session_key`` backfill (guarded by table probe).
+
+    Ports ``backfillForkRollupsSessionKeys`` (``migration.ts:1957-1981``).
+
+    The ``lcm_rollups`` table is Eva's fork-side legacy artifact — never
+    present on upstream lossless-claw or lossless-hermes installs. This
+    helper exists so that if a user imports a fork-side DB into a
+    lossless-hermes install, the session_key column gets populated. On
+    fresh upstream installs this is a no-op (the ``sqlite_master`` probe
+    short-circuits before any UPDATE).
+
+    Idempotent by structure: even if ``lcm_rollups`` exists, the UPDATE
+    filters on ``session_key = '' OR IS NULL``.
+    """
+    has_rollups_table = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = 'lcm_rollups'"
+    ).fetchone()
+    if has_rollups_table is None:
+        return
+
+    rollup_cols = db.execute("PRAGMA table_info(lcm_rollups)").fetchall()
+    has_session_key_col = any(col[1] == "session_key" for col in rollup_cols)
+    if not has_session_key_col:
+        return
+
+    db.execute(
+        """
+        UPDATE lcm_rollups
+        SET session_key = COALESCE(
+          (SELECT c.session_key FROM conversations c
+           WHERE c.conversation_id = lcm_rollups.conversation_id),
+          ''
+        )
+        WHERE session_key = '' OR session_key IS NULL
+        """
+    )
+
+
 def _run_versioned_backfills(db: sqlite3.Connection, log: MigrationLogger | None) -> None:
-    """Run algorithm-versioned data backfills.
+    """Run all data backfills — versioned + identity-hash + session-key.
 
-    **STUB**: body lands in #01-15. Currently a no-op.
+    Per ADR-026 §"Algorithm-versioned state". Sequence (matches TS order):
 
-    Per ADR-026 §"Algorithm-versioned state", each step's completion is
-    recorded in ``lcm_migration_state`` (created by :func:`_ensure_core_tables`
-    in this PR). Re-runs are skipped via the
-    ``hasCompletedVersionedBackfill`` check.
+    1. **``backfillMessageIdentityHashes``** (unversioned) —
+       chunked-batch SHA-256 population of ``messages.identity_hash`` for
+       legacy NULL/empty rows (TS ``migration.ts:1156-1158``). Idempotent
+       by structure: SELECT filters out already-populated rows.
+    2. **``backfillSummaryDepths``** (algorithm_version=1) — TS
+       ``migration.ts:1167``. Ledger-gated.
+    3. **``backfillSummaryMetadata``** (algorithm_version=1) — TS
+       ``migration.ts:1175-1177``. Ledger-gated.
+    4. **``backfillToolCallColumns``** (algorithm_version=1) — TS
+       ``migration.ts:1178-1180``. Ledger-gated.
+    5. **``backfillConversationSessionKeys``** (unversioned) — TS
+       ``migration.ts:1912-1935``. Inserts audit row BEFORE re-keying so
+       the audit exists even on a partial failure.
+    6. **``backfillSummarySessionKeys``** (unversioned) — TS
+       ``migration.ts:1937-1950``. Depends on step 5 having run first
+       (so every conversation has a non-NULL session_key).
+    7. **``backfillForkRollupsSessionKeys``** (unversioned) — TS
+       ``migration.ts:1957-1981``. No-op on upstream installs (the
+       ``lcm_rollups`` table doesn't exist).
 
-    Steps that will land in #01-15:
+    Each step's completion is recorded in ``lcm_migration_state`` for the
+    three algorithm-versioned ones; the unversioned steps are idempotent
+    by their SQL predicates (they re-run cheaply on every migration but
+    find zero rows to update once the columns are populated).
 
-    * ``backfillSummaryDepths`` — compute depth from summary_parents edges
-      (``migration.ts:476-577``).
-    * ``backfillSummaryMetadata`` — earliest_at / latest_at /
-      descendant_count / descendant_token_count / source_message_token_count
-      (``migration.ts:579-749``).
-    * ``backfillToolCallColumns`` — extract tool_call_id / tool_name /
-      tool_input from metadata JSON (``migration.ts:757-811``).
-
-    Also lands in #01-15:
-
-    * ``backfillMessageIdentityHashes`` — chunked-batch SHA-256 population
-      (``migration.ts:332-375``). NOT versioned (no algorithm version), runs
-      every time but is no-op when all rows already have a hash.
-    * ``backfillConversationSessionKeys`` — NULL → ``legacy:conv_<id>``
-      with audit row (``migration.ts:1912-1935``).
-    * ``backfillSummarySessionKeys`` — fill from conversations
-      (``migration.ts:1937-1950``).
-    * ``backfillForkRollupsSessionKeys`` — fork-side legacy table no-op
-      (``migration.ts:1957-1981``).
+    Per ADR-026 §"Open questions" #2, this runs inside the outer
+    ``BEGIN EXCLUSIVE`` started by :func:`run_lcm_migrations` — two
+    concurrent migration calls serialize through SQLite's write lock and
+    the second sees an already-populated ledger, making its body a no-op.
 
     Args:
         db: Open :class:`sqlite3.Connection` inside the migration txn.
         log: Optional :class:`MigrationLogger` for per-step progress.
     """
-    # TODO(epic-01 issue 01-15): body lands in #01-15 (versioned backfills).
-    _ = (db, log)
-    return
+    # 1. Identity-hash rehash (unversioned; chunked-batch).
+    _run_unversioned_migration_step(
+        log,
+        "backfillMessageIdentityHashes",
+        lambda: _backfill_message_identity_hashes(db),
+    )
+
+    # 2-4. Versioned backfills (ledger-gated).
+    _run_versioned_backfill_step(
+        db, "backfillSummaryDepths", log, lambda: _backfill_summary_depths(db)
+    )
+    _run_versioned_backfill_step(
+        db, "backfillSummaryMetadata", log, lambda: _backfill_summary_metadata(db)
+    )
+    _run_versioned_backfill_step(
+        db, "backfillToolCallColumns", log, lambda: _backfill_tool_call_columns(db)
+    )
+
+    # 5-7. v4.1 session-key cleanup migrations (unversioned but idempotent).
+    _run_unversioned_migration_step(
+        log,
+        "backfillConversationSessionKeys",
+        lambda: _backfill_conversation_session_keys(db),
+    )
+    _run_unversioned_migration_step(
+        log,
+        "backfillSummarySessionKeys",
+        lambda: _backfill_summary_session_keys(db),
+    )
+    _run_unversioned_migration_step(
+        log,
+        "backfillForkRollupsSessionKeys",
+        lambda: _backfill_fork_rollups_session_keys(db),
+    )
 
 
 def _seed_default_prompts(db: sqlite3.Connection, log: MigrationLogger | None) -> None:
@@ -2021,7 +2721,8 @@ def run_lcm_migrations(
        ``lcm_embedding_meta`` which #9 depends on).
     9. :func:`_ensure_core_triggers` — stub, body in #01-06 (depends on
        ``lcm_embedding_meta``).
-    10. :func:`_run_versioned_backfills` — stub, body in #01-15.
+    10. :func:`_run_versioned_backfills` — 3 ledger-gated backfills +
+        4 unversioned idempotent helpers (#01-15).
     11. :func:`_seed_default_prompts` — stub, body alongside synthesis epic.
 
     The whole ladder is wrapped in ``BEGIN EXCLUSIVE`` so two concurrent
@@ -2150,8 +2851,11 @@ def run_lcm_migrations(
         # the time the trigger fires.
         _ensure_core_triggers(db)
 
-        # 10. Versioned backfills (stub now; body in #01-15). Recorded in
-        # lcm_migration_state (created in step 1).
+        # 10. Versioned backfills (#01-15). The three ledger-gated steps
+        # (depths / metadata / tool_call_columns) are recorded in
+        # lcm_migration_state (created in step 1). Plus four unversioned
+        # idempotent helpers — identity-hash rehash, conv/summary
+        # session-key backfills, fork-side lcm_rollups no-op.
         _run_versioned_backfills(db, log)
 
         # 11. Seed default synthesis prompts (stub now; body alongside the
