@@ -92,8 +92,17 @@ def fresh_db() -> Iterator[sqlite3.Connection]:
 
 @pytest.fixture
 def migrated_db(fresh_db: sqlite3.Connection) -> sqlite3.Connection:
-    """A DB with the full migration ladder applied (core + v4.1 + triggers)."""
-    run_lcm_migrations(fresh_db)
+    """A DB with the full migration ladder applied (core + v4.1 + triggers).
+
+    Seeding is OFF: the schema-shape tests in this file assert the empty
+    state of ``lcm_prompt_registry`` after migration and several insert
+    their own rows. Issue 07-08 implements
+    :func:`_seed_default_prompts`, so the default ``True`` would
+    pre-populate 11 rows and conflict with those tests' inserts. Seed
+    behavior is covered separately by
+    :file:`tests/synthesis/test_seed_prompts.py`.
+    """
+    run_lcm_migrations(fresh_db, seed_default_prompts=False)
     return fresh_db
 
 

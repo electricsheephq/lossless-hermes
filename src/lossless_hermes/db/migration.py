@@ -2656,30 +2656,34 @@ def _run_versioned_backfills(db: sqlite3.Connection, log: MigrationLogger | None
 def _seed_default_prompts(db: sqlite3.Connection, log: MigrationLogger | None) -> None:
     """Seed the default synthesis prompts into ``lcm_prompt_registry``.
 
-    **STUB**: body lands alongside the synthesis epic.
-
     Per ``migration.ts:1435-1442`` the TS source calls ``seedDefaultPrompts(db)``
     from ``src/synthesis/seed-default-prompts.ts``. The Python equivalent
-    will live at ``src/lossless_hermes/synthesis/seed_default_prompts.py``.
+    lives at ``src/lossless_hermes/synthesis/seed_prompts.py`` (issue 07-08).
 
     Idempotent: only seeds prompts where the
     ``(memory_type, tier_label, pass_kind)`` triple has no existing rows.
     Operator-registered prompts are never overwritten.
 
-    Until the synthesis epic lands, this stub is a no-op. Callers that
-    pass ``seed_default_prompts=True`` see no prompts seeded — and
-    ``dispatchSynthesis`` would return ``missing_prompt`` errors. That's
-    the intended ratchet: synthesis is non-functional until both #01-06
-    (creates ``lcm_prompt_registry``) and the synthesis epic
-    (``seed_default_prompts.py``) ship.
+    Implemented in the synthesis package so the per-prompt literal
+    templates do not bloat ``migration.py``. The call composes with the
+    outer ``BEGIN EXCLUSIVE`` — :func:`seed_default_prompts` uses raw
+    ``INSERT`` (NOT :func:`register_prompt`) so it does NOT open a
+    nested ``BEGIN IMMEDIATE``.
 
     Args:
         db: Open :class:`sqlite3.Connection` inside the migration txn.
         log: Optional :class:`MigrationLogger` for per-step progress.
     """
-    # TODO(epic-01 synthesis): body lands alongside the synthesis epic.
-    _ = (db, log)
-    return
+    # Import locally to keep the synthesis package out of the migration
+    # module's top-level import graph — synthesis itself depends on the
+    # schema this module creates, and a circular import would land hard.
+    from lossless_hermes.synthesis.seed_prompts import seed_default_prompts
+
+    result = seed_default_prompts(db)
+    _log_info(
+        log,
+        f"[migration] _seed_default_prompts: seeded={result.seeded}, skipped={result.skipped}",
+    )
 
 
 # ---------------------------------------------------------------------------

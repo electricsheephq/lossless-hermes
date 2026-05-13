@@ -51,10 +51,18 @@ def migrated_db() -> Iterator[sqlite3.Connection]:
     Adds the two v4.1 cache tables manually since #01-06 hasn't landed.
     The cascade's step 6 is gated by ``_has_table``; we want the test
     suite to exercise step 6 explicitly, so we seed the tables here.
+
+    Default-prompt seeding is OFF: this file's tests insert their own
+    ``prompt_test`` row via ``INSERT OR IGNORE``. With seeding on (since
+    issue 07-08), the COALESCE UNIQUE index already has a row at
+    ``(episodic-leaf, '', single, 1)``, the IGNORE silently swallows the
+    insert, and the downstream FK on ``lcm_synthesis_cache.prompt_id``
+    fails. Seed behavior is covered separately by
+    :file:`tests/synthesis/test_seed_prompts.py`.
     """
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
-    run_lcm_migrations(conn)
+    run_lcm_migrations(conn, seed_default_prompts=False)
     # Minimal v4.1 cache tables (full DDL lives in #01-06). We only need
     # the columns the cascade reads / writes — ``cache_id`` / ``leaf_summary_id``.
     conn.execute(
