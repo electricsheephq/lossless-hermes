@@ -142,6 +142,19 @@ from lossless_hermes.tools.expansion_recursion_guard import (
 TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 
 
+# Per-tool modules register their schemas at import time by appending to
+# ``TOOL_SCHEMAS``. Import them here AFTER ``TOOL_SCHEMAS`` is defined so
+# the registry exists before the per-tool module runs its top-level
+# ``.append(...)`` call. The import is at the bottom of this section so
+# the helper exports above (TypeBox builders, conversation scope, etc.)
+# are already available to the per-tool modules.
+#
+# Ordering note: import order = registration order. Tests rely on the
+# tool list being stable; adding a new per-tool module appends; the
+# 06-02 dispatch table sees the same order.
+from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
+
+
 def get_tool_schemas() -> list[dict[str, Any]]:
     """Return the registered LCM tool schemas (OpenAI function-call format).
 
