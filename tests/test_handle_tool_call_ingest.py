@@ -74,21 +74,25 @@ def engine(tmp_home: Path) -> Iterator[LCMEngine]:
 
 
 # ---------------------------------------------------------------------------
-# Helper — call handle_tool_call defensively (the prelude swallows the
-# inevitable NotImplementedError raised by the existing 02-01 dispatch
-# stub; we want to assert on the ingest side-effects, not the raise).
+# Helper — call handle_tool_call. The 03-03 prelude runs FIRST; the
+# dispatch then either routes to a registered handler or returns the
+# structured JSON error string for unknown names. For the tests below
+# we register no handler, so dispatch returns the JSON error — the
+# tests assert on the ingest side-effects regardless.
 # ---------------------------------------------------------------------------
 
 
 def _invoke(engine: LCMEngine, name: str, args: Dict[str, Any], **kwargs: Any) -> None:
-    """Call ``engine.handle_tool_call(name, args, **kwargs)`` and swallow the raise.
+    """Call ``engine.handle_tool_call(name, args, **kwargs)`` and discard the result.
 
-    The 03-03 engine shell raises ``NotImplementedError`` after the
-    ingest prelude (Epic 06 fills in real dispatch). For the tests below
-    the raise is incidental — we care about the ingest side-effects.
+    Issue 06-02 lifted dispatch from the 03-03 ``NotImplementedError``
+    stub to the real :data:`TOOL_DISPATCH` table. For unknown tool
+    names (the case below — no per-tool ports registered) the call
+    returns the structured JSON error string. For tests below the
+    return value is incidental — we care about the ingest side-effects
+    the prelude produces BEFORE the dispatch step runs.
     """
-    with pytest.raises(NotImplementedError):
-        engine.handle_tool_call(name, args, **kwargs)
+    engine.handle_tool_call(name, args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -333,18 +337,21 @@ def test_tool_only_followed_by_successful_turn_no_double_ingest(
 
 
 def test_missing_messages_kwarg_is_no_op(tmp_home: Path) -> None:
-    """No ``messages`` kwarg → prelude is a no-op; dispatch raises as before.
+    """No ``messages`` kwarg → prelude is a no-op; dispatch returns JSON error.
 
     Spec AC (from issue orchestration): "Missing ``messages`` kwarg:
     handle_tool_call still works (no-op ingest)."
 
-    The prelude short-circuits BEFORE touching stores when ``messages``
-    is missing, so this test does NOT call ``on_session_start`` — it
-    runs on any Python build regardless of sqlite-vec availability.
+    Issue 06-02 lifted dispatch from the 03-03 ``NotImplementedError``
+    stub to the real :data:`TOOL_DISPATCH` table — ``lcm_grep`` is
+    still unknown (06-07 not yet landed), so dispatch returns the
+    structured JSON error string. The prelude short-circuits BEFORE
+    touching stores when ``messages`` is missing, so this test does
+    NOT call ``on_session_start`` — it runs on any Python build
+    regardless of sqlite-vec availability.
     """
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
-    with pytest.raises(NotImplementedError):
-        eng.handle_tool_call("lcm_grep", {}, session_id="sess-A")
+    eng.handle_tool_call("lcm_grep", {}, session_id="sess-A")
     # No ingest happened.
     assert "sess-A" not in eng._last_seen_message_idx
 
@@ -357,8 +364,7 @@ def test_none_messages_kwarg_is_no_op(tmp_home: Path) -> None:
     ``enable_load_extension``).
     """
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
-    with pytest.raises(NotImplementedError):
-        eng.handle_tool_call("lcm_grep", {}, messages=None, session_id="sess-A")
+    eng.handle_tool_call("lcm_grep", {}, messages=None, session_id="sess-A")
     assert "sess-A" not in eng._last_seen_message_idx
 
 
@@ -370,8 +376,7 @@ def test_empty_messages_kwarg_is_no_op(tmp_home: Path) -> None:
     the lock or touching stores. No DB open required.
     """
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
-    with pytest.raises(NotImplementedError):
-        eng.handle_tool_call("lcm_grep", {}, messages=[], session_id="sess-A")
+    eng.handle_tool_call("lcm_grep", {}, messages=[], session_id="sess-A")
     assert "sess-A" not in eng._last_seen_message_idx
 
 
@@ -389,8 +394,7 @@ def test_missing_session_id_and_sender_id_is_no_op(tmp_home: Path) -> None:
     """
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     messages = [{"role": "user", "content": "no session id"}]
-    with pytest.raises(NotImplementedError):
-        eng.handle_tool_call("lcm_grep", {}, messages=messages)
+    eng.handle_tool_call("lcm_grep", {}, messages=messages)
     # No state mutated — the prelude short-circuited.
     assert eng._last_seen_message_idx == {}
 
@@ -405,23 +409,24 @@ def test_empty_session_id_short_circuits(tmp_home: Path) -> None:
     """
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     messages = [{"role": "user", "content": "empty session"}]
-    with pytest.raises(NotImplementedError):
-        eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="")
+    eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="")
     assert eng._last_seen_message_idx == {}
 
 
-def test_no_kwargs_at_all_is_no_op(tmp_home: Path) -> None:
-    """Existing 02-01 test shape — ``handle_tool_call("lcm_grep", {})`` — still raises.
+def test_no_kwargs_at_all_returns_json_error(tmp_home: Path) -> None:
+    """Existing 02-01 test shape — ``handle_tool_call("lcm_grep", {})``.
 
-    Regression: the existing
-    ``tests/test_engine_noop.py::test_handle_tool_call_raises_with_epic_pointer``
-    contract is preserved. The prelude is a no-op when ``messages`` is
-    absent, and the existing :class:`NotImplementedError` still raises.
+    Issue 06-02 lifted dispatch from the 03-03 ``NotImplementedError``
+    stub to the real dispatch table. ``lcm_grep`` is still unknown
+    (06-07 not yet landed) so the call returns the structured JSON
+    error string. The prelude is a no-op when ``messages`` is absent.
     No DB open required.
     """
+    import json as _json
+
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
-    with pytest.raises(NotImplementedError, match=r"Epic 06"):
-        eng.handle_tool_call("lcm_grep", {})
+    result = eng.handle_tool_call("lcm_grep", {})
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +440,7 @@ def test_prelude_per_message_error_does_not_break_dispatch_raise(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A per-message store failure is isolated; the dispatch raise still surfaces.
+    """A per-message store failure is isolated; the dispatch still returns.
 
     The shared ``_ingest_batch`` body wraps each ``_ingest_single`` call
     in its own try/except (per-message error isolation). When the store
@@ -445,7 +450,8 @@ def test_prelude_per_message_error_does_not_break_dispatch_raise(
     * The cursor does NOT advance (no messages successfully landed).
     * The outer prelude's catch-all is NOT triggered (batch swallowed
       the error).
-    * The dispatch :class:`NotImplementedError` still propagates.
+    * The dispatch returns its JSON error string (06-02 contract;
+      ``lcm_grep`` is unknown until 06-07 lands).
 
     This test exercises the "ingest never breaks tool dispatch"
     contract via the per-message error-isolation path that the
@@ -460,9 +466,9 @@ def test_prelude_per_message_error_does_not_break_dispatch_raise(
 
     messages = [{"role": "user", "content": "trigger"}]
     with caplog.at_level(logging.ERROR, logger="lossless_hermes.engine.ingest"):
-        # The dispatch raise still fires (Epic 06 dispatch is not in).
-        with pytest.raises(NotImplementedError):
-            engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+        # The dispatch returns JSON error (Epic 06 per-tool ports not in).
+        result = engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+    assert isinstance(result, str)
 
     # An ingest error was logged — the per-message isolation logs
     # ``_ingest_batch: single ingest failed for session=sess-A …``.
@@ -486,7 +492,7 @@ def test_prelude_outer_exception_does_not_break_dispatch_raise(
     isolation in ``_ingest_batch`` would NOT catch). The outer
     :meth:`_ingest_from_handle_tool_call` try/except fires, logs the
     ``handle_tool_call ingest failed`` breadcrumb, and the dispatch
-    :class:`NotImplementedError` still propagates.
+    still returns its JSON error string (06-02 contract).
     """
     import logging
     from contextlib import contextmanager
@@ -506,8 +512,8 @@ def test_prelude_outer_exception_does_not_break_dispatch_raise(
 
     messages = [{"role": "user", "content": "trigger"}]
     with caplog.at_level(logging.ERROR, logger="lossless_hermes.engine.ingest"):
-        with pytest.raises(NotImplementedError):
-            engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+        result = engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+    assert isinstance(result, str)
 
     # The outer prelude catch logged its breadcrumb.
     assert any("handle_tool_call ingest failed" in rec.getMessage() for rec in caplog.records), [
@@ -522,15 +528,18 @@ def test_prelude_with_no_stores_is_safe(tmp_home: Path) -> None:
     seam. Stores are ``None``; the prelude's
     ``_do_ingest_history_diff`` short-circuits with a warning log.
     """
+    import json as _json
+
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     assert eng._conversation_store is None  # pre-condition
 
     messages = [{"role": "user", "content": "hi"}]
-    # Both the prelude (no-op due to missing stores) AND the dispatch
-    # raise (NotImplementedError) are tolerated; the test asserts only
-    # that NO unexpected exception leaks from the prelude.
-    with pytest.raises(NotImplementedError, match=r"Epic 06"):
-        eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+    # The prelude is a no-op when stores are missing; the dispatch
+    # returns the structured JSON error (lcm_grep unknown — 06-07
+    # not yet landed). The test asserts NO unexpected exception leaks
+    # from the prelude.
+    result = eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
     assert "sess-A" not in eng._last_seen_message_idx
 
 
@@ -590,8 +599,7 @@ def test_ignored_session_pattern_skips_prelude(tmp_home: Path) -> None:
     eng.on_session_start("bench-001")
     try:
         messages = [{"role": "user", "content": "ignored"}]
-        with pytest.raises(NotImplementedError):
-            eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="bench-001")
+        eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="bench-001")
         # No conversation row landed.
         assert eng._conversation_store.list_active_conversations() == []
         assert "bench-001" not in eng._last_seen_message_idx
@@ -613,8 +621,7 @@ def test_distinct_sessions_use_distinct_sync_locks(engine: LCMEngine) -> None:
     """
     with engine._session_locks.acquire_sync("sess-A"):
         messages = [{"role": "user", "content": "hi-B"}]
-        with pytest.raises(NotImplementedError):
-            engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-B")
+        engine.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-B")
         conv_b = engine._conversation_store.get_conversation_by_session_id("sess-B")
         assert conv_b is not None
         msgs_b = engine._conversation_store.get_messages(conv_b.conversation_id)

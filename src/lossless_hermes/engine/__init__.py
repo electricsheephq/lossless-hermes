@@ -65,13 +65,14 @@ See:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Final, List, Optional, Set, Tuple
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.hermes_bridge import ContextEngine
@@ -79,6 +80,7 @@ from lossless_hermes.store.compaction_maintenance import CompactionMaintenanceSt
 from lossless_hermes.store.compaction_telemetry import CompactionTelemetryStore
 from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
+from lossless_hermes.tools import get_tool_schemas as _registry_get_tool_schemas
 
 from lossless_hermes.plugin.needs_compact_gate import (
     TOKEN_GATE_TOOLS,
@@ -103,6 +105,9 @@ __all__ = [
     "CircuitBreaker",
     "ContextEngineInfo",
     "LCMEngine",
+    "RuntimeContext",
+    "TOKEN_GATE_TOOLS",
+    "TOOL_DISPATCH",
 ]
 
 logger = logging.getLogger("lossless_hermes.engine")
@@ -187,6 +192,99 @@ class ContextEngineInfo:
     name: str = "lcm"
     version: str = "0.1.0"
     owns_compaction: bool = True
+
+
+# ---------------------------------------------------------------------------
+# RuntimeContext — token-budget snapshot for the per-call gate (issue 06-02)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeContext:
+    """Per-call snapshot of current token usage + budget for the gate.
+
+    Issue 06-02 introduces this as the value :meth:`LCMEngine.get_runtime_context`
+    returns. The token-gate middleware (porting guide ``tools.md`` lines
+    597–610, ``needs-compact-gate.ts`` in TS) consumes
+    ``current_token_count`` and ``token_budget`` to decide whether to
+    refuse a tool call that would push the projected context-ratio over
+    the ``REFUSAL_THRESHOLD`` (0.92).
+
+    Per [ADR-TOOLS-05](../porting-guides/tools.md), the source of these
+    numbers is the in-memory token-state cache that
+    :meth:`LCMEngine.update_from_response` populates per-turn. At v0.1.0
+    the cache is keyed by ``session_id`` and surfaces the most recent
+    LLM-response prompt-token count plus the configured context budget
+    (Hermes's ``model_context_length``). When neither is available (e.g.
+    pre-first-response, or under a stateless test fixture), both fields
+    are ``None`` — the gate degrades to "skip the gate" (see the
+    porting guide's "Skipped (bypassed) when ``currentTokenCount`` or
+    ``tokenBudget`` is undefined" note).
+
+    Attributes:
+        current_token_count: Most-recent ``last_prompt_tokens`` for the
+            session. ``None`` means no LLM response observed yet.
+        token_budget: Configured context budget (model context length
+            minus a safety reserve). ``None`` means the engine has not
+            been told the budget yet (test-fixture path).
+    """
+
+    current_token_count: Optional[int] = None
+    token_budget: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# TOOL_DISPATCH — module-level handler registry (issue 06-02)
+# ---------------------------------------------------------------------------
+#
+# Per the issue spec (``epics/06-tools/06-02-tool-dispatch-table.md``)
+# and the porting guide (``docs/porting-guides/tools.md`` lines 622–688),
+# this is the canonical handler registry consulted by
+# :meth:`LCMEngine.handle_tool_call`. Per-tool issues 06-07 through 06-14
+# register their handler here at import time::
+#
+#     # In tools/grep.py at module scope:
+#     from lossless_hermes.engine import TOOL_DISPATCH
+#     TOOL_DISPATCH["lcm_grep"] = handle_lcm_grep
+#
+# At 06-02 the registry is EMPTY. The :func:`get_tool_schemas` registry
+# (``lossless_hermes.tools.TOOL_SCHEMAS``) is also empty — per-tool
+# ports populate both atomically as they land.
+#
+# **Why module-level, not class-level**: tests and per-tool ports both
+# need write access. A class attribute would mean every test that
+# stubs a handler has to know the subclass shape; a module-level dict
+# keeps the registration site one stable line per tool. Per ADR-TOOLS-03
+# in tools.md, the middleware lives in :meth:`handle_tool_call` (Option
+# B), and the dispatch table is the obvious public seam for per-tool
+# wiring.
+#
+# **The signature**: per the porting guide line 654–687, each handler
+# is called as ``handler(args, **kwargs)`` where kwargs includes
+# ``db``, ``retrieval``, ``voyage``, ``deps``, ``session_key``,
+# ``runtime_ctx``, and ``messages``. The exact kwargs list is finalized
+# when per-tool issues land — at 06-02 the dispatch passes through
+# whatever ``LCMEngine.handle_tool_call`` was called with (plus the
+# resolved ``session_key`` + ``runtime_ctx``). Handlers MUST return a
+# JSON string (per :py:func:`lossless_hermes.tools._common.tool_result`).
+#
+# **v0.1.0 omission**: per [ADR-012](../../docs/adr/012-subagent-defer.md),
+# ``lcm_expand_query`` is NOT registered in v0.1.0 — only 7 of the 8
+# LCM tools ship. The dispatch entry is left absent (the lookup falls
+# through to the unknown-tool error path).
+
+TOOL_DISPATCH: Final[Dict[str, Callable[..., str]]] = {}
+
+
+# ---------------------------------------------------------------------------
+# TOKEN_GATE_TOOLS is re-exported (canonical definition lives in
+# ``lossless_hermes.plugin.needs_compact_gate`` — see import block above
+# and ``__all__``). Per 06-03 (PR #95), the gate's authoritative
+# membership set is owned by the middleware module: the engine simply
+# consults it at invocation time. Re-exporting it from this module
+# keeps the 06-02 spec's public-surface guarantee intact (tests import
+# ``TOKEN_GATE_TOOLS`` from ``lossless_hermes.engine``).
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -743,52 +841,212 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
                 token_budget=budget,
             )
 
-    # ABC §Tools (defaults are fine; explicit overrides for 02-01 clarity) ---
+    # ABC §Tools -------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return an empty tool list for 02-01.
+        """Return the registered LCM tool schemas (OpenAI function-call format).
 
-        The 8 ``lcm_*`` tools (lcm_grep, lcm_describe, lcm_expand,
-        lcm_synthesize_around, lcm_get_entity, lcm_search_entities,
-        lcm_compact, lcm_conversation_scope) all land in Epic 06.
-        Returning ``[]`` matches the ABC default but is explicit here so
-        the contract is obvious.
+        Per [ADR-024](../../docs/adr/024-project-layout.md) and the
+        porting guide ``tools.md`` lines 642–652, this method delegates
+        to the package-level :func:`lossless_hermes.tools.get_tool_schemas`
+        registry. Per-tool ports (06-07..06-14) append their
+        ``LCM_<TOOL>_SCHEMA`` dicts to that registry at import time so
+        the engine doesn't need to know which tools have been ported.
+
+        Order is stable — :func:`get_tool_schemas` preserves insertion
+        order (CPython 3.7+ dict and list semantics), and tests pin that
+        ordering. Per ADR-029, the registry pattern decouples engine
+        wiring from per-tool schema content so future tool additions
+        only touch the per-tool module + registration line.
+
+        At 06-02 the registry is empty (per-tool ports populate it as
+        they land). Once 06-07..06-14 have all merged, the v0.1.0
+        surface is 7 schemas (no ``lcm_expand_query`` per ADR-012).
 
         Returns:
-            Empty list at 02-01.
+            A FRESH list (callers may mutate freely without side-effects
+            on the registry). Each entry is an OpenAI-format dict with
+            ``name`` / ``description`` / ``parameters`` keys.
         """
-        return []
+        return _registry_get_tool_schemas()
 
-    def get_runtime_context(self, session_key: Optional[str] = None) -> Dict[str, Any]:
-        """Read the cached token-state snapshot for ``session_key``.
+    @property
+    def _current_session_key(self) -> Optional[str]:
+        """Most-recent session identifier seen by ``on_session_start``.
 
-        The :func:`run_with_token_gate` middleware consumes the dict's
-        ``current_token_count`` + ``token_budget`` keys to decide whether
-        to refuse a tool dispatch for context-overflow. Both must be
-        present and well-formed for the gate to fire; missing telemetry
-        = bypass.
+        Used by :meth:`handle_tool_call` as the fallback when the tool
+        kwargs don't carry ``session_key`` / ``session_id`` /
+        ``sender_id``. The TS source's ``runWithTokenGate`` reads
+        ``sessionKey`` from a per-engine context the OpenClaw gateway
+        installs (``ctx.sessionKey`` in the factory closures, per
+        ``src/plugin/index.ts:2415``); Hermes does not surface that on
+        the ``handle_tool_call`` hook, so the engine falls back to the
+        most-recent ``on_session_start`` argument that's already
+        captured on :attr:`current_session_id` (see the field doc in
+        :meth:`__init__`).
+
+        Implemented as a read-only property so per-tool handlers (or
+        tests) cannot accidentally re-bind it. The single writer is
+        :meth:`_LifecycleMixin.on_session_start`.
+
+        Returns:
+            The most-recent session id, or ``None`` if no session has
+            started yet (CLI pre-first-message; bare engine tests).
+        """
+        return self.current_session_id
+
+    def get_runtime_context(self, session_key: Optional[str]) -> RuntimeContext:
+        """Return a :class:`RuntimeContext` snapshot for ``session_key``.
+
+        Per the porting guide ``tools.md`` ADR-TOOLS-05 (lines 757):
+        TS plumbs ``currentTokenCount + tokenBudget`` from an
+        ``llm_output`` hook into a per-session in-memory cache. The
+        Python equivalent reads :attr:`last_prompt_tokens` (populated
+        by :meth:`update_from_response` per turn) and
+        :attr:`threshold_tokens` (set by Hermes / Epic 04). Both are
+        sticky across turns; when either is zero (pre-first-response,
+        bare engine fixture), the corresponding field is ``None`` and
+        the gate skips the refusal check (matching TS line 605 "Skipped
+        (bypassed) when ``currentTokenCount`` or ``tokenBudget`` is
+        undefined").
+
+        At 06-02 the cache is engine-scoped (one cache for the whole
+        engine — :attr:`current_session_id` is the only "current"
+        session). Per the porting guide, when the v0.1.0 gateway lifts
+        the per-session cache out, this method will be the only seam
+        that changes — handlers and the gate read through here.
+
+        **Wave-N provenance** (per ADR-029): the TS source ties this
+        getter to the Wave-14 ``getTokenStateRuntimeContext`` cache and
+        the Wave-12 W2A1 P0 #2 audit fix that wired
+        ``lcm_synthesize_around`` onto the token-accounting bus
+        (``src/plugin/index.ts:2451`` in lossless-claw at ``1f07fbd``).
+        The Python port consolidates both: every gated tool reaches
+        the gate through this method, so the W2A1 escape ("synthesize
+        was previously off the token-accounting bus") is structurally
+        prevented — there's no path to dispatch a gated tool without
+        going through here.
 
         Args:
-            session_key: Cross-conversation identity. Defaults to
-                :attr:`current_session_id` when ``None`` — matches the
-                fallback in :meth:`handle_tool_call`.
+            session_key: The session identifier the call is being made
+                under. At 06-02 the value is ignored (the snapshot is
+                engine-scoped); future per-session caches will use it.
+                Accepted as ``None`` so the unknown-tool error path
+                does not have to construct a dummy key.
 
         Returns:
-            A dict with optional ``current_token_count``, ``token_budget``,
-            ``last_update_at``, ``last_update_source`` keys. Empty dict
-            when no anchor exists (the gate's no-cache bypass path).
+            A :class:`RuntimeContext` with ``current_token_count`` and
+            ``token_budget`` either set (when the engine has observed a
+            real LLM response and Hermes has set the budget) or ``None``
+            (pre-first-response / test-fixture path).
         """
-        return _token_state_get_runtime_context(
-            session_key if session_key is not None else self.current_session_id
+        # The parameter is intentionally kept on the signature even
+        # though it's unused at 06-02 — the per-tool issues 06-07..06-14
+        # call into this method with the resolved session_key, and the
+        # signature stability matters for that contract.
+        _ = session_key
+
+        return RuntimeContext(
+            current_token_count=(self.last_prompt_tokens if self.last_prompt_tokens > 0 else None),
+            token_budget=(self.threshold_tokens if self.threshold_tokens > 0 else None),
+        )
+
+    def _run_with_token_gate(
+        self,
+        *,
+        name: str,
+        handler: Optional[Callable[..., str]],
+        args: Dict[str, Any],
+        session_key: Optional[str],
+        runtime_ctx: RuntimeContext,
+        kwargs: Dict[str, Any],
+    ) -> str:
+        """Token-gate middleware seam — bridges to the real wrapper from 06-03.
+
+        Per the 06-02 dispatch contract this method is the seam tests
+        spy on (see ``tests/test_tool_dispatch.py``); per 06-03
+        (PR #95, ``needs_compact_gate.run_with_token_gate``) the real
+        gate logic — pre-call refusal evaluator, throw-tap, post-call
+        accounting — lives in a module-level function so it can be
+        reused outside the engine class. This method composes the two:
+        the spec's per-spy contract on the method shape, plus the
+        Wave-12 F5 middleware-not-decorator pattern from 06-03.
+
+        Per ADR-029 §"Known Wave-N fixes" Wave-12 F5, the gate's
+        ``current_token_count`` / ``token_budget`` source is the
+        :mod:`token_state` cache (NOT the engine's ``last_prompt_tokens``
+        field), so direct cache mutations are reflected on every
+        invocation. The :class:`RuntimeContext` value passed to the
+        handler reflects engine state per the 06-02 spec — both views
+        coexist by design.
+
+        Args:
+            name: The tool name being dispatched (consumed by the
+                estimator inside :func:`run_with_token_gate`).
+            handler: The looked-up dispatch handler from
+                :data:`TOOL_DISPATCH`, or ``None`` when the tool is not
+                registered. The inner thunk routes through
+                :meth:`_dispatch_tool_call` so the registry lookup
+                happens at the same seam main's middleware test
+                overrides — keeping both 06-02 and 06-03 tests passing.
+            args: The tool arguments dict (the LLM's tool-call
+                ``arguments`` after :py:func:`json.loads`).
+            session_key: The resolved session identifier from
+                :meth:`handle_tool_call`. May be ``None`` if neither
+                kwargs nor :attr:`_current_session_key` provided one.
+            runtime_ctx: The :class:`RuntimeContext` snapshot from
+                :meth:`get_runtime_context`. Forwarded to the handler;
+                the gate's own decision sources its numbers from
+                :func:`_token_state_get_runtime_context`.
+            kwargs: The remaining caller kwargs (e.g. ``messages`` for
+                the ingest prelude, future plumbing). Passed through to
+                the handler unmodified.
+
+        Returns:
+            Either the gate's refusal payload (when the projected ratio
+            exceeds :data:`REFUSAL_THRESHOLD`) or the handler's return
+            value. Both are JSON strings per the tool-result contract.
+        """
+        # The gate's pre-call decision sources from the token-state
+        # cache — direct cache mutation (Wave-12 F5 regression test)
+        # must be visible here.
+        gate_view = _token_state_get_runtime_context(session_key)
+        _ = handler  # handler is consumed inside _dispatch_tool_call via TOOL_DISPATCH
+        return run_with_token_gate(
+            tool_name=name,
+            tool_params=args,
+            session_key=session_key,
+            current_token_count=gate_view.get("current_token_count"),
+            token_budget=gate_view.get("token_budget"),
+            inner=lambda: self._dispatch_tool_call(
+                name,
+                args,
+                runtime_ctx=runtime_ctx,
+                session_key=session_key,
+                **kwargs,
+            ),
         )
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         """Dispatch an LCM tool with ingest prelude + token-gate middleware.
 
-        **Issue 03-03 (ADR-009 §Decision "Option C"):** before any
-        per-tool dispatch this method reads ``kwargs.get("messages")``
-        and runs the same diff-against-cursor / ``_ingest_batch`` body
-        that ``post_llm_call`` runs (via
+        **Issue 06-02 dispatch contract** (porting guide ``tools.md``
+        lines 622–688): the body looks up ``name`` in
+        :data:`TOOL_DISPATCH`, resolves ``session_key`` from kwargs (or
+        falls back to :attr:`_current_session_key`), builds the
+        :class:`RuntimeContext`, and dispatches via
+        :meth:`_run_with_token_gate` for tools in :data:`TOKEN_GATE_TOOLS`
+        or directly to the handler otherwise. Returns
+        ``json.dumps({"error": f"Unknown LCM tool: {name}"})`` for any
+        unknown name. Per [ADR-017](../../docs/adr/017-sync-vs-async-db.md)
+        the method is sync — inner async paths (Voyage, sub-agents)
+        bridge via the engine's background event loop, not this seam.
+
+        **Issue 03-03 (ADR-009 §Decision "Option C") prelude preserved:**
+        before any per-tool dispatch this method reads
+        ``kwargs.get("messages")`` and runs the same
+        diff-against-cursor / ``_ingest_batch`` body that
+        ``post_llm_call`` runs (via
         :meth:`_IngestMixin._ingest_from_handle_tool_call`). The
         prelude covers tool-only turns where the ``post_llm_call`` hook
         does NOT fire (gated on ``final_response and not interrupted``
@@ -815,16 +1073,18 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         ``session_id`` / ``sender_id`` in the kwargs). The
         ``kwargs.get("session_id") or kwargs.get("sender_id")`` chain
         is **forward-compat**: if either key is later added to the
-        Hermes hook call, this code picks it up automatically. When
-        neither is present (the v0.1 reality) the prelude is a no-op
-        and only the existing per-tool dispatch runs — matching the
-        spec AC "Missing ``session_id`` AND ``sender_id``: no-op
-        ingest".
+        Hermes hook call, this code picks it up automatically. The
+        same chain resolves the per-tool ``session_key`` argument
+        (falling back to :attr:`_current_session_key` when neither
+        kwarg is present). When neither is present (the v0.1 reality)
+        the prelude is a no-op and only the per-tool dispatch runs —
+        matching the spec AC "Missing ``session_id`` AND ``sender_id``:
+        no-op ingest".
 
-        Tool dispatch itself: at 03-03 / 06-03 there are no LCM tools
-        registered (:meth:`get_tool_schemas` returns ``[]``), so the
-        inner :meth:`_dispatch_tool_call` raises :class:`NotImplementedError`
-        for any tool ``name`` — real tool handling lands in 06-07..06-14.
+        Tool dispatch: per 06-02, :meth:`_dispatch_tool_call` looks up
+        :data:`TOOL_DISPATCH` and returns
+        ``json.dumps({"error": f"Unknown LCM tool: {name}"})`` for an
+        unregistered name. Real handlers land per-tool in 06-07..06-14.
         The middleware wrap remains intact: the gate runs first, and if
         the dispatch raises, the wrapper taps an error-shaped payload
         into the token-state cache before re-raising (Wave-12 W2A1 P1).
@@ -835,33 +1095,37 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         per-session **sync** lock via
         :meth:`SessionLockRegistry.acquire_sync` (added at issue 03-02
         per the PR #34 sync-conversion). No ``asyncio.run`` is needed
-        — the spec's example was OUTDATED at the time it was written
-        (it predated PR #34 + #42). See ``epics/03-ingest-assembly
-        /03-03-ingest-from-handle-tool-call.md`` §"Sync override".
+        at this seam — per [ADR-017](../../docs/adr/017-sync-vs-async-db.md)
+        the inner async paths run on the engine's background loop.
 
         Args:
-            name: Tool name being dispatched. At 06-03 this is one of
-                the future LCM tool names (Epic 06 binds them); the
-                router only routes through this method for LCM-owned
-                tool names (per ``docs/reference/hermes-hooks.md`` line
-                182).
-            args: Tool arguments. Consumed by both the gate's per-tool
-                estimator and the inner dispatch.
+            name: Tool name being dispatched. The router only routes
+                through this method for LCM-owned tool names (per
+                ``docs/reference/hermes-hooks.md`` line 182); unknown
+                names return the structured JSON error string rather
+                than raising.
+            args: Tool arguments (the LLM's tool-call ``arguments``
+                field after :py:func:`json.loads`). Consumed by both
+                the gate's per-tool estimator and the inner dispatch.
             **kwargs: May include ``messages`` (Hermes today, per
-                ``run_agent.py:11249``), forward-compat ``session_id`` /
-                ``sender_id``, and forward-compat ``session_key``. All
-                read defensively; missing keys default to no-op.
+                ``run_agent.py:11249``), the forward-compat
+                ``session_id`` / ``sender_id`` / ``session_key`` keys,
+                and any future plumbing. All read defensively; missing
+                keys default to no-op for the ingest prelude and to
+                ``None`` for the ``session_key`` resolution.
 
         Returns:
-            A JSON-encoded string. Either the gate's refusal payload
-            (when the projected ratio exceeds the threshold) or the
-            tool's own output.
-
-        Raises:
-            NotImplementedError: When the inner dispatch is reached
-                (06-07..06-14 land the real bodies). The middleware
-                tap fires BEFORE the re-raise so the error-message
-                token cost is still accounted for.
+            A JSON string. On the happy path this is the handler's
+            return value (per
+            :py:func:`lossless_hermes.tools._common.tool_result`). On
+            an unknown tool name it is
+            ``json.dumps({"error": f"Unknown LCM tool: {name}"})``.
+            On a gate refusal it is the gate's refusal payload
+            (when the projected ratio exceeds the threshold). Never
+            raises for unknown names (per the spec AC "Returns a JSON
+            string in every code path"); handler exceptions are
+            payload-encoded by the per-tool middleware via
+            :func:`run_with_token_gate`'s Wave-12 W2A1 P1 throw-tap.
         """
         # --- Issue 03-03 ingest prelude (ADR-009 Option C) ---------------
         # Pulled defensively from kwargs so the prelude can NEVER raise
@@ -885,60 +1149,102 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
             # acquires the per-session sync lock for the diff window.
             self._ingest_from_handle_tool_call(session_id, messages)
 
-        # --- Issue 06-03 token-gate middleware (Wave-12 F5) ---------------
+        # --- 06-02 + 06-03 dispatch ------------------------------------
+        # 1. Resolve the session key. Per the 06-02 spec AC, the order is:
+        #    explicit kwarg → session_id kwarg → sender_id kwarg →
+        #    self._current_session_key (the on_session_start fallback).
+        #    All four can be None; the per-tool handler / gate is
+        #    responsible for treating None as "no active session".
+        session_key = (
+            kwargs.get("session_key")
+            or kwargs.get("session_id")
+            or kwargs.get("sender_id")
+            or self._current_session_key
+        )
+
+        # 2. Build the runtime-context snapshot the HANDLER will see
+        #    (PR #97 contract — handlers receive a typed
+        #    :class:`RuntimeContext`). The gate's decision below sources
+        #    its numbers from the token-state cache via main's
+        #    :func:`_token_state_get_runtime_context` so that direct
+        #    cache mutations (e.g. the Wave-12 F5 middleware regression
+        #    test) are reflected on every invocation.
+        runtime_ctx = self.get_runtime_context(session_key)
+
+        # 3. Strip the orchestrator-consumed kwargs before forwarding to
+        #    the handler — the handler signature owns its own kwargs
+        #    surface (db / retrieval / voyage / deps / messages / etc.).
+        #    Per the porting guide lines 654–687, only ``messages`` is
+        #    actively forwarded today; the session_id / sender_id /
+        #    session_key keys are consumed at this seam.
+        forwarded_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("session_id", "sender_id", "session_key")
+        }
+
+        # 4. Route through the token-gate middleware OR call the handler
+        #    directly. Per ADR-029 §"Known Wave-N fixes" Wave-12 F5,
+        #    the wrap runs at INVOCATION time, not at registration time
+        #    — :data:`TOKEN_GATE_TOOLS` membership is consulted here so
+        #    the gate sees the LATEST cached state every dispatch.
+        #    ``lcm_expand`` and ``lcm_compact`` bypass the gate
+        #    (sub-agent dispatch + the deliberate "spend tokens to free
+        #    tokens" trade respectively).
         # LCM Wave-12 F5 (2026-04-30): runWithTokenGate is middleware-not-decorator
         # so the gate state is computed at invocation time, not at
-        # registration time. A decorator-time computation would freeze
-        # the gate state to whatever was true at plugin-init, defeating
-        # the purpose. See ADR-029 §"Known Wave-N fixes" Wave-12 row.
-        # Original: lossless-claw/src/plugin/needs-compact-gate.ts.
-        session_key = kwargs.get("session_key") or session_id or self.current_session_id
-        runtime_ctx = _token_state_get_runtime_context(session_key)
+        # registration time. Original: lossless-claw/src/plugin/needs-compact-gate.ts.
         if name in TOKEN_GATE_TOOLS:
-            return run_with_token_gate(
-                tool_name=name,
-                tool_params=args,
+            return self._run_with_token_gate(
+                name=name,
+                handler=TOOL_DISPATCH.get(name),
+                args=args,
                 session_key=session_key,
-                current_token_count=runtime_ctx.get("current_token_count"),
-                token_budget=runtime_ctx.get("token_budget"),
-                inner=lambda: self._dispatch_tool_call(name, args, **kwargs),
+                runtime_ctx=runtime_ctx,
+                kwargs=forwarded_kwargs,
             )
-
-        # --- Tools NOT in TOKEN_GATE_TOOLS: bypass middleware ------------
-        # ``lcm_expand`` and ``lcm_compact`` are exempt from the gate
-        # (lcm_expand has its own grant ledger; lcm_compact emits a
-        # ~150-token status response). Their handlers still land in
-        # Epic 06 but they're not gate-wrapped.
-        return self._dispatch_tool_call(name, args, **kwargs)
+        return self._dispatch_tool_call(
+            name,
+            args,
+            runtime_ctx=runtime_ctx,
+            session_key=session_key,
+            **forwarded_kwargs,
+        )
 
     def _dispatch_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        """Inner dispatch — routes ``name`` to its handler.
+        """Inner dispatch — routes ``name`` to its :data:`TOOL_DISPATCH` handler.
 
-        At 06-03 there are no LCM tools registered (06-02's
-        ``TOOL_DISPATCH`` table lands separately, and per-tool handlers
-        land in 06-07..06-14). The body raises :class:`NotImplementedError`
-        for any tool ``name`` so a stray dispatch surfaces loudly
-        instead of silently returning a JSON error string. Once 06-02
-        and the per-tool issues land, this body becomes the standard
-        ``TOOL_DISPATCH.get(name, ...)(args, **kwargs)`` ladder.
+        Per the 06-02 spec, the registry lookup either:
+
+        * returns the handler's JSON string (real dispatch), or
+        * returns ``json.dumps({"error": f"Unknown LCM tool: {name}"})``
+          when the name is not registered (per spec AC, NOT a Python
+          exception — Hermes wraps caller-side failures in its own
+          JSON envelope, so a raise here would surface as a 5xx-
+          equivalent rather than as a "tool said no").
 
         Factored out of :meth:`handle_tool_call` so the gate middleware
         in :func:`run_with_token_gate` can wrap a single thunk. Tests
-        for the middleware can subclass :class:`LCMEngine` and override
-        this method to return a known string — exercising the
-        gate/dispatch/tap chain without depending on real handler
-        bodies.
+        for the middleware (see
+        ``tests/plugin/test_wave12_f5_middleware_not_decorator.py``) can
+        subclass :class:`LCMEngine` and override this method to return
+        a known string — exercising the gate/dispatch/tap chain without
+        depending on real per-tool handler bodies (which land in
+        06-07..06-14).
 
         Args:
             name: The tool name.
-            args: The tool args.
-            **kwargs: Forwarded from :meth:`handle_tool_call`.
+            args: The tool args (forwarded to the handler verbatim).
+            **kwargs: Forwarded from :meth:`handle_tool_call` after
+                orchestrator-consumed keys are stripped. Includes the
+                resolved ``runtime_ctx`` and ``session_key`` plus any
+                handler-relevant kwargs the caller passed (e.g.
+                ``messages``).
 
         Returns:
-            The tool's JSON-encoded result string.
-
-        Raises:
-            NotImplementedError: Always — Epic 06's per-tool issues
-                replace this with real dispatch.
+            The tool's JSON-encoded result string. On unknown names,
+            the structured ``{"error": "Unknown LCM tool: ..."}`` JSON
+            string per the 06-02 spec AC.
         """
-        raise NotImplementedError(f"handle_tool_call({name!r}, ...): tools land in Epic 06")
+        handler = TOOL_DISPATCH.get(name)
+        if handler is None:
+            return json.dumps({"error": f"Unknown LCM tool: {name}"})
+        return handler(args, **kwargs)

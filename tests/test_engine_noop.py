@@ -314,28 +314,46 @@ def test_on_session_reset_no_longer_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tools — empty schemas, raise on dispatch
+# Tools — empty schemas, JSON-error on unknown dispatch
 # ---------------------------------------------------------------------------
 
 
 def test_get_tool_schemas_returns_empty_list() -> None:
-    """AC: tools land in Epic 06 — v0 returns ``[]``."""
+    """AC: tools land in Epic 06 — v0 returns ``[]``.
+
+    Issue 06-02 (PR #87 follow-on) wired :meth:`get_tool_schemas` to
+    delegate to ``lossless_hermes.tools.get_tool_schemas`` — the v0
+    schemas list is still empty until per-tool issues 06-07..06-14
+    land, so the assertion holds.
+    """
     engine = LCMEngine()
     assert engine.get_tool_schemas() == []
 
 
-def test_handle_tool_call_raises_with_epic_pointer() -> None:
-    """AC: ``handle_tool_call`` raises ``NotImplementedError`` naming Epic 06."""
+def test_handle_tool_call_returns_json_error_for_unknown_name() -> None:
+    """AC (06-02 update): unknown tool name returns the structured JSON
+    error string — does NOT raise.
+
+    Was a ``NotImplementedError`` raise at 02-01 / 03-03 (Epic 06
+    pointer). Issue 06-02 lifted the body to the real dispatch table;
+    unknown names now return ``{"error": "Unknown LCM tool: ..."}``
+    per spec — Hermes wraps caller-side failures in its own JSON
+    envelope, so the refusal shape is canonical.
+    """
+    import json as _json
+
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 06"):
-        engine.handle_tool_call("lcm_grep", {"pattern": "foo"})
+    result = engine.handle_tool_call("lcm_grep", {"pattern": "foo"})
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
 
 
-def test_handle_tool_call_includes_name_in_message() -> None:
-    """The error message names the attempted tool for debuggability."""
+def test_handle_tool_call_includes_name_in_error_payload() -> None:
+    """The structured error names the attempted tool for debuggability."""
+    import json as _json
+
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"lcm_grep"):
-        engine.handle_tool_call("lcm_grep", {})
+    result = engine.handle_tool_call("lcm_grep", {})
+    assert _json.loads(result)["error"] == "Unknown LCM tool: lcm_grep"
 
 
 # ---------------------------------------------------------------------------

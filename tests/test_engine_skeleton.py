@@ -369,16 +369,30 @@ def test_update_from_response_still_works_on_shell() -> None:
 
 
 def test_get_tool_schemas_returns_empty_at_02_01() -> None:
-    """Tools land in Epic 06; the shell returns ``[]`` until then."""
+    """Tools land in Epic 06; the registry returns ``[]`` until then.
+
+    Issue 06-02 wired :meth:`get_tool_schemas` to delegate to
+    ``lossless_hermes.tools.get_tool_schemas`` — empty until per-tool
+    issues 06-07..06-14 register schemas at import time.
+    """
     engine = LCMEngine()
     assert engine.get_tool_schemas() == []
 
 
-def test_handle_tool_call_raises_epic_06() -> None:
-    """The shell raises with the Epic 06 pointer."""
+def test_handle_tool_call_unknown_returns_json_error() -> None:
+    """Issue 06-02 lifted dispatch from the Epic-06-pointer stub to the
+    real :data:`TOOL_DISPATCH` table.
+
+    Unknown tool names now return the structured JSON error string per
+    spec — handlers land in 06-07..06-14 and register into the table
+    at import time. The 02-01 ``NotImplementedError`` semantics moved
+    to "registered but unimplemented" instead of "any name raises".
+    """
+    import json as _json
+
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 06"):
-        engine.handle_tool_call("lcm_grep", {})
+    result = engine.handle_tool_call("lcm_grep", {})
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
 
 
 # ---------------------------------------------------------------------------
