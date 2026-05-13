@@ -33,8 +33,10 @@ After budget-walk, the selected message list may contain assistant turns whose `
      - Find some selected `tool_result` with the same id at an ordinal **strictly greater** than the assistant message.
      - If yes → **keep** the block.
      - If no AND `item.ordinal < orphan_stripping_ordinal` → **strip** the block.
-     - If no AND the id has *any* resolved `tool_result` somewhere (`all_tool_result_ords_by_id`) → **keep** (don't strip cache-marginal turns).
-     - Else → **strip**.
+     - If no AND the id has **NO** resolved `tool_result` *anywhere* (empty/absent in `all_tool_result_ords_by_id`) → **keep** (cache-marginal protection: absence-of-evidence guards against transient eviction churn).
+     - Else (resolved somewhere in `all_tool_result_ords_by_id` but not in selected window AND boundary protected) → **strip**.
+
+   **TS canonical semantics** (per PR #50 / #49 review): TS `assembler.ts:747` uses `if (!(allToolResult.get(id)?.length)) return true` — the leading `!` means **absence/empty** → KEEP, **presence** → STRIP. Earlier spec drafts inverted this; PR #50 ships the TS-canonical reading with two regression tests (`test_orphan_above_boundary_with_resolved_anywhere_stripped` and `test_orphan_above_boundary_with_empty_resolved_list_kept`).
    - If all blocks stripped, **drop the whole assistant message**.
 
 The `orphan_stripping_ordinal` parameter is a stable boundary that hot-cache callers can supply to prevent prefix churn across turns (per `LCMEngine._stable_orphan_stripping_ordinals_by_conversation` state on the shell class).
