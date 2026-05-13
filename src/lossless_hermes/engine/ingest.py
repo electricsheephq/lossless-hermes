@@ -28,9 +28,18 @@ on ``final_response and not interrupted`` at ``run_agent.py:15407`` —
 turns that exit on Ctrl-C or no-final-response mid-tool-loop never
 fire this hook. The next successful turn will diff from
 ``_last_seen_message_idx[session_id]`` and pick up the
-previous-turn-interrupted tail on its way through. Issue 03-03 adds
-the belt-and-suspenders safety net by hooking ``handle_tool_call`` /
-``on_session_end`` for the residual coverage gap.
+previous-turn-interrupted tail on its way through.
+
+**Issue 03-03** adds the belt-and-suspenders safety net via
+:meth:`_ingest_from_handle_tool_call` — invoked by the engine shell's
+``handle_tool_call`` override before any LCM-tool dispatch (per ADR-009
+§Decision "Option C"). The entry seam differs but the body is the
+**same** lock-acquire / cursor-re-read / ``_ingest_batch`` /
+cursor-advance sequence as ``post_llm_call``; both call into the
+private :meth:`_do_ingest_history_diff` helper. Double-firing both
+hooks on the same turn is harmless: the second caller re-reads the
+cursor under the lock, sees ``current_idx >= len(history)``, and
+returns without writing.
 
 Mixin contract (per ADR-027 §Consequences "All state lives on the shell
 class"):
@@ -675,14 +684,68 @@ class _IngestMixin:
     ) -> None:
         """Inner body of :meth:`_on_post_llm_call` — raises on error.
 
+        Thin wrapper around :meth:`_do_ingest_history_diff` that passes
+        ``hook_source="post_llm_call"`` for log-breadcrumb attribution.
         Split out so the public hook's try/except can stay narrow:
-        every code path in this body either short-circuits or runs
-        through the per-session lock. Tests that need to assert specific
-        exception types call this method directly.
+        every code path in :meth:`_do_ingest_history_diff` either
+        short-circuits or runs through the per-session lock. Tests that
+        need to assert specific exception types call this method
+        directly.
+        """
+        self._do_ingest_history_diff(
+            session_id=session_id,
+            history=conversation_history,
+            hook_source="post_llm_call",
+        )
+
+    def _do_ingest_history_diff(
+        self,
+        *,
+        session_id: str,
+        history: Optional[List[Dict[str, Any]]],
+        hook_source: str,
+    ) -> None:
+        """Shared diff-against-cursor / ingest-batch / advance-cursor body.
+
+        Issue 03-03 extracts this from :meth:`_do_post_llm_call` so the
+        ``handle_tool_call`` entry seam (ADR-009 Option C) can call into
+        the **same** body without copy-paste. The only difference between
+        the two entry points is which Hermes hook fired and the
+        ``hook_source`` log-breadcrumb attribution — everything from the
+        empty-session_id guard through the cursor advance is identical.
+
+        Two callers share this body:
+
+        * :meth:`_do_post_llm_call` (ADR-009 Option B, the primary path)
+          — passes the ``conversation_history`` kwarg Hermes hands
+          ``post_llm_call`` hooks at ``run_agent.py:15410``.
+        * :meth:`_ingest_from_handle_tool_call` (ADR-009 Option C, the
+          safety net) — passes the ``messages`` kwarg Hermes hands
+          ``ContextEngine.handle_tool_call`` at ``run_agent.py:11249``.
+
+        **Idempotency invariant.** Double-firing both seams on the
+        same turn is safe: the second caller acquires
+        :meth:`SessionLockRegistry.acquire_sync` after the first
+        releases it, re-reads ``_last_seen_message_idx[session_id]``,
+        sees ``current_idx >= len(history)``, and returns without
+        writing. The cursor IS the dedup mechanism (per ADR-009
+        §Decision "Option B primary path").
+
+        Args:
+            session_id: The session identifier; empty string → no-op.
+            history: The full message-history snapshot to diff. ``None``
+                is tolerated (treated as empty).
+            hook_source: Free-form attribution string for log
+                breadcrumbs (e.g. ``"post_llm_call"`` or
+                ``"handle_tool_call"``). Only flows into log records;
+                does NOT influence ingest behavior.
         """
         # Fast-fail guards before any lock acquisition.
         if not session_id:
-            logger.debug("[lcm] post_llm_call: empty session_id, skipping ingest")
+            logger.debug(
+                "[lcm] %s: empty session_id, skipping ingest",
+                hook_source,
+            )
             return
 
         # Engine not yet bootstrapped (``on_session_start`` hasn't run
@@ -692,8 +755,9 @@ class _IngestMixin:
         # races, so we degrade gracefully.
         if self._conversation_store is None or self._summary_store is None:
             logger.warning(
-                "[lcm] post_llm_call session=%s: stores not initialized "
+                "[lcm] %s session=%s: stores not initialized "
                 "(on_session_start did not run?); skipping ingest",
+                hook_source,
                 session_id,
             )
             return
@@ -704,7 +768,8 @@ class _IngestMixin:
         # gate is the broader bypass.
         if self._should_ignore_session(session_id=session_id):
             logger.debug(
-                "[lcm] post_llm_call session=%s: ignored by pattern",
+                "[lcm] %s session=%s: ignored by pattern",
+                hook_source,
                 session_id,
             )
             return
@@ -712,26 +777,27 @@ class _IngestMixin:
             # Hook kwargs don't carry session_key today; the gate
             # short-circuits unless/until Hermes forwards it.
             logger.debug(
-                "[lcm] post_llm_call session=%s: stateless session, skipping writes",
+                "[lcm] %s session=%s: stateless session, skipping writes",
+                hook_source,
                 session_id,
             )
             return
 
-        history = conversation_history or []
+        snapshot = history or []
         last_idx = self._last_seen_message_idx.get(session_id, 0)
-        if last_idx >= len(history):
+        if last_idx >= len(snapshot):
             # No new messages — idempotent no-op. Matches the spec AC
             # "Re-running the hook with the same ``conversation_history``
             # is a no-op".
             logger.debug(
-                "[lcm] post_llm_call session=%s: no new messages (last_idx=%d, history_len=%d)",
+                "[lcm] %s session=%s: no new messages (last_idx=%d, history_len=%d)",
+                hook_source,
                 session_id,
                 last_idx,
-                len(history),
+                len(snapshot),
             )
             return
 
-        new_messages = history[last_idx:]
         # Lock-and-ingest. The per-session sync lock guards the
         # diff → ingest → cursor-advance sequence so concurrent firings
         # on the same session_id (in the gateway, two adjacent turns
@@ -744,33 +810,113 @@ class _IngestMixin:
             # messages, which the identity_hash UNIQUE constraint would
             # reject — but the cleaner path is to recompute the diff
             # window from the latest cursor before doing any writes.
+            # This re-read is also the dedup guarantee for the Option B
+            # + Option C double-fire path (ADR-009 §Decision): when both
+            # post_llm_call AND handle_tool_call fire on the same turn,
+            # the second one through this gate sees the cursor already
+            # at len(history) and returns without writing.
             current_idx = self._last_seen_message_idx.get(session_id, 0)
-            if current_idx >= len(history):
+            if current_idx >= len(snapshot):
                 logger.debug(
-                    "[lcm] post_llm_call session=%s: another caller "
+                    "[lcm] %s session=%s: another caller "
                     "advanced the cursor while we waited; nothing to do",
+                    hook_source,
                     session_id,
                 )
                 return
-            window = history[current_idx:]
+            window = snapshot[current_idx:]
             ingested = self._ingest_batch(session_id=session_id, messages=window)
             if ingested > 0:
-                self._last_seen_message_idx[session_id] = len(history)
+                self._last_seen_message_idx[session_id] = len(snapshot)
                 logger.info(
-                    "[lcm] post_llm_call session=%s: ingested %d/%d new messages (cursor %d -> %d)",
+                    "[lcm] %s session=%s: ingested %d/%d new messages (cursor %d -> %d)",
+                    hook_source,
                     session_id,
                     ingested,
                     len(window),
                     current_idx,
-                    len(history),
+                    len(snapshot),
                 )
             else:
                 logger.debug(
-                    "[lcm] post_llm_call session=%s: 0 of %d candidate "
+                    "[lcm] %s session=%s: 0 of %d candidate "
                     "messages ingested (all filtered/dropped)",
+                    hook_source,
                     session_id,
                     len(window),
                 )
+
+    # ------------------------------------------------------------------
+    # handle_tool_call ingest entry path — issue 03-03 (ADR-009 Option C)
+    # ------------------------------------------------------------------
+
+    def _ingest_from_handle_tool_call(
+        self,
+        session_id: str,
+        messages: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        """Belt-and-suspenders ingest entry from ``handle_tool_call``.
+
+        Issue 03-03 / ADR-009 §Decision "Option C": ``post_llm_call`` is
+        gated on ``final_response and not interrupted`` at
+        ``run_agent.py:15407`` and does NOT fire when the user Ctrl-Cs
+        mid-turn or when the loop exits without a final response. To
+        cover tool-only turns that invoke an LCM tool but never reach a
+        final response, the engine shell's :meth:`handle_tool_call`
+        override calls this method BEFORE dispatching the tool. The
+        ingest then captures the user's pre-tool turn (which the
+        ``post_llm_call`` hook might never see).
+
+        Reuses the **same** body as :meth:`_do_post_llm_call` via
+        :meth:`_do_ingest_history_diff` — the only difference is the
+        entry seam (and the ``hook_source`` log attribution). The
+        cursor-based idempotency guarantee (ADR-009 §Decision) ensures
+        that if BOTH hooks fire on the same turn, the second one
+        through is a no-op.
+
+        **Observer-only contract.** Exceptions are swallowed + logged
+        identically to :meth:`_on_post_llm_call` so a transient DB
+        failure on the tool-dispatch hot path never breaks the
+        user-facing agent. The host's ``handle_tool_call`` call site
+        at ``run_agent.py:11251-11253`` already wraps the call in a
+        try/except, but the contract is "ingest never breaks the tool
+        dispatch" — easier to enforce here than to rely on the host.
+
+        Args:
+            session_id: The Hermes session identifier. Resolved by the
+                caller via
+                ``kwargs.get("session_id") or kwargs.get("sender_id")``
+                — when both are absent (the current Hermes shape at
+                ``run_agent.py:11249`` which passes only ``messages``),
+                the engine shell's ``handle_tool_call`` short-circuits
+                BEFORE calling this method, so reaching here implies a
+                non-empty session_id. The empty-string check at the
+                top of :meth:`_do_ingest_history_diff` is the
+                belt-and-suspenders guard for that invariant.
+            messages: The Hermes ``kwargs["messages"]`` snapshot —
+                Hermes's in-memory message list at the moment the tool
+                was dispatched. ``None`` is tolerated and treated as
+                empty.
+        """
+        try:
+            self._do_ingest_history_diff(
+                session_id=session_id,
+                history=messages,
+                hook_source="handle_tool_call",
+            )
+        except Exception as exc:  # noqa: BLE001 — observer-only contract
+            # Mirrors :meth:`_on_post_llm_call`'s catch-all: the ingest
+            # prelude must NEVER raise into the tool-dispatch hot path.
+            # The host wraps ``handle_tool_call`` in its own try/except
+            # at run_agent.py:11251-11253, but the contract is "ingest
+            # never breaks tool dispatch" — easier to enforce here than
+            # rely on the host.
+            logger.error(
+                "[lcm] handle_tool_call ingest failed for session=%s: %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # _ingest_batch / _ingest_single — TS engine.ts:5899-6134 port
