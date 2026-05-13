@@ -514,7 +514,16 @@ class TestApswFallbackWithoutExtra:
     ) -> None:
         # Stdlib ``sqlite3.connect`` raises ``OperationalError`` AND no
         # apsw extra → re-raise the original error.
+        #
+        # We must also bypass ``_check_sqlite_extension_loading`` — on
+        # macOS-actions-Python (``actions/setup-python@v5`` without
+        # ``--enable-loadable-sqlite-extensions``) that guard raises
+        # ``RuntimeError`` BEFORE we reach the ``sqlite3.connect`` call,
+        # short-circuiting the test's intent. Patch it to a no-op so the
+        # test exercises only the OperationalError-passthrough behavior
+        # it's named for.
         monkeypatch.setattr(connection_mod, "HAS_APSW", False)
+        monkeypatch.setattr(connection_mod, "_check_sqlite_extension_loading", lambda: None)
 
         def boom(*args: object, **kwargs: object) -> object:
             raise sqlite3.OperationalError("read-only filesystem")
