@@ -1,10 +1,10 @@
-"""Tests for :mod:`lossless_hermes.db.migration` — the core 11 tables + 20 indexes.
+"""Tests for :mod:`lossless_hermes.db.migration` — the core 12 tables + 20 indexes.
 
 Covers the acceptance criteria from ``epics/01-storage/01-04-migration-core-tables.md``
 in scope for the core schema:
 
-* All 12 tables + 20 indexes created on a fresh in-memory DB via
-  :func:`run_lcm_migrations`.
+* All 12 core tables + 20 core indexes created on a fresh in-memory DB
+  via :func:`run_lcm_migrations`.
 * Idempotency: re-running :func:`run_lcm_migrations` is a no-op.
 * CHECK constraints enforced (role / cache_state / last_activity_band /
   item_type / part_type / kind).
@@ -18,11 +18,13 @@ in scope for the core schema:
   partial-active partial UNIQUE.
 * Belt-and-suspenders: :func:`_ensure_message_parts_table_belt_and_suspenders`
   re-runs idempotently outside the bulk block.
-* Stubs: :func:`_ensure_fts5_tables`, :func:`_ensure_v41_tables`,
-  :func:`_ensure_core_triggers`, :func:`_run_versioned_backfills`,
-  :func:`_seed_default_prompts` are no-ops (the schema after migration
-  contains exactly the core 12 tables + 20 indexes; no FTS / v4.1
-  / trigger / backfill artifacts).
+* Stubs: :func:`_ensure_fts5_tables`, :func:`_run_versioned_backfills`,
+  :func:`_seed_default_prompts` are no-ops (FTS5 lands in #01-05,
+  backfills in #01-15, prompt seeding alongside synthesis).
+* :func:`_ensure_v41_tables` and :func:`_ensure_core_triggers` are
+  IMPLEMENTED as of #01-06 — verified by ``test_v41_tables_created_*``
+  and ``test_core_triggers_created_*`` here, plus full coverage in
+  ``test_migration_v41.py``.
 * Reference-fixture parity: the SQL stored in ``sqlite_master`` for each
   core object matches the corresponding entry in
   ``tests/fixtures/lcm_reference_schema.sql`` (the TS-generated golden).
@@ -31,7 +33,7 @@ in scope for the core schema:
 Out of scope for this test file (covered when the dependent PRs land):
 
 * FTS5 virtual-table creation + seed (in #01-05).
-* v4.1 tables / their indexes / the polymorphic-cleanup trigger (in #01-06).
+* v4.1 deep-dive tests — see ``tests/test_migration_v41.py``.
 * Versioned-backfill semantics (in #01-15).
 * Default-prompt seeding (in synthesis epic).
 
@@ -39,6 +41,7 @@ References:
 
 * :mod:`lossless_hermes.db.migration` — implementation under test.
 * ``epics/01-storage/01-04-migration-core-tables.md`` — issue spec + AC.
+* ``epics/01-storage/01-06-migration-v41-tables.md`` — v4.1 spec + AC.
 * ``docs/porting-guides/storage.md`` §2.1 — table inventory.
 * ``tests/fixtures/lcm_reference_schema.sql`` — TS-generated golden.
 """
@@ -230,38 +233,35 @@ _EXPECTED_CORE_INDEXES = (
 )
 
 
-def test_core_table_count(migrated_db: sqlite3.Connection) -> None:
-    """The migration creates exactly 12 core tables (no more, no less)."""
-    tables = _list_tables(migrated_db)
-    assert tables == list(_EXPECTED_CORE_TABLES), (
-        f"core table set mismatch: got {tables!r}; expected {list(_EXPECTED_CORE_TABLES)!r}"
-    )
+def test_core_tables_present(migrated_db: sqlite3.Connection) -> None:
+    """The migration creates all 12 core tables.
 
-
-def test_core_index_count(migrated_db: sqlite3.Connection) -> None:
-    """The migration creates exactly 20 core indexes (no more, no less)."""
-    indexes = _list_indexes(migrated_db)
-    assert indexes == list(_EXPECTED_CORE_INDEXES), (
-        f"core index set mismatch: got {indexes!r}; expected {list(_EXPECTED_CORE_INDEXES)!r}"
-    )
-
-
-def test_no_triggers_in_core_pr(migrated_db: sqlite3.Connection) -> None:
-    """The core PR does NOT create any triggers.
-
-    The only core trigger (``lcm_embedding_meta_cleanup_summary``) is
-    deferred to #01-06 because it references ``lcm_embedding_meta``
-    which lands there. See
-    :func:`lossless_hermes.db.migration._ensure_core_triggers` docstring.
+    After #01-06 landed, the migration creates v4.1 tables as well; this
+    test only checks the core subset is present (use
+    :func:`list_core_tables` to enumerate).
     """
-    assert _list_triggers(migrated_db) == []
+    tables = set(_list_tables(migrated_db))
+    missing = set(_EXPECTED_CORE_TABLES) - tables
+    assert missing == set(), f"missing core tables: {missing!r}"
+
+
+def test_core_indexes_present(migrated_db: sqlite3.Connection) -> None:
+    """The migration creates all 20 core indexes.
+
+    After #01-06 landed, the migration creates v4.1 indexes as well; this
+    test only checks the core subset is present (use
+    :func:`list_core_index_names` to enumerate).
+    """
+    indexes = set(_list_indexes(migrated_db))
+    missing = set(_EXPECTED_CORE_INDEXES) - indexes
+    assert missing == set(), f"missing core indexes: {missing!r}"
 
 
 def test_introspection_helpers_match_expected_sets() -> None:
     """``list_core_tables()`` and ``list_core_index_names()`` match expectations.
 
     These helpers are used by tests + future ``/lcm doctor`` to enumerate
-    what this PR is responsible for. They must stay in sync with
+    what the core PR is responsible for. They must stay in sync with
     ``_CORE_TABLE_CREATIONS`` / ``_CORE_INDEX_CREATIONS``.
     """
     assert sorted(list_core_tables()) == list(_EXPECTED_CORE_TABLES)
@@ -1064,18 +1064,20 @@ def test_fts5_noop_when_unavailable(migrated_db: sqlite3.Connection) -> None:
     assert "summaries_fts_cjk" not in tables
 
 
-def test_v41_tables_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
-    """``_ensure_v41_tables`` is a no-op until #01-06 lands.
+def test_v41_tables_created_after_migration(migrated_db: sqlite3.Connection) -> None:
+    """After #01-06, all 17 v4.1 tables are created by ``_ensure_v41_tables``.
 
-    None of the 13 v4.1 tables are created.
+    Re-invoking the helper on a migrated DB is idempotent (no-op), but
+    the tables themselves exist.
     """
     schema_before = _snapshot_schema(migrated_db)
     _ensure_v41_tables(migrated_db)
     schema_after = _snapshot_schema(migrated_db)
+    # Idempotent re-run: no schema delta.
     assert schema_before == schema_after
 
-    tables = _list_tables(migrated_db)
-    for v41_table in (
+    tables = set(_list_tables(migrated_db))
+    expected_v41_tables = {
         "lcm_worker_lock",
         "lcm_extraction_queue",
         "lcm_session_key_audit",
@@ -1093,25 +1095,25 @@ def test_v41_tables_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
         "lcm_embedding_profile",
         "lcm_embedding_meta",
         "lcm_feature_flags",
-    ):
-        assert v41_table not in tables
+    }
+    missing = expected_v41_tables - tables
+    assert missing == set(), f"missing v4.1 tables: {missing!r}"
 
 
-def test_core_triggers_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
-    """``_ensure_core_triggers`` is a no-op until #01-06 lands.
+def test_core_triggers_created_after_migration(migrated_db: sqlite3.Connection) -> None:
+    """After #01-06, the ``lcm_embedding_meta_cleanup_summary`` trigger exists.
 
-    The only core trigger (``lcm_embedding_meta_cleanup_summary``) is
-    deferred to #01-06 because it references ``lcm_embedding_meta``
-    (which lands in #01-06). See
-    :func:`lossless_hermes.db.migration._ensure_core_triggers` docstring.
+    Re-invoking the helper on a migrated DB is idempotent (no-op), but
+    the trigger itself exists.
     """
     schema_before = _snapshot_schema(migrated_db)
     _ensure_core_triggers(migrated_db)
     schema_after = _snapshot_schema(migrated_db)
+    # Idempotent re-run: no schema delta.
     assert schema_before == schema_after
 
     triggers = _list_triggers(migrated_db)
-    assert triggers == []
+    assert triggers == ["lcm_embedding_meta_cleanup_summary"]
 
 
 def test_backfills_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
