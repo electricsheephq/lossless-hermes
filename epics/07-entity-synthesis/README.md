@@ -14,7 +14,7 @@ Port LCM's **async, queue-driven entity coreference worker** and its **on-demand
 - `src/lossless_hermes/synthesis/prompt_registry.py` — `register_prompt` (`BEGIN IMMEDIATE`, append-only versioning), `get_active_prompt` (NULL-safe `tier_label` normalization), `bump_bundle_version`.
 - `src/lossless_hermes/synthesis/seed_prompts.py` — 10 default prompts from architecture-v4.1.md §12 Appendix A; idempotent skip-if-exists; raw `INSERT` so the migration outer txn isn't broken by a nested `BEGIN`.
 - **Cache write + invalidation path** — `lcm_synthesis_cache` single-flight via `INSERT OR IGNORE`, `lcm_cache_leaf_refs` populated post-synthesis, explicit `DELETE` on soft-suppression (cascade does not fire on `suppressed_at` set).
-- **Optional opinionated model ladder** — Open Decision A per `synthesis.md`: should the Python port seed `model_recommendation` with haiku→sonnet→opus→opus-thinking by tier, or match TS exactly with all NULLs and one global env var? Tracked as ADR-? in 07-10.
+- **Tier-to-model routing policy** — [ADR-031](../../docs/adr/031-synthesis-tier-model-routing.md) (issue 07-10, Option A: match TS exactly — single `LCM_SUMMARY_MODEL` env var, NULL `model_recommendation` in seed). Opinionated haiku→sonnet→opus→opus-thinking ladder deferred to Epic 09 eval. Public surface lives in `src/lossless_hermes/synthesis/tier_routing.py` (re-exports the tier-defaults + pass-strategy tables and the public `pick_synthesis_model`).
 - **~80 ported pytest cases** across the four contract test files plus the Wave-N regression set.
 
 ## Dependencies
@@ -44,10 +44,10 @@ Port LCM's **async, queue-driven entity coreference worker** and its **on-demand
 
 ## Confidence
 
-**85%.** Two sub-95% items keep this from spike-verified territory:
+**90%.** One sub-95% item remains:
 
 - **LLM adapter shape:** `synthesis.md` calls out that Hermes's existing client must be adapted into the `LlmCall` protocol. Until Epic 04 lands the adapter, this is a known-unknown — the worker-LLM dispatch and cost-accounting shape might need revision once the real Anthropic SDK token-count payload is in hand.
-- **Tier-to-model policy (Open Decision A):** the TS source has all `model_recommendation = NULL` and routes every tier through one env var. Whether the Python port seeds an opinionated haiku/sonnet/opus ladder OR matches TS exactly is an ADR open question (`synthesis.md` Open Decisions §1). 07-10 is the placeholder.
+- ~~**Tier-to-model policy (Open Decision A):**~~ **RESOLVED** per [ADR-031](../../docs/adr/031-synthesis-tier-model-routing.md) (issue 07-10, merged 2026-05-14). Option A: Python port matches TS exactly — single `LCM_SUMMARY_MODEL` env var, NULL `model_recommendation` in seed. Opinionated tier ladder deferred until Epic 09 eval data exists; deferral marker is `lossless_hermes.synthesis.tier_routing.TIER_LADDER_DEFERRED`. Confidence bump from 85% → 90% reflects that this resolution is in the codebase, not deferred.
 
 Everything else — the SQL, the worker-tick algorithm, the cache key composition, the audit-row lifecycle, the prompt-registry append-only contract, the Wave-N fixes — is fully specified in the porting guides and either spike-verified or has direct TS-side test parity.
 
@@ -80,9 +80,9 @@ All accepted at 95%+:
 - **ADR-024** (project layout) — `extraction/`, `synthesis/`, and `tools/entity_shared.py` paths are pinned.
 - **ADR-029** (Wave-N provenance) — every Wave-1, Wave-4, Wave-7, Wave-10 fix in this epic carries the inline `# LCM Wave-N (date): ...` comment.
 
-ADR pending:
+ADR resolved during epic:
 
-- **ADR-? Tier-to-model routing.** See 07-10. Recommendation: defer the seed decision until Epic 09 eval data exists; ship 07-10 as a stub that matches TS (all NULL).
+- **[ADR-031](../../docs/adr/031-synthesis-tier-model-routing.md): Tier-to-model routing.** See 07-10. Option A: match TS exactly — single `LCM_SUMMARY_MODEL` env var, NULL `model_recommendation` in seed; opinionated ladder deferred to Epic 09 eval (v0.2 candidate).
 
 ## Out of scope for this epic
 
