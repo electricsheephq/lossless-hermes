@@ -50,6 +50,31 @@ from lossless_hermes.db.connection import (
     open_lcm_db,
 )
 
+# ---------------------------------------------------------------------------
+# Skip marker: actions/setup-python macOS builds lack enable_load_extension
+# ---------------------------------------------------------------------------
+#
+# Per ADR-004 §Open questions item 1 and ADR-028 §Decision point 8, some
+# CPython builds (notably ``actions/setup-python``'s macOS pre-built
+# Python) ship without ``--enable-loadable-sqlite-extensions``. That's an
+# operator-machine concern in production (the Apple-Python guard fires
+# loudly), but in CI it means the open_lcm_db path can't be exercised at
+# all on those cells. We auto-skip the live-DB tests when extension
+# loading isn't available on the running interpreter — the guard tests
+# below still run (they explicitly monkey-patch the introspection hook).
+#
+# Ubuntu cells + Homebrew/pyenv/uv-managed Python all have extension
+# loading enabled, so the skip only fires on the macOS GH-Actions runners.
+_skip_no_extension_loading = pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "enable_load_extension"),
+    reason=(
+        "actions/setup-python on macOS ships a CPython build without "
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load. "
+        "Apple-Python-guard tests still run (see TestApplePythonGuard). "
+        "See ADR-004 §Open questions item 1 + ADR-028 §Decision point 8."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Autouse: clear the module-level registry between tests
@@ -126,6 +151,7 @@ class TestPathHelpers:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 class TestPragmas:
     """All 7 PRAGMAs from storage.md §3 are applied after ``open_lcm_db``."""
 
@@ -188,6 +214,7 @@ class TestPragmas:
 
 
 class TestAssertForeignKeysEnabled:
+    @_skip_no_extension_loading
     def test_passes_when_foreign_keys_on(self, tmp_path: Path) -> None:
         conn = open_lcm_db(tmp_path / "lcm.db")
         try:
@@ -222,6 +249,7 @@ class TestAssertForeignKeysEnabled:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 class TestSqliteVecLoaded:
     def test_vec_version_query_works(self, tmp_path: Path) -> None:
         # AC: sqlite-vec is loaded; ``SELECT vec_version()`` returns a
@@ -480,6 +508,7 @@ class TestWalFallback:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 class TestCloseLcmDb:
     def test_close_runs_pragma_optimize(self, tmp_path: Path) -> None:
         # ``sqlite3.Connection.set_trace_callback`` is the documented
@@ -544,6 +573,7 @@ class TestCloseLcmDb:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 class TestRegistry:
     def test_open_tracks_connection(self, tmp_path: Path) -> None:
         db = tmp_path / "lcm.db"
@@ -641,6 +671,7 @@ class TestOpenLcmDbApi:
         with pytest.raises(ValueError, match=r"driver"):
             open_lcm_db(tmp_path / "lcm.db", driver="postgres")  # type: ignore[arg-type]
 
+    @_skip_no_extension_loading
     def test_creates_parent_directory(self, tmp_path: Path) -> None:
         # mkdir -p semantics. The TS code does the same — see
         # ``ensureDbDirectory`` in connection.ts.
@@ -653,6 +684,7 @@ class TestOpenLcmDbApi:
         finally:
             close_lcm_db(conn)
 
+    @_skip_no_extension_loading
     def test_in_memory_path(self) -> None:
         conn = open_lcm_db(":memory:")
         try:
@@ -667,6 +699,7 @@ class TestOpenLcmDbApi:
         finally:
             close_lcm_db(conn)
 
+    @_skip_no_extension_loading
     def test_accepts_pathlib_path(self, tmp_path: Path) -> None:
         conn = open_lcm_db(tmp_path / "lcm.db")
         try:
