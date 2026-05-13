@@ -33,6 +33,7 @@ from lossless_hermes.voyage.client import (
     VoyageError,
     VoyageErrorKind,
 )
+from lossless_hermes.voyage.credentials import resolve_voyage_api_key
 
 __all__ = [
     "BACKOFF_BASE_MS",
@@ -51,4 +52,5 @@ __all__ = [
     "VoyageClient",
     "VoyageError",
     "VoyageErrorKind",
+    "resolve_voyage_api_key",
 ]
