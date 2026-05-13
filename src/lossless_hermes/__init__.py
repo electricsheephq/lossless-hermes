@@ -5,10 +5,15 @@ into the same Python environment as hermes-agent; Hermes discovers it at
 startup by iterating ``importlib.metadata.entry_points(group="hermes_agent.plugins")``
 and invoking the :func:`register` callable below with a ``PluginContext``.
 
-The v0 wiring registers the no-op :class:`LCMEngine` only. The Hermes
-hooks (``pre_llm_call`` / ``post_llm_call``) and the ``/lcm`` slash
-command are deferred to later epics — see the inline ``TODO(epic-03)``
-and ``TODO(epic-08)`` markers below.
+At **issue 02-07** the wiring registers the no-op :class:`LCMEngine`,
+the ``/lcm`` slash command (per issue 02-10), AND all four Hermes hooks
+that the engine needs to be a real plugin: ``post_llm_call`` (per-turn
+ingest seam, ADR-009), ``pre_llm_call`` (recall-policy injection,
+ADR-014), ``on_session_end`` (per-turn defense-in-depth, ADR-009
+Consequences), and ``subagent_stop`` (forward-compat seam for Epic 06
+per ADR-012). The hook bodies themselves are no-op stubs at 02-07 —
+Epic 03 (ingest, assemble) and Epic 06 (subagent context-sharing) fill
+in the real behavior without touching :func:`register`.
 
 ### Distribution model
 
@@ -37,11 +42,19 @@ See:
   distribution decision and the ``register(ctx)`` contract.
 * ``docs/adr/007-hermes-as-dependency.md`` — startup health-check
   rationale.
+* ``docs/adr/009-per-message-ingest.md`` — ``post_llm_call`` as the
+  per-turn ingest seam.
+* ``docs/adr/010-always-on-assembly-emulation.md`` — ``pre_llm_call``
+  as the always-on assembly substitution seam.
+* ``docs/adr/012-subagent-context-sharing.md`` — v1 defers subagent
+  context-sharing to v2; ``subagent_stop`` hook is a forward-compat seam.
+* ``docs/adr/014-recall-policy-injection.md`` — user-message-position
+  injection of policy text (preserves prompt cache).
 * ``docs/adr/024-project-layout.md`` — ``src/lossless_hermes/`` layout.
-* ``docs/reference/hermes-hooks.md`` lines 256-326 — full worked example
-  of ``register()`` plus the ``ContextEngine`` hook landing table.
-* ``epics/00-scaffolding/issues/00-06-noop-engine.md`` — this issue's
-  acceptance criteria.
+* ``docs/reference/hermes-hooks.md`` — VALID_HOOKS table + per-hook
+  kwargs and dispatch sites.
+* ``epics/02-engine-skeleton/02-07-hook-registrations.md`` — this
+  issue's acceptance criteria.
 """
 
 from __future__ import annotations
@@ -65,7 +78,7 @@ def register(ctx: Any) -> None:
     """Hermes plugin entry point.
 
     Hermes invokes this callable once at startup with a ``PluginContext``.
-    The v0 body:
+    The 02-07 body:
 
     1. Verifies Hermes is on the import path (defensive against direct-
        invocation in a Hermes-less env per ADR-007 §Consequences).
@@ -74,20 +87,29 @@ def register(ctx: Any) -> None:
     3. Constructs an :class:`LCMEngine` (no DB open, no migrations — those
        land in :meth:`LCMEngine.on_session_start` per ADR-001).
     4. Registers the engine via :meth:`PluginContext.register_context_engine`.
-    5. Emits an info-level log line for observability.
+    5. **Registers the four Hermes hooks** the engine needs to operate:
+       ``post_llm_call`` (per-turn ingest, ADR-009),
+       ``pre_llm_call`` (recall-policy injection, ADR-014),
+       ``on_session_end`` (per-turn defense-in-depth, ADR-009 Consequences),
+       and ``subagent_stop`` (Epic 06 forward-compat per ADR-012).
+    6. Registers the ``/lcm`` slash command (issue 02-10).
+    7. Emits an info-level log line for observability.
 
-    What is **not** registered at v0:
-
-    * ``pre_llm_call`` / ``post_llm_call`` hooks (TODO epic-03 — the
-      ingest + always-on-assembly seams land there per ADR-009 + ADR-010).
-    * The ``/lcm`` slash command (TODO epic-08 — the 25 subcommands all
-      land then).
+    The hook bodies are no-op stubs at 02-07 (debug-log + return ``None``
+    or ``None``-equivalent). Epic 03 fills in the real ingest /
+    assemble paths; Epic 06 fills in the subagent_stop behavior. Per
+    ADR-001 §Invariant "the package's top-level
+    ``lossless_hermes:register`` callable must remain stable across
+    versions" — wiring all four hooks here means Epic 03 / Epic 06
+    patches only have to fill the hook bodies, not edit
+    :func:`register`.
 
     Args:
         ctx: The Hermes ``PluginContext`` instance, providing the
             registration methods enumerated in
-            ``hermes_cli/plugins.py:287-665``. The only method used at
-            v0 is ``register_context_engine``.
+            ``hermes_cli/plugins.py:287-665``. Methods used at 02-07
+            are ``register_context_engine``, ``register_hook`` (×4),
+            and ``register_command``.
 
     Raises:
         LosslessHermesEnvironmentError: Hermes is not on the import
@@ -122,12 +144,20 @@ def register(ctx: Any) -> None:
     engine = LCMEngine(hermes_home=get_hermes_home(), config=config)
     ctx.register_context_engine(engine)
 
-    # TODO(epic-03): wire ``pre_llm_call`` and ``post_llm_call`` hooks
-    # once ``LCMEngine._on_pre_llm_call`` and ``_on_post_llm_call`` land.
-    # Issue 02-07 lands the hook registrations separately from this issue
-    # (02-10), which only adds the slash-command dispatcher.
-    # ctx.register_hook("pre_llm_call", engine._on_pre_llm_call)
-    # ctx.register_hook("post_llm_call", engine._on_post_llm_call)
+    # Hook registrations (issue 02-07). The four hooks listed in
+    # docs/reference/hermes-hooks.md "Where LCM hooks land" table —
+    # every hook the engine needs to be a real Hermes plugin. The hook
+    # bodies are no-op stubs at 02-07 (debug-log only); Epic 03 / 06
+    # fills in the real behavior without touching this register call.
+    #
+    # Per `hermes_cli/plugins.py:603-618`, ``register_hook(name, cb)``:
+    # unknown hook names produce a warning but are still stored
+    # (forward-compat); known names from VALID_HOOKS are appended to
+    # the per-hook callback list.
+    ctx.register_hook("post_llm_call", engine._on_post_llm_call)
+    ctx.register_hook("pre_llm_call", engine._on_pre_llm_call)
+    ctx.register_hook("on_session_end", engine._on_session_end_hook)
+    ctx.register_hook("subagent_stop", engine._on_subagent_stop)
 
     # Slash command registration (issue 02-10). The dispatcher seam is
     # live; subcommand bodies for purge / doctor / health / worker / eval
@@ -145,6 +175,6 @@ def register(ctx: Any) -> None:
     )
 
     _log.info(
-        "lossless-hermes plugin loaded (engine=%s, /lcm registered)",
+        "lossless-hermes plugin loaded (engine=%s, hooks=4, /lcm registered)",
         engine.name,
     )

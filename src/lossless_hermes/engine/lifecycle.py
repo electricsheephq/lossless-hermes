@@ -319,6 +319,133 @@ class _LifecycleMixin:
         self._telemetry_store = None
         self._maintenance_store = None
 
+    def _on_session_end_hook(
+        self,
+        session_id: str = "",
+        completed: bool = True,
+        interrupted: bool = False,
+        model: str = "",
+        platform: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Hermes ``on_session_end`` **plugin hook** — per-turn cadence (ADR-009).
+
+        Wired into :func:`lossless_hermes.register` as
+        ``ctx.register_hook("on_session_end", engine._on_session_end_hook)``.
+        Distinct from the :class:`ContextEngine` ABC method
+        :meth:`on_session_end` (which fires at real session boundaries:
+        ``shutdown_memory_provider``, ``commit_memory_session`` —
+        ``run_agent.py:5575,5600``); this plugin hook fires at the end
+        of **every** ``run_conversation`` call (``run_agent.py:15525``)
+        — i.e., once per user turn — plus a safety-net fire on
+        interrupted CLI exit (``cli.py:13233``). See
+        ``docs/reference/hermes-hooks.md`` line 96 for the
+        documentation of this distinction.
+
+        Per ADR-009 §Consequences "defense-in-depth for interrupted
+        turns", the role of this hook is to catch any ``post_llm_call``
+        that did NOT fire (``run_agent.py:15407`` gates on
+        ``final_response and not interrupted``). At 02-07 the body is a
+        no-op debug-log stub — Epic 03 fills in the tail-ingest path
+        that calls :meth:`_IngestMixin._on_post_llm_call` for any
+        message that landed in ``conversation_history`` after the last
+        successful ingest cursor.
+
+        Note that the **kwargs shape here is the PLUGIN-HOOK shape**
+        (``session_id``, ``completed``, ``interrupted``, ``model``,
+        ``platform``) — NOT the ABC :meth:`on_session_end` signature
+        (which takes ``messages: List[Dict]``). The plugin hook does
+        not receive the final message list; if Epic 03's tail-ingest
+        needs the messages it must read them from the engine's own
+        :attr:`_conversation_store` keyed by ``session_id``.
+
+        Args:
+            session_id: The Hermes session identifier.
+            completed: Whether ``run_conversation`` ran to a clean
+                completion (final response set, no exception).
+            interrupted: Whether the turn was interrupted (Ctrl-C in
+                CLI, gateway client disconnect, etc.). The Epic-03
+                tail-ingest body fires only when this is ``True``.
+            model: The LLM model id.
+            platform: The provider platform string.
+            **kwargs: Forward-compat for future hook signature
+                additions.
+        """
+        # No-op stub. Epic 03 replaces this body with the real defense-
+        # in-depth tail-ingest path (catch up any messages the
+        # ``post_llm_call`` hook didn't see because ``interrupted``
+        # short-circuited the dispatch). The debug log gives an
+        # operator scanning logs a breadcrumb that the hook fired.
+        if interrupted:
+            logger.debug(
+                "[lcm] on_session_end (plugin hook) session=%s interrupted=True "
+                "(Epic 03 will catch up on tail messages)",
+                session_id,
+            )
+        else:
+            logger.debug(
+                "[lcm] on_session_end (plugin hook) session=%s completed=%s "
+                "(per-turn cadence — ABC on_session_end handles real boundaries)",
+                session_id,
+                completed,
+            )
+
+    def _on_subagent_stop(
+        self,
+        parent_session_id: str = "",
+        child_role: Any = None,
+        child_summary: str = "",
+        child_status: str = "",
+        duration_ms: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Hermes ``subagent_stop`` hook — no-op stub (ADR-012 defers to v2).
+
+        Wired into :func:`lossless_hermes.register` as
+        ``ctx.register_hook("subagent_stop", engine._on_subagent_stop)``.
+        Fires once per child after ``delegate_task`` runs (per
+        ``tools/delegate_tool.py:2248``), serialised on the parent
+        thread so plugin authors don't have to handle concurrency.
+
+        Per ADR-012 §Decision, v1 of lossless-hermes does NOT share
+        subagent context with the parent — each subagent runs its own
+        full ``run_conversation`` with its own ``pre_llm_call`` /
+        ``post_llm_call`` hooks (per ``docs/reference/hermes-hooks.md``
+        §"Subagent / delegate_task lifecycle"). Epic 06 wires the real
+        subagent-context-sharing behavior (v2). Until then the hook is
+        registered as a forward-compat seam — registering at 02-07
+        means an Epic-06 patch only has to fill the body, not edit
+        :func:`register`.
+
+        Per ``docs/reference/hermes-hooks.md`` line 99, the kwargs
+        shape is ``parent_session_id``, ``child_role`` (Any),
+        ``child_summary``, ``child_status``, ``duration_ms``. Every
+        kwarg is accepted (defaults provided + ``**kwargs`` catches
+        forward-compat additions) and no exception fires.
+
+        Args:
+            parent_session_id: The parent agent's session identifier.
+            child_role: The child agent's role (typed ``Any`` because
+                Hermes may pass an enum, a string, or a dict).
+            child_summary: The child's final summary text.
+            child_status: The child's exit status (``"completed"``,
+                ``"error"``, ``"timeout"``, etc.).
+            duration_ms: Wall-clock duration of the child's run.
+            **kwargs: Forward-compat for future hook signature
+                additions.
+        """
+        # No-op stub. Epic 06 replaces this body with the real
+        # subagent-context-sharing path (v2 of ADR-012). The debug log
+        # gives an operator scanning logs a breadcrumb that the hook
+        # fired so the integration test can confirm it's wired.
+        logger.debug(
+            "[lcm] subagent_stop parent=%s status=%s duration_ms=%d "
+            "(v1: no-op per ADR-012; Epic 06 wires real behavior)",
+            parent_session_id,
+            child_status,
+            duration_ms,
+        )
+
     def on_session_reset(self) -> None:
         """Reset per-session state. Does NOT close the DB.
 

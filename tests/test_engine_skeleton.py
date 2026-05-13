@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import pytest
 
@@ -263,12 +263,18 @@ def test_on_session_reset_no_longer_stubbed() -> None:
     assert engine.last_prompt_tokens == 0
 
 
-def test_on_post_llm_call_stub_raises() -> None:
-    """Epic 03 fills in this body; at 02-01 the stub raises."""
+def test_on_post_llm_call_stub_returns_none() -> None:
+    """Issue 02-07 demotes the stub from ``NotImplementedError`` to no-op.
+
+    The hook must be callable without raising so :func:`register` can
+    wire it via ``ctx.register_hook("post_llm_call", engine._on_post_llm_call)``
+    without the agent loop crashing every turn. Epic 03 fills in the
+    real diff-and-ingest body.
+    """
     engine = LCMEngine()
 
-    async def _exercise() -> None:
-        await engine._on_post_llm_call(
+    async def _exercise() -> Any:
+        return await engine._on_post_llm_call(
             session_id="sess-1",
             user_message="hi",
             assistant_response="hello",
@@ -277,19 +283,28 @@ def test_on_post_llm_call_stub_raises() -> None:
             platform="anthropic",
         )
 
-    with pytest.raises(NotImplementedError, match=r"Epic 03"):
-        asyncio.run(_exercise())
+    result = asyncio.run(_exercise())
+    assert result is None
 
 
-def test_on_pre_llm_call_stub_raises() -> None:
-    """Epic 03 fills in this body; at 02-01 the stub raises."""
+def test_on_pre_llm_call_stub_returns_none() -> None:
+    """Issue 02-07 demotes the stub from ``NotImplementedError`` to no-op.
+
+    The hook must be callable without raising so :func:`register` can
+    wire it via ``ctx.register_hook("pre_llm_call", engine._on_pre_llm_call)``
+    without the agent loop crashing every turn. Per Hermes's hook
+    contract (``hermes_cli/plugins.py:1218-1232``) a ``None`` return is
+    a valid observer-only result that leaves the user message
+    unchanged. Epic 03 replaces this body with the real
+    ``LOSSLESS_RECALL_POLICY_PROMPT`` injection per ADR-014.
+    """
     engine = LCMEngine()
 
-    async def _exercise() -> None:
-        await engine._on_pre_llm_call(session_id="sess-1", conversation_history=[])
+    async def _exercise() -> Any:
+        return await engine._on_pre_llm_call(session_id="sess-1", conversation_history=[])
 
-    with pytest.raises(NotImplementedError, match=r"Epic 03"):
-        asyncio.run(_exercise())
+    result = asyncio.run(_exercise())
+    assert result is None
 
 
 # ---------------------------------------------------------------------------

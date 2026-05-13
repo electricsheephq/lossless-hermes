@@ -10,6 +10,15 @@ seam). Maps to ``engine.ts`` ``assemble`` cluster (the ContextAssembler
 collaborator and the LCM ``pre_llm_call`` always-on substitution per
 ADR-010).
 
+**Issue 02-07** demotes the ``_on_pre_llm_call`` stub from
+:class:`NotImplementedError` to a silent no-op returning ``None`` so
+that :func:`lossless_hermes.register` can wire it as a Hermes
+``pre_llm_call`` hook callback without the agent loop crashing on every
+turn. Per Hermes's hook contract (``hermes_cli/plugins.py``), a ``None``
+return is a valid observer-only result that leaves the user message
+unchanged; Epic 03 replaces the body with the real
+``LOSSLESS_RECALL_POLICY_PROMPT`` injection per ADR-014.
+
 Mixin contract (per ADR-027 §Consequences "All state lives on the shell
 class"):
 
@@ -23,26 +32,38 @@ class"):
 
 See:
 
+* ``docs/adr/010-always-on-assembly-emulation.md`` — the
+  ``pre_llm_call`` substitution seam that fills this stub in Epic 03.
+* ``docs/adr/014-recall-policy-injection.md`` — user-message-position
+  injection of the policy text (preserves Anthropic prompt cache).
 * ``docs/adr/024-project-layout.md`` — engine/ package placement.
 * ``docs/adr/027-engine-splitting.md`` — mixin pattern decisions.
-* ``docs/adr/010-always-on-assembly-emulation.md`` — the
-  ``pre_llm_call`` substitution seam that fills these stubs in Epic 03.
 * ``docs/porting-guides/engine.md`` §"assemble" + §"Always-on assembly
   problem" — TS algorithm + Python adaptation.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     pass
 
 
+logger = logging.getLogger("lossless_hermes.engine.assemble")
+
+
 class _AssembleMixin:
     """Per-turn assembly + ``safe_fallback`` handlers for :class:`LCMEngine`.
 
-    Skeleton at 02-01 — bodies land in Epic 03 (assemble seam).
+    Skeleton at 02-01 — bodies land in Epic 03 (assemble seam). At 02-07
+    the ``_on_pre_llm_call`` stub is demoted from
+    :class:`NotImplementedError` to a no-op returning ``None`` so
+    :func:`register` can actually wire it through
+    ``ctx.register_hook("pre_llm_call", ...)`` without the agent loop
+    crashing every turn.
+
     Maps to engine.ts ``assemble`` cluster + the ``pre_llm_call``
     substitution hook per ADR-010.
 
@@ -53,25 +74,58 @@ class _AssembleMixin:
 
     async def _on_pre_llm_call(
         self,
-        session_id: str,
-        conversation_history: List[Dict[str, Any]],
+        session_id: str = "",
+        user_message: Any = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        is_first_turn: bool = False,
+        model: str = "",
+        platform: str = "",
+        sender_id: str = "",
         **kwargs: Any,
-    ) -> List[Dict[str, Any]]:
-        """``pre_llm_call`` Hermes hook — always-on assembly substitution. Body lands in Epic 03.
+    ) -> None:
+        """``pre_llm_call`` Hermes hook — recall-policy injection (Epic 03).
 
-        Per ADR-010: every turn the engine rewrites the prompt message
-        list from the DAG via the assembler. Returns the assembled
-        message list to substitute into the LLM call.
+        Per ADR-014: every user turn the engine returns a dict
+        ``{"context": <reworded LOSSLESS_RECALL_POLICY_PROMPT>}`` whose
+        text Hermes appends to the current turn's user message (NOT the
+        system prompt, to preserve the Anthropic prompt cache).
+
+        At 02-07 the body is a no-op returning ``None`` so
+        :func:`register` can wire it via
+        ``ctx.register_hook("pre_llm_call", ...)`` without the agent
+        loop crashing every turn. Per Hermes's hook contract
+        (``hermes_cli/plugins.py:1218-1232``) a ``None`` return is a
+        valid observer-only result that leaves the user message
+        unchanged. The kwargs shape matches the ``pre_llm_call``
+        signature in ``docs/reference/hermes-hooks.md`` line 91 — every
+        documented kwarg is accepted and no exception fires.
 
         Args:
             session_id: The Hermes session identifier.
-            conversation_history: Full message history snapshot.
+            user_message: The raw original user message (string or dict).
+            conversation_history: Full message history snapshot. ``None``
+                is tolerated for forward-compat / partial-kwarg callers.
+            is_first_turn: Whether this is the first turn of the
+                conversation.
+            model: The LLM model id.
+            platform: The provider platform string.
+            sender_id: Gateway platform user id (empty in CLI).
             **kwargs: Forward-compat for future hook signature additions.
 
         Returns:
-            The assembled (per-turn-substituted) message list.
-
-        Raises:
-            NotImplementedError: Always at 02-01; body lands in Epic 03.
+            ``None`` at 02-07 (no-op); Epic 03 returns
+            ``{"context": <policy text>}`` per ADR-014.
         """
-        raise NotImplementedError("_on_pre_llm_call lands in Epic 03 (assemble seam)")
+        # No-op stub. Epic 03 replaces this body with the real recall-
+        # policy injection (returning ``{"context": ...}``). The debug
+        # log gives an operator scanning logs a breadcrumb that the hook
+        # fired with the expected kwargs.
+        history_len = len(conversation_history) if conversation_history else 0
+        logger.debug(
+            "[lcm] pre_llm_call session=%s history_len=%d first_turn=%s "
+            "(Epic 03 will inject recall-policy)",
+            session_id,
+            history_len,
+            is_first_turn,
+        )
+        return None
