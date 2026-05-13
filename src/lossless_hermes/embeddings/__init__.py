@@ -10,8 +10,10 @@ This package owns LCM's semantic-recall plumbing:
   ``lossless-claw/src/embeddings/store.ts``.
 * (Future) ``backfill.py`` — cron-driven backfill of unembedded leaves
   (issue 05-07).
-* (Future) ``semantic_search.py`` — KNN retrieval surface that calls into
-  :func:`store.search_similar` (issue 05-08).
+* :mod:`lossless_hermes.embeddings.semantic_search` — KNN retrieval surface
+  that calls into :func:`store.search_similar`, embeds the query through
+  Voyage, JOINs back to ``summaries``, and exposes cosine-similarity bands.
+  Port of ``lossless-claw/src/embeddings/semantic-search.ts``.
 
 The Voyage HTTP client lives in :mod:`lossless_hermes.voyage`, not here —
 the embeddings store consumes vectors from any source and is intentionally
@@ -26,6 +28,18 @@ See:
 
 from __future__ import annotations
 
+from lossless_hermes.embeddings.semantic_search import (
+    COSINE_BAND_HIGH,
+    COSINE_BAND_LOW,
+    COSINE_BAND_MEDIUM,
+    ConfidenceBand,
+    EmbeddingProfile,
+    SemanticHit,
+    SemanticSearchResult,
+    SemanticSearchUnavailableError,
+    get_active_embedding_model,
+    run_semantic_search,
+)
 from lossless_hermes.embeddings.store import (
     EmbeddedKind,
     SearchHit,
@@ -44,18 +58,28 @@ from lossless_hermes.embeddings.store import (
 )
 
 __all__ = [
+    "COSINE_BAND_HIGH",
+    "COSINE_BAND_LOW",
+    "COSINE_BAND_MEDIUM",
+    "ConfidenceBand",
     "EmbeddedKind",
+    "EmbeddingProfile",
     "SearchHit",
     "SearchSimilarOptions",
+    "SemanticHit",
+    "SemanticSearchResult",
+    "SemanticSearchUnavailableError",
     "delete_embedding",
     "drop_embeddings_triggers",
     "embeddings_table_exists",
     "embeddings_table_name",
     "ensure_embeddings_table",
+    "get_active_embedding_model",
     "is_embedded",
     "mark_embedding_suppressed",
     "record_embedding",
     "register_embedding_profile",
     "replace_embedding",
+    "run_semantic_search",
     "search_similar",
 ]
