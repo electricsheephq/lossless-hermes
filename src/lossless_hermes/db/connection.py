@@ -106,17 +106,18 @@ if TYPE_CHECKING:
     pass
 
 # Optional ``apsw`` dependency probe (ADR-004 §"apsw fallback is opt-in"; the
-# ``[apsw]`` extra is documented in pyproject.toml). Resolving at import time
-# keeps :func:`open_db` simple — no try/except wrapped around every fallback
-# call site, and ``HAS_APSW`` is also the boolean tests use to gate the
-# apsw-specific suite.
-try:
-    import apsw as _apsw
+# ``[apsw]`` extra is documented in pyproject.toml). We probe via
+# ``importlib.util.find_spec`` rather than ``import apsw`` so static type
+# checkers (``ty``) don't try to resolve the apsw module when the [apsw]
+# extra isn't installed — CI runs ``uv sync --locked --extra dev`` which
+# intentionally omits [apsw], and a top-level ``import apsw`` triggers
+# ``error[unresolved-import]`` even inside a try/except (resolution is
+# decoupled from runtime import in static analysis). The actual ``import
+# apsw`` happens lazily inside :func:`_open_with_apsw` where it's guarded
+# by ``HAS_APSW`` and the call site is annotated for ty.
+import importlib.util
 
-    HAS_APSW: bool = True
-except ImportError:  # pragma: no cover - extra is opt-in
-    _apsw = None  # type: ignore[assignment]
-    HAS_APSW = False
+HAS_APSW: bool = importlib.util.find_spec("apsw") is not None
 
 __all__ = [
     "HAS_APSW",
@@ -855,13 +856,25 @@ def _open_with_apsw(path: Union[str, Path], role: DbRole) -> Connection:
             stdlib path's :class:`OperationalError` already triggered the
             fallback, so an apsw-side failure is a real configuration error.
     """
-    if not HAS_APSW or _apsw is None:
+    if not HAS_APSW:
         raise ImportError(
             "lossless-hermes: apsw fallback requested but the [apsw] extra "
             "is not installed. Re-install with "
             "`pip install lossless-hermes[apsw]` to enable the apsw driver. "
             "(See ADR-004 §'apsw fallback is opt-in'.)"
         )
+
+    # Lazy import — ``apsw`` is an optional extra and may not be on the
+    # import path in CI (the [apsw] extra is opt-in per ADR-005). We use
+    # :func:`importlib.import_module` rather than ``import apsw`` so static
+    # type checkers (``ty``) don't try to resolve the module when [apsw]
+    # isn't installed; the dynamic call yields ``Any``, which is the
+    # right shape here because the caller-facing API is the
+    # :class:`_ApswConnectionAdapter` wrapper (the apsw-specific type
+    # never leaks past this helper). ``HAS_APSW`` was probed via
+    # :func:`importlib.util.find_spec` at module load (see top of file)
+    # so this branch is only reached when apsw IS importable.
+    _apsw = importlib.import_module("apsw")
 
     path_str = str(path) if isinstance(path, Path) else path
 

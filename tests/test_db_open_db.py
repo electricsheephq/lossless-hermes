@@ -500,9 +500,11 @@ class TestApswFallbackWithoutExtra:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # Force HAS_APSW=False even if the extra is installed in the
-        # test env — exercises the import-error branch.
+        # test env — exercises the import-error branch. (As of the
+        # ty-CI fix-forward, ``_apsw`` is no longer a module-level
+        # binding; the function lazy-imports via ``importlib`` inside
+        # the helper, gated on ``HAS_APSW``.)
         monkeypatch.setattr(connection_mod, "HAS_APSW", False)
-        monkeypatch.setattr(connection_mod, "_apsw", None)
 
         with pytest.raises(ImportError, match=r"\[apsw\]"):
             connection_mod._open_with_apsw(tmp_path / "x.db", "gateway")
