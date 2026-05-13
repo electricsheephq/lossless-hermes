@@ -658,6 +658,30 @@ class LcmConfig(BaseModel):
     # --- Worker placeholder (Epic 02) ---
     workers: dict[str, WorkerConfig] = Field(default_factory=dict)
 
+    # --- Experimental flags (ADR-010 §"Path 2") --------------------------------
+    # Per ADR-010, when the upstream Hermes ``preassemble`` ABC method
+    # (PR #24949) is NOT yet merged, lossless-hermes can opt into a
+    # **fallback** always-on substitution path that forces
+    # ``should_compress`` to return ``True`` every turn and runs the
+    # assembler from inside ``compress()``. This routes through
+    # ``run_agent.py:10264`` which REPLACES the live message list — the
+    # substitution semantic LCM needs, with the cost that the Hermes
+    # ``_compress_context`` side-effects fire every turn (session-ID
+    # rotation, memory provider re-extraction, compression-count warning,
+    # log spam — full list in spike-002 + ADR-010 §"Option A").
+    #
+    # This flag is **gated OFF by default**. Operators who explicitly
+    # want validation-only always-on assembly (e.g. for cache-hit
+    # benchmarks during Phase 2) flip it to ``True`` in
+    # ``$HERMES_HOME/config.yaml`` and accept the documented breakage.
+    #
+    # Once PR #24949 merges, this flag becomes dead code (Hermes-side
+    # ``preassemble`` ABC method takes precedence) and a future minor
+    # release removes the field entirely. Until then, the field provides
+    # an escape hatch for validation work without committing
+    # production-mode users to the broken behavior.
+    experimental_always_on_via_compress: bool = False
+
 
 # ---------------------------------------------------------------------------
 # State-dir resolvers
@@ -1587,6 +1611,17 @@ def resolve_lcm_config_with_diagnostics(
             "max": resolved_dynamic_max,
         },
         "voyage_api_key": _to_str(pc.get("voyageApiKey")) or _to_str(pc.get("voyage_api_key")),
+        # Issue 03-09 — ADR-010 Option A experimental fallback. Resolver
+        # accepts both snake_case + camelCase from YAML; bool coercion
+        # via :func:`_to_bool` (recognises "true"/"True"/"1" strings).
+        "experimental_always_on_via_compress": _to_bool(
+            _pc_get(
+                pc,
+                "experimentalAlwaysOnViaCompress",
+                "experimental_always_on_via_compress",
+            )
+        )
+        or False,
     }
 
     # Coerce floats that should be ints for the typed model.
@@ -1819,6 +1854,8 @@ _RECOGNIZED_PLUGIN_CONFIG_KEYS: frozenset[str] = frozenset({
     "dynamic_leaf_chunk_tokens",
     "voyage_api_key",
     "workers",
+    # Issue 03-09 — ADR-010 Option A experimental fallback
+    "experimental_always_on_via_compress",
     # TS camelCase aliases (accepted for JSON-from-disk round-tripping)
     "databasePath",
     "dbPath",
@@ -1865,6 +1902,8 @@ _RECOGNIZED_PLUGIN_CONFIG_KEYS: frozenset[str] = frozenset({
     "cacheAwareCompaction",
     "dynamicLeafChunkTokens",
     "voyageApiKey",
+    # Issue 03-09 — ADR-010 Option A experimental fallback (camelCase alias)
+    "experimentalAlwaysOnViaCompress",
 })
 
 
