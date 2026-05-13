@@ -29,6 +29,13 @@ pieces ported in epic 07:
   pass-strategy table under stable names and exposes a public
   :func:`pick_synthesis_model` wrapper over dispatch's private
   ``_pick_model``.
+* ``invalidation`` (issue 07-07) — best-effort
+  :func:`record_cache_leaf_refs` populate + caller-owned-tx
+  :func:`invalidate_caches_for_suppressed_leaves` DELETE for the
+  :sql:`lcm_cache_leaf_refs` inverse index. Closes the soft-purge leak
+  (Final.review.3 Loop 2 Leak 2.5) where ``ON DELETE CASCADE`` did not
+  fire on the ``UPDATE suppressed_at`` write, so post-suppression cache
+  reads could surface PII baked in before suppression.
 
 Issue 07-09 (audit) builds on this foundation. The TS canonical source
 (commit ``1f07fbd`` on branch ``pr-613``) is
@@ -64,6 +71,10 @@ from lossless_hermes.synthesis.dispatch import (
     SynthesizeResult,
     TierLabel,
     dispatch_synthesis,
+)
+from lossless_hermes.synthesis.invalidation import (
+    invalidate_caches_for_suppressed_leaves,
+    record_cache_leaf_refs,
 )
 from lossless_hermes.synthesis.prompt_registry import (
     PromptRegistryError,
@@ -131,10 +142,12 @@ __all__ = [
     "get_active_prompt",
     "get_prompt_by_id",
     "insert_cache_row_single_flight",
+    "invalidate_caches_for_suppressed_leaves",
     "leaf_fingerprint",
     "list_active_prompts",
     "lookup_cache_row",
     "pick_synthesis_model",
+    "record_cache_leaf_refs",
     "register_prompt",
     "resolve_default_model_from_env",
     "resolve_session_key",
