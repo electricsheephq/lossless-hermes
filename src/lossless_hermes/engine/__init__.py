@@ -67,8 +67,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.hermes_bridge import ContextEngine
@@ -271,6 +272,21 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # the engine has already ingested. ``_on_post_llm_call`` diffs
         # ``conversation_history[idx:]`` against this on each turn.
         self._last_seen_message_idx: Dict[str, int] = {}
+
+        # ``_compression_history`` — bounded deque of (before_tokens,
+        # after_tokens) tuples, one entry per ``compress()`` call.
+        # Consumed by ``should_compress`` (in :class:`_CompactMixin`) for
+        # the anti-thrashing gate: when the most recent
+        # ``INEFFECTIVE_RUN_LENGTH`` entries are all ineffective (saved
+        # <10% of pre-compression tokens), ``should_compress`` returns
+        # False even at over-threshold prompt_tokens to break the
+        # hot-loop. ``maxlen`` is generously sized — we only ever
+        # inspect the tail, so a small ring keeps memory bounded and
+        # keeps a debugging breadcrumb. Hermes parity:
+        # ``context_compressor.py`` tracks ``_ineffective_compression_count``
+        # as a single counter; we keep a deque so Epic 04's real
+        # algorithm has a debugging-friendly window to consult.
+        self._compression_history: Deque[Tuple[int, int]] = deque(maxlen=16)
 
         # ------------------------------------------------------------------
         # Token-state attributes inherited from the ABC (run_agent.py reads
