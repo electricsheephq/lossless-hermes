@@ -273,7 +273,7 @@ def _estimate_tokens(text: str) -> int:
         # PR #35 (port/03-01-token-estimator) lands the canonical port.
         # Until it merges to main this import resolves on the dev tree
         # (PR #35's branch checkout) and falls through on main.
-        from lossless_hermes.estimate_tokens import (  # ty: ignore[unresolved-import]
+        from lossless_hermes.estimate_tokens import (
             estimate_tokens,
         )
 
