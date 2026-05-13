@@ -70,11 +70,19 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import secrets
 import sqlite3
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from lossless_hermes.synthesis.audit import (
+    AuditCompletedResult,
+    AuditInsertContext,
+    generate_audit_id,
+    insert_audit_started,
+    truncate_for_audit,
+    update_audit_completed,
+    update_audit_failed,
+)
 from lossless_hermes.synthesis.prompt_registry import get_active_prompt
 from lossless_hermes.synthesis.types import MemoryType, PassKind, PromptRecord
 
@@ -689,7 +697,7 @@ class SynthesisDispatcher:
            telemetry.
         """
 
-        audit_id = f"audit_{audit.pass_session_id}_{audit.prompt_id[-6:]}_{_random_suffix()}"
+        audit_id = generate_audit_id()
         # LCM Wave-9 Group D adversarial Gap 4 (2026-03-08): wrap insert
         # in try/except so FK violations (bad target_summary_id) and
         # CHECK violations surface as typed SynthesisDispatchError
@@ -698,19 +706,20 @@ class SynthesisDispatcher:
         # the caller the LLM was never called.
         # Original: lossless-claw/src/synthesis/dispatch.ts:401-420.
         try:
-            _insert_audit_row(
+            insert_audit_started(
                 self._db,
-                audit_id=audit_id,
-                pass_session_id=audit.pass_session_id,
-                target_summary_id=audit.target_summary_id,
-                target_cache_id=audit.target_cache_id,
-                prompt_id=audit.prompt_id,
-                pass_kind=llm_args.pass_kind,
-                pass_input_truncated=_truncate_for_audit(audit.pass_input_for_audit),
-                status="started",
-                model_used=llm_args.model,
+                audit_id,
+                AuditInsertContext(
+                    pass_session_id=audit.pass_session_id,
+                    target_summary_id=audit.target_summary_id,
+                    target_cache_id=audit.target_cache_id,
+                    prompt_id=audit.prompt_id,
+                    pass_kind=llm_args.pass_kind,
+                    pass_input_truncated=truncate_for_audit(audit.pass_input_for_audit),
+                    model_used=llm_args.model,
+                ),
             )
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.DatabaseError, ValueError) as exc:
             raise SynthesisDispatchError(
                 "audit_insert_failure",
                 f"[synthesis.dispatch] failed to insert 'started' audit row "
@@ -720,12 +729,7 @@ class SynthesisDispatcher:
         try:
             result = await self._llm_call(llm_args)
         except Exception as exc:  # noqa: BLE001 — vendor-specific exceptions vary
-            _update_audit_row(
-                self._db,
-                audit_id,
-                status="failed",
-                last_error=str(exc),
-            )
+            update_audit_failed(self._db, audit_id, str(exc))
             raise SynthesisDispatchError(
                 "llm_failure",
                 f"[synthesis.dispatch] LLM call failed for pass {llm_args.pass_kind}: {exc}",
@@ -734,14 +738,15 @@ class SynthesisDispatcher:
         # LCM Wave-9 (2026-03-08): pass_output truncated to 8000 chars
         # with "…(truncated)" marker. Full outputs are not retained.
         # Original: lossless-claw/src/synthesis/dispatch.ts:440.
-        _update_audit_row(
+        update_audit_completed(
             self._db,
             audit_id,
-            status="completed",
-            pass_output=_truncate_for_audit(result.output),
-            model_used=result.actual_model or llm_args.model,
-            latency_ms=round(result.latency_ms),
-            cost_cents=(round(result.cost_cents) if result.cost_cents is not None else None),
+            AuditCompletedResult(
+                pass_output=truncate_for_audit(result.output),
+                model_used=result.actual_model or llm_args.model,
+                latency_ms=round(result.latency_ms),
+                cost_cents=(round(result.cost_cents) if result.cost_cents is not None else None),
+            ),
         )
 
         return _PassResult(
@@ -1191,146 +1196,19 @@ def _parse_judge_output(output: str, n: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Audit row writes
+# Audit row writes + ID generation
 # ---------------------------------------------------------------------------
-
-
-def _insert_audit_row(
-    db: sqlite3.Connection,
-    *,
-    audit_id: str,
-    pass_session_id: str,
-    target_summary_id: str | None,
-    target_cache_id: str | None,
-    prompt_id: str,
-    pass_kind: PassKind,
-    pass_input_truncated: str,
-    status: Literal["started", "completed", "failed"],
-    model_used: str,
-) -> None:
-    """Insert the ``'started'`` audit row.
-
-    LCM Wave-9 (2026-03-08) audit insert BEFORE LLM call, UPDATE to
-    ``completed`` / ``failed`` after. Forensic record survives crash
-    between call and ack.
-    Original: ``lossless-claw/src/synthesis/dispatch.ts:402``.
-    """
-
-    db.execute(
-        "INSERT INTO lcm_synthesis_audit"
-        " (audit_id, pass_session_id, target_summary_id, target_cache_id, prompt_id,"
-        "  pass_kind, pass_input_truncated, status, model_used)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            audit_id,
-            pass_session_id,
-            target_summary_id,
-            target_cache_id,
-            prompt_id,
-            pass_kind,
-            pass_input_truncated,
-            status,
-            model_used,
-        ),
-    )
-
-
-def _update_audit_row(
-    db: sqlite3.Connection,
-    audit_id: str,
-    *,
-    status: Literal["started", "completed", "failed"] | None = None,
-    pass_output: str | None = None,
-    model_used: str | None = None,
-    latency_ms: int | None = None,
-    cost_cents: int | None = None,
-    last_error: str | None = None,
-) -> None:
-    """Update an audit row in place.
-
-    Builds a dynamic ``SET`` clause from the non-``None`` kwargs. If no
-    kwargs are set, the call is a no-op.
-
-    Mirrors the TS ``updateAuditRow`` at ``dispatch.ts:491-536``.
-    """
-
-    sets: list[str] = []
-    args: list[str | int] = []
-    if status is not None:
-        sets.append("status = ?")
-        args.append(status)
-    if pass_output is not None:
-        sets.append("pass_output = ?")
-        args.append(pass_output)
-    if model_used is not None:
-        sets.append("model_used = ?")
-        args.append(model_used)
-    if latency_ms is not None:
-        sets.append("latency_ms = ?")
-        args.append(latency_ms)
-    if cost_cents is not None:
-        sets.append("cost_usd_cents = ?")
-        args.append(cost_cents)
-    if last_error is not None:
-        sets.append("last_error = ?")
-        args.append(last_error)
-    if not sets:
-        return
-    args.append(audit_id)
-    db.execute(
-        f"UPDATE lcm_synthesis_audit SET {', '.join(sets)} WHERE audit_id = ?",
-        args,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Misc helpers
-# ---------------------------------------------------------------------------
-
-
-#: Audit-row text-field hard cap (chars). Pass inputs + outputs longer
-#: than this are truncated with a ``"…(truncated)"`` marker. Full inputs
-#: / outputs are NOT retained on the audit row.
-#:
-#: TS source: ``dispatch.ts:809-810`` (``maxLen = 8000``).
-_AUDIT_MAX_LEN: int = 8000
-
-_AUDIT_TRUNCATED_MARKER: str = "…(truncated)"
-
-
-def _truncate_for_audit(s: str, max_len: int = _AUDIT_MAX_LEN) -> str:
-    """Truncate a string to ``max_len`` chars with ``"…(truncated)"`` marker.
-
-    Used by both pass_input + pass_output recording. Full inputs / outputs
-    are not retained.
-
-    Mirrors the TS ``truncateForAudit`` at ``dispatch.ts:809-811``.
-
-    Args:
-        s: The string to truncate.
-        max_len: Cap length. Default :data:`_AUDIT_MAX_LEN` (8000 chars).
-
-    Returns:
-        Either ``s`` unchanged (if shorter than ``max_len``) or
-        ``s[:max_len] + "…(truncated)"``.
-    """
-
-    if len(s) > max_len:
-        return s[:max_len] + _AUDIT_TRUNCATED_MARKER
-    return s
-
-
-def _random_suffix() -> str:
-    """Return a 6-hex-char random suffix for audit-row IDs.
-
-    ~24 bits of entropy from :func:`secrets.token_hex`. Used in
-    ``audit_<pass_session_id>_<prompt_id[-6:]>_<suffix>`` IDs so
-    concurrent dispatches within the same pass_session don't collide
-    on PK.
-
-    Mirrors the TS ``randomSuffix`` at ``dispatch.ts:813-817``. The TS
-    version uses ``Math.random()``; we use :func:`secrets.token_hex` for
-    cryptographic quality (no downside, no extra cost).
-    """
-
-    return secrets.token_hex(3)
+#
+# Audit-row INSERT / UPDATE / retention-sweep helpers live in the
+# dedicated :mod:`lossless_hermes.synthesis.audit` module (issue 07-09):
+#
+# * :func:`audit.insert_audit_started` — wrap-and-call lifecycle insert
+# * :func:`audit.update_audit_completed` — post-success UPDATE
+# * :func:`audit.update_audit_failed` — post-failure UPDATE
+# * :func:`audit.sweep_orphan_audit_starts` — orphan ``'started'`` GC
+# * :func:`audit.sweep_terminal_audit_rows` — 30-day terminal-row GC
+# * :func:`audit.generate_audit_id` — ``aud_<6 hex>`` PK
+# * :func:`audit.truncate_for_audit` — 8000-char cap with marker
+#
+# The dispatcher delegates to those functions inside
+# :meth:`SynthesisDispatcher._run_pass_with_audit` (see imports at top).
