@@ -111,11 +111,30 @@ def test_register_calls_register_context_engine_once(hermes_available: None) -> 
     assert engine_arg.name == "lcm"
 
 
-def test_register_does_not_call_register_hook_at_v0(hermes_available: None) -> None:
-    """AC line 40: hooks are deferred to Epic 03 — v0 must not register them."""
+def test_register_wires_all_four_hermes_hooks(hermes_available: None) -> None:
+    """Issue 02-07 AC: ``register(ctx)`` calls ``ctx.register_hook`` exactly
+    four times — once for each of ``post_llm_call``, ``pre_llm_call``,
+    ``on_session_end``, ``subagent_stop`` — per the "Where LCM hooks land"
+    table in ``docs/reference/hermes-hooks.md`` lines 322–334.
+
+    Supersedes the v0 (00-06) assertion that ``register_hook`` was NOT
+    called. The hook bodies themselves are no-op stubs at 02-07 (Epic
+    03 fills the ingest / assemble bodies; Epic 06 wires
+    subagent_stop's real behavior).
+    """
     ctx = _make_stub_ctx()
     register(ctx)
-    ctx.register_hook.assert_not_called()
+    assert ctx.register_hook.call_count == 4, (
+        f"expected register_hook called 4 times, got "
+        f"{ctx.register_hook.call_count}: {ctx.register_hook.call_args_list}"
+    )
+    hook_names = [call.args[0] for call in ctx.register_hook.call_args_list]
+    assert set(hook_names) == {
+        "post_llm_call",
+        "pre_llm_call",
+        "on_session_end",
+        "subagent_stop",
+    }, f"unexpected hook names registered: {hook_names}"
 
 
 def test_register_calls_register_command_for_lcm(hermes_available: None) -> None:
