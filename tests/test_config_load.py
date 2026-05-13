@@ -144,9 +144,7 @@ def test_unknown_key_raises_validation_error(tmp_path: Path) -> None:
     assert "totally_made_up_knob" in str(exc.value)
 
 
-def test_env_var_interpolation_when_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_env_var_interpolation_when_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``${HERMES_TEST_VAR}`` in YAML body is expanded against ``os.environ``.
 
     Issue #00-07 AC: "${HERMES_TEST_VAR} in YAML body is interpolated
@@ -214,9 +212,7 @@ def test_env_var_interpolation_unresolved_var_is_kept_verbatim(
 # ---------------------------------------------------------------------------
 
 
-def test_default_path_uses_hermes_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_default_path_uses_hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """When ``path`` is ``None``, the loader reads ``$HERMES_HOME/config.yaml``.
 
     Pin the default-path resolution contract: the loader must respect
