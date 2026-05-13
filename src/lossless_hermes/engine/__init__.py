@@ -1,34 +1,41 @@
-"""LCMEngine — Lossless Context Management engine class shell.
+"""LCMEngine — Lossless Context Management engine shell.
 
-This is the v0 skeleton: a no-op ``ContextEngine`` subclass that satisfies
-the Hermes ABC contract but does **no actual context management**. Every
-ABC method is either:
+This package hosts the :class:`LCMEngine` class shell that composes four
+mixins per ADR-027 §Decision "Package structure":
 
-* a **passthrough no-op** (``compress`` returns ``messages`` unchanged,
-  ``should_compress`` returns ``False``, ``update_from_response`` records
-  the token state but takes no other action), or
-* a **stub that raises** :class:`NotImplementedError` with a message naming
-  the epic that fills it in (``on_session_start``, ``on_session_end``,
-  ``on_session_reset``, ``handle_tool_call``).
+* :class:`_LifecycleMixin` (``lifecycle.py``) — ``on_session_start`` /
+  ``on_session_end`` / ``on_session_reset``.
+* :class:`_CompactMixin` (``compact.py``) — ``compress`` overflow-recovery
+  + state-machine helpers.
+* :class:`_AssembleMixin` (``assemble.py``) — per-turn assembly
+  substitution.
+* :class:`_IngestMixin` (``ingest.py``) — ``post_llm_call`` diff-ingest.
 
-The class shell + state initialization + per-method docstrings establish
-the call surface every later epic will fill in. Real ingest, assembly,
-and compaction land in Epics 02–04.
+Per ADR-027 §Consequences:
 
-### Why subclass via ``hermes_bridge``
+* **All state lives on this shell class.** Mixin methods read/write
+  ``self._db``, ``self._conversation_store``, ``self._session_locks``
+  etc. — every state attribute is declared in :meth:`__init__` here.
+* **No mixin owns state.** Mixin files contain methods only; the shell
+  class is the single state-creation site.
+* **No cross-mixin imports.** Mixin methods that need behavior owned
+  by a sibling mixin call ``self.<method>`` — MRO resolves to the
+  appropriate :class:`_FooMixin` body.
 
-We import ``ContextEngine`` from :mod:`lossless_hermes.hermes_bridge`, NOT
-directly from ``agent.context_engine``. Per ADR-024 §"Hermes bridge", all
-Hermes-side imports flow through ``hermes_bridge`` so future ABC churn
-touches one file, not 50. In a Hermes-less env (CI, dev installs without
-Hermes on the path) the bridge re-exports a stub class — see
-:mod:`lossless_hermes.hermes_bridge` for the import-time fallback.
+At **issue 02-01** this file is the wired-but-skeleton shell:
 
-### Why a no-op for v0
-
-ADR-001 §Consequences mandates: "Heavy init (DB open, migration ladder
-run) belongs in ``ContextEngine.on_session_start``, not in ``register()``".
-The v0 skeleton honors that — ``__init__`` only stores constructor args.
+* The four mixins are imported and composed in :class:`LCMEngine`'s
+  bases tuple. Their bodies are stubs (mostly :class:`NotImplementedError`)
+  that subsequent Epic 02–04 issues fill in.
+* :meth:`__init__` instantiates state fields. Following the 00-06
+  invariant (and ADR-001 §Consequences "heavy init belongs in
+  ``ContextEngine.on_session_start``"), the constructor does NOT open
+  the SQLite DB or run migrations — those land in 02-03
+  (``on_session_start``). Store attributes default to ``None``; 02-03
+  populates them.
+* :meth:`compress` and :meth:`should_compress` retain the 00-06 no-op
+  bodies via :class:`_CompactMixin` (passthrough; ``False``). Epic 04
+  replaces those with the real compaction algorithm.
 
 ### Apple system Python guard
 
@@ -38,41 +45,48 @@ Per ADR-004 §Consequences, sqlite-vec loading requires
 ``actions/setup-python``'s macOS builds) ship without.
 
 The guard helper :func:`_check_sqlite_extension_loading` is deliberately
-**not** wired into :meth:`LCMEngine.__init__` at v0 — there is no DB
-open attempt at v0 (heavy init defers to :meth:`on_session_start` per
-ADR-001 §Consequences). Firing the guard at construction time would
+**not** wired into :meth:`LCMEngine.__init__` — there is no DB open
+attempt in ``__init__`` (heavy init defers to :meth:`on_session_start`
+per ADR-001 §Consequences). Firing the guard at construction time would
 block legitimate Python installations from importing the package even
 though no DB ever opens. Instead, the guard is exposed for the future
-:meth:`on_session_start` implementation (Epic 02) to call before its
-first ``open_lcm_db()`` invocation. ADR-004 §Consequences spec
-("before any DB open attempt") is satisfied because v0 has no DB open
-attempt at all.
-
-The helper is independently unit-tested via
-:func:`_has_sqlite_extension_loading` (the introspection hook tests can
-monkey-patch — ``sqlite3.Connection`` is C-immutable).
+:meth:`on_session_start` body (issue 02-03) to call before its first
+``open_lcm_db()`` invocation.
 
 See:
 
 * ``docs/adr/001-plugin-distribution-model.md`` — entry-point contract.
+* ``docs/adr/004-sqlite-vec-distribution.md`` — sqlite extension guard.
 * ``docs/adr/007-hermes-as-dependency.md`` — Hermes-less env story.
 * ``docs/adr/024-project-layout.md`` — engine/ package placement.
-* ``docs/adr/027-engine-splitting.md`` — sub-module split (deferred to
-  Epic 02; for v0, the full shell lives in this single file).
-* ``docs/porting-guides/engine.md`` — full port plan (this issue ships
-  only step 1: the no-op skeleton).
+* ``docs/adr/027-engine-splitting.md`` — mixin pattern decisions.
+* ``docs/porting-guides/engine.md`` — full engine port plan.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.hermes_bridge import ContextEngine
+from lossless_hermes.store.compaction_maintenance import CompactionMaintenanceStore
+from lossless_hermes.store.compaction_telemetry import CompactionTelemetryStore
+from lossless_hermes.store.conversation import ConversationStore
+from lossless_hermes.store.summary import SummaryStore
+
+from .assemble import _AssembleMixin
+from .compact import _CompactMixin
+from .ingest import _IngestMixin
+from .lifecycle import _LifecycleMixin
 
 __all__ = ["APPLE_SYSTEM_PYTHON_MSG", "LCMEngine"]
+
+logger = logging.getLogger("lossless_hermes.engine")
 
 
 # ---------------------------------------------------------------------------
@@ -115,36 +129,43 @@ def _check_sqlite_extension_loading() -> None:
 
 
 # ---------------------------------------------------------------------------
-# LCMEngine — v0 no-op shell
+# LCMEngine — shell class composing the four mixins
 # ---------------------------------------------------------------------------
 
 
-class LCMEngine(ContextEngine):
-    """Lossless Context Management engine for Hermes (v0 no-op shell).
+class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, ContextEngine):
+    """Lossless Context Management engine for Hermes.
 
-    This is the **class skeleton** — every method is either a passthrough
-    or raises :class:`NotImplementedError` with the epic that will fill
-    it in. The shape is locked; the algorithm is deferred. Maps to
-    ``lossless-claw/src/engine.ts`` ``LcmContextEngine`` class.
+    Per ADR-027 §Decision, this is the **shell class** that composes
+    four mixins (lifecycle / compact / assemble / ingest). Every state
+    field is owned by this class (declared in :meth:`__init__`); mixin
+    methods exclusively read/write ``self.<state>``.
 
-    State is stored as plain instance attributes in :meth:`__init__`. No
-    DB connection is opened, no migration ladder runs, no background task
-    is started — those land in Epic 02 (engine skeleton fill-in).
+    MRO (Python C3 linearization, per ADR-027 §Decision):
+
+    ``LCMEngine -> _LifecycleMixin -> _CompactMixin -> _AssembleMixin
+    -> _IngestMixin -> ContextEngine -> object``
+
+    At issue 02-01 this is a skeleton: stores are ``None`` (instantiated
+    in 02-03's ``on_session_start``), the ingest/assemble/compact bodies
+    in the mixins are stubs (filled in Epic 03/04). The class still
+    satisfies the ABC contract — :meth:`compress` is a passthrough and
+    :meth:`should_compress` returns ``False``, both via :class:`_CompactMixin`.
+
+    Maps to ``lossless-claw/src/engine.ts`` ``LcmContextEngine`` class
+    declaration (line 1739) + constructor (lines 1808-1900).
 
     Attributes:
         hermes_home: Path to ``$HERMES_HOME`` (typically ``~/.hermes/``).
-            Per ADR-001, the engine takes Hermes-side path as a
-            constructor arg rather than computing it itself, so tests can
-            substitute a ``tmp_path``.
-        config: Validated :class:`LcmConfig` instance from
-            :func:`lossless_hermes.db.config.load_config`. Currently empty
-            at v0; each knob lands in a subsequent PR.
+            Per ADR-001, the engine takes the Hermes-side path as a
+            constructor arg rather than computing it itself, so tests
+            can substitute a ``tmp_path``.
+        config: Validated :class:`LcmConfig` instance.
 
     The ``name`` class attribute is the canonical engine selector — it
     matches ``context.engine: lcm`` in ``~/.hermes/config.yaml`` per
-    ADR-001 §Consequences "config.yaml must also set context.engine: lcm".
-    The string ``"lcm"`` is the entry-point binding the Hermes
-    plugin-selection ladder (run_agent.py:2256-2287) keys off.
+    ADR-001 §Consequences. The string ``"lcm"`` is the entry-point
+    binding the Hermes plugin-selection ladder keys off.
     """
 
     # ABC §Identity ----------------------------------------------------------
@@ -152,14 +173,14 @@ class LCMEngine(ContextEngine):
     # a class attribute satisfies the abstract requirement in Python (the
     # name is present on the class, which is all ``__init_subclass__``
     # checks for). Confirmed by Hermes's own ``ContextCompressor.name`` as
-    # a ``@property`` and a test stub (``tests/agent/test_context_engine.py``
-    # line 25) that uses a property — both work. Class attribute is the
-    # idiomatic choice when the value is a constant.
+    # a ``@property`` and the test stub in
+    # ``tests/agent/test_context_engine.py`` line 25 that uses a property —
+    # both work. Class attribute is the idiomatic choice when constant.
     name: str = "lcm"
 
     # ABC §Compaction parameters (inherited, can be overridden later) -------
-    # Keeping defaults from the ABC for v0. Epic 02 will override these
-    # from ``self.config`` once the config knobs land.
+    # Keeping defaults from the ABC for 02-01. Epic 02 fill-in issues
+    # override these from ``self.config`` once the config wiring lands.
     threshold_percent: float = 0.75
     protect_first_n: int = 3
     protect_last_n: int = 8  # LCM standard, override of ABC's default 6
@@ -169,10 +190,13 @@ class LCMEngine(ContextEngine):
         hermes_home: Optional[Path] = None,
         config: Optional[LcmConfig] = None,
     ) -> None:
-        """Initialize the no-op engine.
+        """Initialize the engine shell.
 
-        No DB connection, no migration run, no background task — heavy
-        init lands in :meth:`on_session_start` per ADR-001 §Consequences.
+        Per ADR-001 §Consequences "heavy init belongs in
+        ``ContextEngine.on_session_start``": no DB open, no migration
+        run, no background task. Store attributes default to ``None``;
+        :meth:`on_session_start` (issue 02-03) opens the DB and
+        instantiates them.
 
         Args:
             hermes_home: Path to ``$HERMES_HOME``. Defaults to ``None``;
@@ -196,24 +220,65 @@ class LCMEngine(ContextEngine):
         Note:
             The Apple-Python sqlite-extension-loading guard
             (:func:`_check_sqlite_extension_loading`) is **not** invoked
-            here at v0. There is no DB open attempt at v0 (heavy init
-            defers to :meth:`on_session_start`), so firing the guard
-            here would reject perfectly working Python installations
-            that simply cannot load extensions. Epic 02's
-            ``on_session_start`` body will call the guard before its
-            first ``open_lcm_db()`` invocation — matching ADR-004
-            §Consequences' "before any DB open attempt" requirement
-            literally.
+            here. There is no DB open attempt in ``__init__`` (heavy
+            init defers to :meth:`on_session_start` per ADR-001
+            §Consequences), so firing the guard here would reject
+            perfectly working Python installations that simply cannot
+            load extensions. Issue 02-03's ``on_session_start`` body
+            will call the guard before its first ``open_lcm_db()``
+            invocation — matching ADR-004 §Consequences' "before any DB
+            open attempt" requirement literally.
         """
+        # Constructor args
         self.hermes_home: Path = (
             Path(hermes_home) if hermes_home is not None else Path.home() / ".hermes"
         )
         self.config: LcmConfig = config if config is not None else LcmConfig()
 
-        # Token-state attributes inherited from the ABC (class-level
-        # defaults are 0). Re-declared here as instance attrs so the
-        # no-op ``update_from_response`` can write them without first
-        # falling back to the class default. ABC §"Token state" line 46-51.
+        # ------------------------------------------------------------------
+        # State fields — owned by shell, used by mixins (ADR-027 §Consequences)
+        # ------------------------------------------------------------------
+        # DB connection — opened in on_session_start (02-03). Typed as
+        # ``Optional[sqlite3.Connection]`` because pre-on_session_start
+        # callers see ``None``.
+        self._db: Optional[sqlite3.Connection] = None
+
+        # The four Epic-01 stores — instantiated in on_session_start
+        # (02-03) once ``self._db`` is open. Typed as Optional[...] so
+        # mixin methods can guard with ``if self._conversation_store is
+        # None: raise RuntimeError("on_session_start not yet called")``.
+        self._conversation_store: Optional[ConversationStore] = None
+        self._summary_store: Optional[SummaryStore] = None
+        self._telemetry_store: Optional[CompactionTelemetryStore] = None
+        self._maintenance_store: Optional[CompactionMaintenanceStore] = None
+
+        # Per-session asyncio locks — see ADR-018 §"Per-session queue".
+        # ``defaultdict`` so callers can ``async with self._session_locks
+        # [session_id]:`` without explicit setdefault. Note that
+        # ``defaultdict(asyncio.Lock)`` here constructs the lock lazily,
+        # in whatever event-loop happens to be running at first access —
+        # acceptable because the same loop services every turn.
+        # 02-08 may extend this with refcount + cleanup pass.
+        self._session_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+        # Circuit-breaker scaffold — body lands in 02-09. Keyed by
+        # session/provider scope; values are CircuitBreakerState records
+        # whose Python type lands with the body.
+        self._circuit_breakers: Dict[str, Any] = {}
+
+        # ``last_seen_message_idx`` for diff-based ingest (Epic 03).
+        # Keyed by session_id; value is the index of the last message
+        # the engine has already ingested. ``_on_post_llm_call`` diffs
+        # ``conversation_history[idx:]`` against this on each turn.
+        self._last_seen_message_idx: Dict[str, int] = {}
+
+        # ------------------------------------------------------------------
+        # Token-state attributes inherited from the ABC (run_agent.py reads
+        # these directly). Class-level defaults are 0; we re-declare as
+        # instance attrs so the no-op ``update_from_response`` can write
+        # them without first falling back to the class default.
+        # ABC §"Token state" line 46-51.
+        # ------------------------------------------------------------------
         self.last_prompt_tokens: int = 0
         self.last_completion_tokens: int = 0
         self.last_total_tokens: int = 0
@@ -221,21 +286,26 @@ class LCMEngine(ContextEngine):
         self.context_length: int = 0
         self.compression_count: int = 0
 
-    # ABC §Core interface ----------------------------------------------------
+    # ABC §Core interface -----------------------------------------------------
+    # ``compress`` and ``should_compress`` bodies live in :class:`_CompactMixin`
+    # (compact.py). At 02-01 those are no-op passthroughs matching 00-06;
+    # Epic 04 fills in the real compaction algorithm.
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         """Record token usage from an API response.
 
-        v0 implementation: stores ``prompt_tokens``, ``completion_tokens``,
-        and ``total_tokens`` in the standard instance attributes
-        ``run_agent.py`` reads directly. No telemetry-store write — that
-        lands in Epic 04 (compaction telemetry).
+        02-01 implementation (unchanged from 00-06): stores
+        ``prompt_tokens``, ``completion_tokens``, and ``total_tokens``
+        in the standard instance attributes ``run_agent.py`` reads
+        directly. No telemetry-store write — that lands in Epic 04
+        (compaction telemetry).
 
-        Tolerates both ``prompt_tokens``/``completion_tokens`` (Anthropic-
-        and OpenAI-style) keys; if ``total_tokens`` is missing it is
-        computed from the parts. Maps to engine.ts behavior for the
-        ``last_*_tokens`` fields under §"State owned by
-        LcmContextEngine" (porting-guides/engine.md lines 21-50).
+        Tolerates both ``prompt_tokens``/``completion_tokens`` (OpenAI
+        style) and ``input_tokens``/``output_tokens`` (Anthropic style)
+        keys; if ``total_tokens`` is missing it is computed from the
+        parts. Maps to engine.ts behavior for the ``last_*_tokens``
+        fields under §"State owned by LcmContextEngine"
+        (porting-guides/engine.md lines 21-50).
 
         Args:
             usage: The ``usage`` dict from the LLM response.
@@ -247,96 +317,10 @@ class LCMEngine(ContextEngine):
         self.last_completion_tokens = completion
         self.last_total_tokens = total
 
-    def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
-        """Return ``False`` unconditionally for v0.
-
-        LCM's compaction decision is driven by ``post_llm_call`` ingest +
-        per-turn evaluation, not by Hermes's threshold gate (ADR-009 +
-        ADR-010). The Hermes ``compress()`` path is the **overflow-
-        recovery** entry point — it fires only when ``should_compress``
-        returns ``True``. For v0 we always return ``False`` because there
-        is no real engine to compact into; raw messages pass through
-        unchanged. Real threshold logic ports in Epic 02.
-
-        Args:
-            prompt_tokens: Optional explicit token count. Ignored at v0.
-
-        Returns:
-            Always ``False`` at v0.
-        """
-        return False
-
-    def compress(
-        self,
-        messages: List[Dict[str, Any]],
-        current_tokens: Optional[int] = None,
-        focus_topic: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return ``messages`` unchanged (no-op passthrough).
-
-        v0 is a transparent identity function — every input message list
-        comes out unchanged. Maps to engine.ts ``compact()`` /
-        ``executeCompactionCore`` (lines 7185-7243, 3344-3528) which port
-        in Epic 04. The no-op shell preserves the ABC contract while no
-        real compaction runs, so the rest of the plugin (entry point,
-        config loader, hooks) can be exercised in isolation.
-
-        Args:
-            messages: The conversation message list. Returned verbatim.
-            current_tokens: Ignored at v0.
-            focus_topic: Ignored at v0.
-
-        Returns:
-            The input ``messages`` list, unchanged.
-        """
-        return messages
-
-    # ABC §Lifecycle (override defaults with NotImplementedError) ------------
-
-    def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        """Lifecycle stub — raises :class:`NotImplementedError`.
-
-        The real implementation lands in Epic 02 (engine skeleton). At
-        that point it will open the SQLite DB connection, run the
-        migration ladder, instantiate the stores, and apply the
-        ignored/stateless session-pattern check. Maps to engine.ts
-        ``bootstrap()`` (lines 4983-5424) — most JSONL fast-paths drop
-        per ``docs/porting-guides/engine.md`` §"bootstrap".
-
-        Raises:
-            NotImplementedError: Always at v0.
-        """
-        raise NotImplementedError("on_session_start lands in Epic 02 (engine skeleton)")
-
-    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        """Lifecycle stub — raises :class:`NotImplementedError`.
-
-        The real implementation lands in Epic 02. Will flush state, close
-        DB connections, and persist any pending compaction work. Maps to
-        engine.ts ``handleSessionEnd`` (line 7468).
-
-        Raises:
-            NotImplementedError: Always at v0.
-        """
-        raise NotImplementedError("on_session_end lands in Epic 02 (engine skeleton)")
-
-    def on_session_reset(self) -> None:
-        """Lifecycle stub — raises :class:`NotImplementedError`.
-
-        The real implementation lands in Epic 02. Will archive the
-        current conversation, optionally create a replacement, and reset
-        per-session caches. Maps to engine.ts ``handleBeforeReset``
-        (line 7415).
-
-        Raises:
-            NotImplementedError: Always at v0.
-        """
-        raise NotImplementedError("on_session_reset lands in Epic 02 (engine skeleton)")
-
-    # ABC §Tools (defaults are fine; explicit overrides for v0 clarity) -----
+    # ABC §Tools (defaults are fine; explicit overrides for 02-01 clarity) ---
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return an empty tool list for v0.
+        """Return an empty tool list for 02-01.
 
         The 8 ``lcm_*`` tools (lcm_grep, lcm_describe, lcm_expand,
         lcm_synthesize_around, lcm_get_entity, lcm_search_entities,
@@ -345,12 +329,12 @@ class LCMEngine(ContextEngine):
         the contract is obvious.
 
         Returns:
-            Empty list at v0.
+            Empty list at 02-01.
         """
         return []
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        """Raise :class:`NotImplementedError` — no tools at v0.
+        """Raise :class:`NotImplementedError` — no tools at 02-01.
 
         The ABC default returns a JSON error string; we override to
         raise instead so a stray dispatch (which should not happen since
@@ -363,6 +347,6 @@ class LCMEngine(ContextEngine):
             **kwargs: May include ``messages`` per ABC contract.
 
         Raises:
-            NotImplementedError: Always at v0.
+            NotImplementedError: Always at 02-01.
         """
         raise NotImplementedError(f"handle_tool_call({name!r}, ...): tools land in Epic 06")
