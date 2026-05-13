@@ -618,19 +618,98 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         return []
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        """Raise :class:`NotImplementedError` — no tools at 02-01.
+        """Dispatch an LCM tool — with a belt-and-suspenders ingest prelude.
 
-        The ABC default returns a JSON error string; we override to
-        raise instead so a stray dispatch (which should not happen since
-        :meth:`get_tool_schemas` returns ``[]``) surfaces loudly. Real
-        tool handling lands in Epic 06.
+        **Issue 03-03 (ADR-009 §Decision "Option C"):** before any
+        per-tool dispatch this method reads ``kwargs.get("messages")``
+        and runs the same diff-against-cursor / ``_ingest_batch`` body
+        that ``post_llm_call`` runs (via
+        :meth:`_IngestMixin._ingest_from_handle_tool_call`). The
+        prelude covers tool-only turns where the ``post_llm_call`` hook
+        does NOT fire (gated on ``final_response and not interrupted``
+        at ``run_agent.py:15407`` — Ctrl-C, max-iterations,
+        no-final-response). Idempotent under the cursor — double-firing
+        both hooks is harmless because the second caller through the
+        per-session sync lock re-reads the cursor and sees no new
+        messages.
+
+        Session-id resolution: Hermes today passes only
+        ``messages=messages`` at ``run_agent.py:11249`` (no
+        ``session_id`` / ``sender_id`` in the kwargs). The
+        ``kwargs.get("session_id") or kwargs.get("sender_id")`` chain
+        is **forward-compat**: if either key is later added to the
+        Hermes hook call, this code picks it up automatically. When
+        neither is present (the v0.1 reality) the prelude is a no-op
+        and only the existing per-tool dispatch runs — matching the
+        spec AC "Missing ``session_id`` AND ``sender_id``: no-op
+        ingest".
+
+        Tool dispatch itself: at 02-01 / 03-03 there are no LCM tools
+        registered (:meth:`get_tool_schemas` returns ``[]``), so reaching
+        the dispatch step implies a programmer error or test
+        invocation. The body raises :class:`NotImplementedError` for
+        any tool ``name``; real tool handling lands in Epic 06 (the
+        8 LCM tools: ``lcm_grep`` / ``lcm_describe`` / ``lcm_expand`` /
+        ``lcm_compact`` / ``lcm_synthesize_around`` /
+        ``lcm_get_entity`` / ``lcm_search_entities`` /
+        ``lcm_conversation_scope``).
+
+        **Sync, not async.** Hermes's ``run_agent.py:11249`` calls this
+        method synchronously inside the tool-dispatch loop. The
+        :meth:`_ingest_from_handle_tool_call` body acquires the
+        per-session **sync** lock via
+        :meth:`SessionLockRegistry.acquire_sync` (added at issue 03-02
+        per the PR #34 sync-conversion). No ``asyncio.run`` is needed
+        — the spec's example was OUTDATED at the time it was written
+        (it predated PR #34 + #42). See ``epics/03-ingest-assembly
+        /03-03-ingest-from-handle-tool-call.md`` §"Sync override".
 
         Args:
-            name: Tool name being dispatched.
-            args: Tool arguments.
-            **kwargs: May include ``messages`` per ABC contract.
+            name: Tool name being dispatched. At 03-03 this is one of
+                the future LCM tool names (Epic 06 binds them); the
+                router only routes through this method for LCM-owned
+                tool names (per ``docs/reference/hermes-hooks.md`` line
+                182).
+            args: Tool arguments. Ignored by the 03-03 ingest prelude.
+            **kwargs: May include ``messages`` (Hermes today, per
+                ``run_agent.py:11249``) and forward-compat
+                ``session_id`` / ``sender_id``. All read defensively;
+                missing keys default to no-op.
 
         Raises:
-            NotImplementedError: Always at 02-01.
+            NotImplementedError: Always (at 03-03; Epic 06 fills in
+                the real dispatch). The ingest prelude is best-effort
+                and never raises — it logs + returns silently per
+                :meth:`_ingest_from_handle_tool_call`'s observer-only
+                contract.
         """
+        # --- Issue 03-03 ingest prelude (ADR-009 Option C) ---------------
+        # Pulled defensively from kwargs so the prelude can NEVER raise
+        # on a malformed dispatch shape (a future Hermes change that
+        # drops the ``messages`` kwarg, an explicit test invocation that
+        # passes only positional args, etc.). All three checks must
+        # pass for the prelude to fire:
+        #   1. ``messages`` is present + truthy
+        #   2. either ``session_id`` or ``sender_id`` is present
+        #   3. (deferred to the prelude itself) the session_id is non-empty
+        # The prelude runs BEFORE any tool dispatch so the assembler
+        # sees the user's pre-tool turn even if the loop exits via
+        # Ctrl-C / max-iterations / no-final-response before the
+        # ``post_llm_call`` hook would fire.
+        messages = kwargs.get("messages")
+        session_id = kwargs.get("session_id") or kwargs.get("sender_id")
+        if messages and session_id:
+            # Sync: PR #34 (merged 2026-05-13) + PR #42 (merged
+            # 2026-05-14) converted ingest off async. The prelude runs
+            # on the calling thread (Hermes's tool-dispatch loop) and
+            # acquires the per-session sync lock for the diff window.
+            self._ingest_from_handle_tool_call(session_id, messages)
+
+        # --- Existing per-tool dispatch ---------------------------------
+        # No LCM tools at 02-01 / 03-03 — Epic 06 fills in the real
+        # dispatch ladder. The override raises for ANY name so a stray
+        # dispatch surfaces loudly (rather than silently returning a
+        # JSON error string per the ABC default). The error message
+        # names both the attempted tool and the epic that lands the
+        # real handler.
         raise NotImplementedError(f"handle_tool_call({name!r}, ...): tools land in Epic 06")
