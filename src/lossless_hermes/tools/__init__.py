@@ -29,12 +29,22 @@ See also:
 
 from __future__ import annotations
 
+from lossless_hermes.tools.conversation_scope import (
+    LcmConversationScope,
+    LcmDependencies,
+    parse_iso_timestamp_param,
+    resolve_lcm_conversation_scope,
+)
 from lossless_hermes.tools.entity_shared import (
     VISIBLE_MENTIONS_CTE,
     entity_agg_cte,
 )
 
 __all__ = [
+    "LcmConversationScope",
+    "LcmDependencies",
     "VISIBLE_MENTIONS_CTE",
     "entity_agg_cte",
+    "parse_iso_timestamp_param",
+    "resolve_lcm_conversation_scope",
 ]
