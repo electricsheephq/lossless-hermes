@@ -11,7 +11,8 @@ function-call format) and a handler callable. Issue 06-01 lands the
 
 The package also hosts non-tool shared SQL/conversation/recursion
 helpers that several tools import — e.g. :mod:`entity_shared` (Wave-12
-F4 fix, issue 07-01), :mod:`conversation_scope` (issue 06-05).
+F4 fix, issue 07-01), :mod:`conversation_scope` (issue 06-05),
+:mod:`expansion_recursion_guard` (issue 06-06).
 
 Per [ADR-016](../../docs/adr/016-typebox-translation.md), schemas are
 **hand-translated** from the TypeScript source (not auto-generated).
@@ -65,6 +66,17 @@ Conversation-scope helpers (from issue 06-05)
 * :func:`conversation_scope.resolve_lcm_conversation_scope` — 5-priority
   scope resolver (matches TS 92-161).
 
+Expansion recursion guard (from issue 06-06)
+--------------------------------------------
+
+* :class:`expansion_recursion_guard.DelegatedExpansionContext` — stamped
+  metadata on a delegated child session.
+* :func:`expansion_recursion_guard.evaluate_expansion_recursion_guard` —
+  the depth-cap / idempotent-reentry decision used by ``lcm_expand`` and
+  the deferred ``lcm_expand_query`` (per ADR-012).
+* :func:`expansion_recursion_guard.acquire_expansion_concurrency_slot` /
+  ``release_expansion_concurrency_slot`` — per-origin in-flight slot.
+
 References
 ----------
 
@@ -98,6 +110,23 @@ from lossless_hermes.tools.conversation_scope import (
 from lossless_hermes.tools.entity_shared import (
     VISIBLE_MENTIONS_CTE,
     entity_agg_cte,
+)
+from lossless_hermes.tools.expansion_recursion_guard import (
+    EXPANSION_CONCURRENCY_ERROR_CODE,
+    EXPANSION_DELEGATION_DEPTH_CAP,
+    EXPANSION_RECURSION_ERROR_CODE,
+    DelegatedExpansionContext,
+    ExpansionConcurrencyGuardDecision,
+    ExpansionRecursionGuardDecision,
+    acquire_expansion_concurrency_slot,
+    clear_delegated_expansion_context,
+    create_expansion_request_id,
+    evaluate_expansion_recursion_guard,
+    record_expansion_delegation_telemetry,
+    release_expansion_concurrency_slot,
+    resolve_expansion_request_id,
+    resolve_next_expansion_depth,
+    stamp_delegated_expansion_context,
 )
 
 # ---------------------------------------------------------------------------
@@ -136,20 +165,35 @@ def get_tool_schemas() -> list[dict[str, Any]]:
 
 
 __all__: Final = (
+    "EXPANSION_CONCURRENCY_ERROR_CODE",
+    "EXPANSION_DELEGATION_DEPTH_CAP",
+    "EXPANSION_RECURSION_ERROR_CODE",
+    "DelegatedExpansionContext",
+    "ExpansionConcurrencyGuardDecision",
+    "ExpansionRecursionGuardDecision",
     "LcmConversationScope",
     "LcmDependencies",
     "OptionalField",
     "TOOL_SCHEMAS",
     "VISIBLE_MENTIONS_CTE",
+    "acquire_expansion_concurrency_slot",
     "array_field",
     "boolean_field",
+    "clear_delegated_expansion_context",
+    "create_expansion_request_id",
     "entity_agg_cte",
+    "evaluate_expansion_recursion_guard",
     "get_tool_schemas",
     "number_field",
     "object_schema",
     "optional",
     "parse_iso_timestamp_param",
+    "record_expansion_delegation_telemetry",
+    "release_expansion_concurrency_slot",
+    "resolve_expansion_request_id",
     "resolve_lcm_conversation_scope",
+    "resolve_next_expansion_depth",
+    "stamp_delegated_expansion_context",
     "string_field",
     "tool_schema",
     "validate_schema",
