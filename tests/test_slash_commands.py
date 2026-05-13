@@ -186,7 +186,6 @@ def test_unknown_cmd_returns_unknown_message() -> None:
 @pytest.mark.parametrize(
     "subcommand,expected_epic",
     [
-        ("health", "Epic 08"),
         ("doctor", "Epic 08"),
         ("rotate", "Epic 08"),
         ("eval", "Epic 09"),
@@ -194,12 +193,11 @@ def test_unknown_cmd_returns_unknown_message() -> None:
         # wired the real body in ``lossless_hermes.cli.import_openclaw``.
         # The dedicated tests live in ``tests/cli/test_import_openclaw.py``.
         # Note: ``backup`` was previously stubbed; issue 08-09 wired the
-        # real body in ``lossless_hermes.commands.backup``. The dedicated
-        # tests live in ``tests/commands/test_backup.py``.
+        # real body in ``lossless_hermes.commands.backup``.
         # Note: ``purge`` was previously stubbed; issue 08-04 wired the
-        # real body in ``lossless_hermes.commands.purge``. The dedicated
-        # tests live in ``tests/commands/test_purge.py`` +
-        # ``tests/operator/test_purge.py``.
+        # real body in ``lossless_hermes.commands.purge``.
+        # Note: ``health`` was previously stubbed; issue 08-03 wired the
+        # real body in ``lossless_hermes.commands.health``.
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
