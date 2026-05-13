@@ -150,6 +150,7 @@ __all__ = [
     "EMPTY_FRESH_TAIL_ORDINAL",
     "LcmProviderAuthError",
     "LeafChunkSelection",
+    "LeafPassOutcome",
     "LeafPassResult",
     "LeafTriggerReason",
     "LeafTriggerResult",
@@ -320,6 +321,49 @@ class LeafPassResult:
     content: str
     removed_tokens: int
     added_tokens: int
+
+
+@dataclass(frozen=True)
+class LeafPassOutcome:
+    """Discriminated return value of :meth:`CompactionEngine._run_leaf_pass`.
+
+    Distinguishes the three terminal states a leaf-pass (or condensed-pass)
+    hook can reach:
+
+    * **summary produced** — ``summary`` set, ``auth_failure=False``;
+      caller increments the running token delta and continues the phase
+      loop.
+    * **empty chunk / voluntary skip** — ``summary=None``,
+      ``auth_failure=False``; caller breaks the phase loop cleanly. TS
+      equivalent: ``leafChunk.items.length === 0`` short-circuit at
+      ``compaction.ts:673-675`` (Phase-1), or the condensed-pass
+      ``!candidate`` short-circuit at ``compaction.ts:721-723``.
+    * **provider-auth failure** — ``summary=None``, ``auth_failure=True``;
+      caller breaks the phase loop AND sets ``CompactionResult.auth_failure
+      = True`` so :meth:`compact_until_under` can short-circuit the round
+      loop instead of retrying. TS equivalent: the ``hadAuthFailure =
+      true; break`` pair at ``compaction.ts:685-687`` (Phase-1) and
+      ``compaction.ts:733-735`` (Phase-2).
+
+    Issue 04-02 introduced this split. Before 04-02 the protocol was just
+    ``LeafPassResult | None`` and both empty-chunk and auth-failure
+    funneled through the same ``None`` return — meaning
+    :meth:`compact_full_sweep` could not set ``auth_failure=True`` on the
+    final :class:`CompactionResult` and the downstream
+    :meth:`compact_until_under` round loop would silently retry across
+    a provider outage. PR #81 reviewer MAJOR finding.
+
+    Attributes:
+        summary: The :class:`LeafPassResult` produced by a successful
+            pass. ``None`` for both empty-chunk and auth-failure
+            terminations.
+        auth_failure: ``True`` iff the pass aborted because the
+            summarizer raised :class:`LcmProviderAuthError`. ``False``
+            for empty-chunk / voluntary-skip terminations.
+    """
+
+    summary: LeafPassResult | None
+    auth_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -1948,19 +1992,28 @@ class CompactionEngine:
         running_tokens = tokens_before
         while True:
             pass_tokens_before = running_tokens
-            leaf_result = self._run_leaf_pass(
+            leaf_outcome = self._run_leaf_pass(
                 conversation_id=conversation_id,
                 summarize=summarize,
                 previous_summary_content=previous_summary_content,
                 summary_model=summary_model,
             )
-            if leaf_result is None:
-                # TS line 685-687: either nothing left to compact (TS
-                # treats ``leafChunk.items.length === 0`` as a clean
-                # break) OR a provider-auth failure surfaced from
-                # ``_leafPass``. 04-04 skeleton funnels both through
-                # the same ``None`` return; 04-02 will split them.
+            if leaf_outcome.auth_failure:
+                # TS lines 685-687: a provider-auth failure surfaced
+                # from ``_leafPass``. Mirror the TS ``hadAuthFailure =
+                # true; break`` pair so the final ``CompactionResult``
+                # propagates ``auth_failure=True`` (which
+                # ``compact_until_under`` reads at TS lines 831-838 to
+                # short-circuit the round loop instead of retrying
+                # across a provider outage).
+                had_auth_failure = True
                 break
+            if leaf_outcome.summary is None:
+                # TS lines 673-675: empty chunk / voluntary skip —
+                # clean termination, NOT an auth failure. Caller
+                # leaves ``had_auth_failure = False``.
+                break
+            leaf_result = leaf_outcome.summary
 
             pass_tokens_after = (
                 pass_tokens_before - leaf_result.removed_tokens + leaf_result.added_tokens
@@ -2015,17 +2068,24 @@ class CompactionEngine:
         # ended the sweep.
         while force or previous_tokens > threshold:
             pass_tokens_before = running_tokens
-            condense_result = self._run_condensed_pass(
+            condense_outcome = self._run_condensed_pass(
                 conversation_id=conversation_id,
                 hard_trigger=hard_trigger,
                 summarize=summarize,
                 summary_model=summary_model,
             )
-            if condense_result is None:
-                # TS lines 721-723 (no candidate) + 733-735 (auth
-                # failure). 04-04 skeleton conflates these the same
-                # way phase-1 does.
+            if condense_outcome.auth_failure:
+                # TS lines 733-735: provider-auth failure surfaces the
+                # same way phase-1 does — set the
+                # ``CompactionResult.auth_failure`` flag and break so
+                # ``compact_until_under`` short-circuits.
+                had_auth_failure = True
                 break
+            if condense_outcome.summary is None:
+                # TS lines 721-723: no candidate / voluntary skip — a
+                # clean break that leaves ``auth_failure`` False.
+                break
+            condense_result = condense_outcome.summary
 
             pass_tokens_after = (
                 pass_tokens_before - condense_result.removed_tokens + condense_result.added_tokens
@@ -2486,15 +2546,16 @@ class CompactionEngine:
         summarize: SummarizeFn,
         previous_summary_content: str | None,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
-        """Run one leaf pass and return the resulting summary, or ``None``.
+    ) -> LeafPassOutcome:
+        """Run one leaf pass and return a :class:`LeafPassOutcome`.
 
         Issue 04-02 production body. Ports TS ``leafPass``
         (``compaction.ts:1492-1607``) end-to-end:
 
         1. Select the next chunk via :meth:`_select_oldest_leaf_chunk`.
-           Empty selection → return ``None`` (clean "nothing to do"
-           termination — caller breaks the phase-1 loop).
+           Empty selection → return ``LeafPassOutcome(summary=None,
+           auth_failure=False)`` (clean "nothing to do" termination —
+           caller breaks the phase-1 loop with ``auth_failure`` clear).
         2. Resolve prior leaf-summary context via
            :meth:`_resolve_prior_leaf_summary_context` for iterative
            continuity.
@@ -2507,36 +2568,42 @@ class CompactionEngine:
         5. Call :meth:`_summarize_with_escalation` (a 04-02 stub; the
            full escalation cascade lands in issue 04-06). On
            :class:`LcmProviderAuthError` raised by the summarizer →
-           return ``None`` (auth short-circuit — caller treats as
-           non-compacting skip).
+           return ``LeafPassOutcome(summary=None, auth_failure=True)``.
+           The caller distinguishes this from the empty-chunk case and
+           propagates ``CompactionResult.auth_failure=True`` so
+           :meth:`compact_until_under` can short-circuit the round
+           loop. TS line 685-687 (``hadAuthFailure = true; break``).
         6. Persist atomically inside ``summary_store.with_transaction()``:
            ``insert_summary`` → ``link_summary_to_messages`` →
            ``replace_context_range_with_summary``.
         7. Invalidate the context cache via
            :meth:`_invalidate_context_cache` (04-02 no-op until the
            cache lands).
-        8. Return :class:`LeafPassResult` with the running-delta
+        8. Return :class:`LeafPassOutcome` carrying a
+           :class:`LeafPassResult` with the running-delta
            ``removed_tokens`` / ``added_tokens`` Wave-12 guard consumes.
 
         Subclasses (regression tests, 04-04 scripted engines) may
         override to inject scripted results without standing up real
-        stores.
+        stores. Overrides MUST return a :class:`LeafPassOutcome` and
+        MUST set ``auth_failure=True`` on the provider-auth path so the
+        sweep flag propagates correctly.
 
         Args:
             conversation_id: The conversation being compacted.
             summarize: The summarize callback passed down from
                 :meth:`compact_full_sweep`.
             previous_summary_content: ``content`` field from the most
-                recent ``LeafPassResult``, or ``None`` on the first
-                call. Provides iterative-summarization continuity.
+                recent successful :class:`LeafPassResult`, or ``None``
+                on the first call. Provides iterative-summarization
+                continuity.
             summary_model: Optional model override for this pass.
 
         Returns:
-            A :class:`LeafPassResult` if a pass produced a summary,
-            ``None`` otherwise. The Wave-12 guard inspects
-            ``removed_tokens`` + ``added_tokens`` (via the
-            running-delta arithmetic) to decide whether the pass made
-            progress.
+            A :class:`LeafPassOutcome` whose ``summary`` field carries
+            the produced :class:`LeafPassResult` (when a pass succeeded)
+            and whose ``auth_failure`` flag distinguishes the
+            provider-auth path from the empty-chunk path.
         """
         return self._leaf_pass(
             conversation_id=conversation_id,
@@ -2552,7 +2619,7 @@ class CompactionEngine:
         summarize: SummarizeFn,
         previous_summary_content: str | None,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
+    ) -> LeafPassOutcome:
         """Body of one leaf pass — chunk → summarize → persist.
 
         Ports TS ``leafPass`` (compaction.ts lines 1492-1607). See
@@ -2570,10 +2637,10 @@ class CompactionEngine:
         selection = self._select_oldest_leaf_chunk(conversation_id)
         message_items = selection.items
         if not message_items:
-            # TS line 685-687 funnels this through the same ``None``
-            # return; phase-1 loop treats it as "nothing left to
-            # compact" and breaks cleanly.
-            return None
+            # TS lines 673-675 — empty chunk is a clean termination,
+            # NOT an auth failure. Caller breaks the phase-1 loop with
+            # ``CompactionResult.auth_failure`` left False.
+            return LeafPassOutcome(summary=None, auth_failure=False)
 
         # 2. Resolve prior leaf-summary continuity. ``previous_summary_content``
         #    from the caller wins (when set — TS reuses the most recent
@@ -2641,12 +2708,16 @@ class CompactionEngine:
             # LCM auth-short-circuit: avoid persisting fallback-truncation summaries
             # during transient provider outages — preserves DAG integrity.
             # Original: lossless-claw/src/compaction.ts:1571 (early-return on null).
-            return None
+            # Signal auth_failure=True so ``compact_full_sweep`` sets
+            # ``CompactionResult.auth_failure=True`` (mirror of TS
+            # ``hadAuthFailure = true`` at compaction.ts:686).
+            return LeafPassOutcome(summary=None, auth_failure=True)
         if summary is None:
             # Per TS lines 1544-1549 — summarizer voluntarily skipped
-            # (e.g. empty source after sanitation). Same auth-short-
-            # circuit return so caller treats as non-compacting skip.
-            return None
+            # (e.g. empty source after sanitation). This is NOT an
+            # auth failure; caller treats as non-compacting skip with
+            # ``auth_failure`` left False.
+            return LeafPassOutcome(summary=None, auth_failure=False)
 
         # 7. Persist atomically.
         summary_content: str = summary["content"]
@@ -2720,12 +2791,15 @@ class CompactionEngine:
         # 8. Invalidate context cache after the swap.
         self._invalidate_context_cache(conversation_id)
 
-        return LeafPassResult(
-            summary_id=summary_id,
-            level=summary_level,
-            content=summary_content,
-            removed_tokens=removed_tokens,
-            added_tokens=token_count,
+        return LeafPassOutcome(
+            summary=LeafPassResult(
+                summary_id=summary_id,
+                level=summary_level,
+                content=summary_content,
+                removed_tokens=removed_tokens,
+                added_tokens=token_count,
+            ),
+            auth_failure=False,
         )
 
     def _resolve_message_token_count(self, message: _MessageRecordLike) -> int:
@@ -2823,12 +2897,20 @@ class CompactionEngine:
         hard_trigger: bool,
         summarize: SummarizeFn,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
-        """Run one condensed pass and return the resulting summary, or ``None``.
+    ) -> LeafPassOutcome:
+        """Run one condensed pass and return a :class:`LeafPassOutcome`.
 
         04-04 skeletal stub. Production body lands in issue 04-03
         (the condensed-pass + chunk-selection helpers in TS). Same
-        ``None``-terminates-the-loop contract as :meth:`_run_leaf_pass`.
+        outcome-discrimination contract as :meth:`_run_leaf_pass`:
+
+        * empty candidate / voluntary skip → ``LeafPassOutcome(summary=None,
+          auth_failure=False)`` (TS lines 721-723).
+        * provider-auth failure → ``LeafPassOutcome(summary=None,
+          auth_failure=True)`` (TS lines 733-735, ``hadAuthFailure =
+          true`` parity with phase-1).
+        * pass produced a summary →
+          ``LeafPassOutcome(summary=LeafPassResult(...), auth_failure=False)``.
 
         Args:
             conversation_id: The conversation being compacted.
@@ -2839,9 +2921,11 @@ class CompactionEngine:
             summary_model: Optional model override for this pass.
 
         Returns:
-            A :class:`LeafPassResult` if a pass produced a summary,
-            ``None`` otherwise. Phase-2's Wave-12 guard inspects the
-            same fields as phase-1.
+            A :class:`LeafPassOutcome` whose ``summary`` field carries
+            the produced :class:`LeafPassResult` (when a pass
+            succeeded) and whose ``auth_failure`` flag mirrors the
+            phase-1 contract so ``compact_full_sweep`` propagates the
+            sweep-level auth flag identically across both phases.
         """
         del conversation_id, hard_trigger, summarize, summary_model
-        return None
+        return LeafPassOutcome(summary=None, auth_failure=False)

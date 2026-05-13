@@ -65,6 +65,7 @@ from lossless_hermes.compaction import (
     CompactionEngine,
     LcmProviderAuthError,
     LeafChunkSelection,
+    LeafPassOutcome,
     LeafPassResult,
     SummarizeFn,
     _dedupe_ordered_ids,
@@ -879,15 +880,19 @@ class TestLeafPassBody:
         )
 
     def test_returns_none_when_no_compactable_chunk(self) -> None:
-        """Empty chunk → ``None`` (clean break, not auth failure)."""
+        """Empty chunk → ``summary=None, auth_failure=False`` (clean break)."""
         engine, _, _ = _make_engine(context_items=[])
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=_scripted_summarize("ignored"),
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is None
+        assert isinstance(outcome, LeafPassOutcome)
+        assert outcome.summary is None
+        # CRITICAL: empty chunk is NOT an auth failure — protocol
+        # split per PR #81 reviewer MAJOR.
+        assert outcome.auth_failure is False
 
     def test_persists_summary_with_correct_dag_edges(self) -> None:
         """AC: ``link_summary_to_messages`` called with chunk message IDs.
@@ -897,14 +902,16 @@ class TestLeafPassBody:
         transaction as insert_summary``.
         """
         engine, summary_store, _ = self._setup_engine_with_messages()
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=_scripted_summarize("Summary text"),
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is not None
-        assert isinstance(result, LeafPassResult)
+        assert outcome.auth_failure is False
+        assert outcome.summary is not None
+        assert isinstance(outcome.summary, LeafPassResult)
+        result = outcome.summary
         # ID format check.
         assert result.summary_id.startswith("sum_")
         assert len(result.summary_id) == 4 + 16
@@ -935,36 +942,48 @@ class TestLeafPassBody:
         assert insert.content == "Summary text"
         assert insert.source_message_token_count == 400  # 4 × 100
 
-    def test_returns_none_on_auth_failure(self) -> None:
-        """AC: Auth-failure path returns ``None`` (NOT raising)."""
+    def test_auth_failure_returns_outcome_with_flag_set(self) -> None:
+        """AC: Auth-failure path returns ``LeafPassOutcome(summary=None, auth_failure=True)``.
+
+        The flag is what lets :meth:`compact_full_sweep` set
+        ``CompactionResult.auth_failure=True`` (the PR #81 reviewer
+        MAJOR fix). Before 04-02 the protocol was just ``None`` and
+        the sweep could not distinguish auth-failure from empty-chunk.
+        """
         engine, summary_store, _ = self._setup_engine_with_messages()
 
         def auth_failing(text: str, aggressive: bool = False, options: dict | None = None) -> str:
             del text, aggressive, options
             raise LcmProviderAuthError("provider down")
 
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=auth_failing,
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is None
+        assert outcome.summary is None
+        assert outcome.auth_failure is True
         # CRITICAL: nothing got persisted on auth failure.
         assert summary_store.inserted == []
         assert summary_store.linked == []
         assert summary_store.replaced == []
 
-    def test_returns_none_on_empty_summarizer_output(self) -> None:
-        """An empty summarizer return is a voluntary skip (TS lines 1544-1549)."""
+    def test_empty_summarizer_output_returns_outcome_without_auth_flag(self) -> None:
+        """An empty summarizer return is a voluntary skip (TS lines 1544-1549).
+
+        Must NOT trip ``auth_failure`` — only ``LcmProviderAuthError``
+        does that.
+        """
         engine, summary_store, _ = self._setup_engine_with_messages()
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=_scripted_summarize(""),
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is None
+        assert outcome.summary is None
+        assert outcome.auth_failure is False
         assert summary_store.inserted == []
 
     def test_strips_reasoning_blocks_from_message_text(self) -> None:
@@ -1001,13 +1020,14 @@ class TestLeafPassBody:
             messages=messages,
             config=CompactionConfig(fresh_tail_count=8),
         )
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=capture,
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is not None
+        assert outcome.summary is not None
+        assert outcome.auth_failure is False
         assert len(captured_text) == 1
         # No SECRET-SIG bytes in what we send to the summarizer.
         assert "SECRET-SIG" not in captured_text[0]
@@ -1043,13 +1063,14 @@ class TestLeafPassBody:
             parts=parts,
             config=CompactionConfig(fresh_tail_count=8),
         )
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=capture,
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is not None
+        assert outcome.summary is not None
+        assert outcome.auth_failure is False
         assert "[Media attachment]" in captured[0]
 
     def test_passes_previous_summary_to_summarizer(self) -> None:
@@ -1116,13 +1137,14 @@ class TestLeafPassBody:
     def test_summary_id_format_is_sha256_prefixed(self) -> None:
         """AC: Summary ID has the ``sum_<16 hex chars>`` format."""
         engine, _, _ = self._setup_engine_with_messages()
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=1,
             summarize=_scripted_summarize("summary"),
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is not None
+        assert outcome.summary is not None
+        result = outcome.summary
         assert result.summary_id.startswith("sum_")
         # Suffix is valid hex of length 16.
         suffix = result.summary_id[len("sum_") :]
@@ -1367,13 +1389,15 @@ class TestLeafPassRealStoreIntegration:
             config=CompactionConfig(fresh_tail_count=8, leaf_chunk_tokens=10_000),
         )
 
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=conv_id,
             summarize=_scripted_summarize("Compacted summary"),
             previous_summary_content=None,
             summary_model="test-model",
         )
-        assert result is not None
+        assert outcome.summary is not None
+        assert outcome.auth_failure is False
+        result = outcome.summary
         # Summaries row exists.
         row = real_db.execute(
             "SELECT summary_id, conversation_id, kind, depth, content, model "
@@ -1429,15 +1453,251 @@ class TestLeafPassRealStoreIntegration:
             summary_store=summary_store,
             config=CompactionConfig(fresh_tail_count=8, leaf_chunk_tokens=10_000),
         )
-        result = engine._run_leaf_pass(
+        outcome = engine._run_leaf_pass(
             conversation_id=conv_id,
             summarize=_scripted_summarize("Compacted"),
             previous_summary_content=None,
             summary_model=None,
         )
-        assert result is not None
+        assert outcome.summary is not None
+        assert outcome.auth_failure is False
+        result = outcome.summary
         # 4 messages outside tail × 200 tokens = 800.
         assert result.removed_tokens == 800
         # ``added_tokens`` is estimate_tokens("Compacted") — small.
         assert result.added_tokens >= 1
         assert result.added_tokens < result.removed_tokens
+
+
+# =============================================================================
+# Auth-failure propagation — _run_leaf_pass → compact_full_sweep (PR #81)
+# =============================================================================
+#
+# These regression tests close the PR #81 reviewer MAJOR finding:
+# before 04-02, the ``_run_leaf_pass`` protocol returned
+# ``LeafPassResult | None`` and could not distinguish "empty chunk" from
+# "auth failure". As a result ``compact_full_sweep`` would never set
+# ``CompactionResult.auth_failure=True`` even when the summarizer
+# raised :class:`LcmProviderAuthError`, and ``compact_until_under``
+# would retry across a provider outage.
+#
+# The fix introduces :class:`LeafPassOutcome` with an explicit
+# ``auth_failure`` flag (TS parity: ``compaction.ts:685-687`` —
+# ``hadAuthFailure = true; break``). The phase-1 leaf-pass loop and
+# phase-2 condensed-pass loop both consume the flag.
+
+
+class _AuthFailingEngine(CompactionEngine):
+    """Subclass whose ``_run_leaf_pass`` simulates a provider-auth failure.
+
+    Used to drive the auth path through ``compact_full_sweep`` without
+    standing up a real summarizer.
+    """
+
+    def __init__(self, **engine_kwargs: object) -> None:
+        super().__init__(**engine_kwargs)  # type: ignore[arg-type]
+        self.leaf_pass_calls = 0
+
+    def _run_leaf_pass(
+        self,
+        *,
+        conversation_id: int,
+        summarize: SummarizeFn,
+        previous_summary_content: str | None,
+        summary_model: str | None,
+    ) -> LeafPassOutcome:
+        del conversation_id, summarize, previous_summary_content, summary_model
+        self.leaf_pass_calls += 1
+        return LeafPassOutcome(summary=None, auth_failure=True)
+
+
+class _EmptyChunkEngine(CompactionEngine):
+    """Subclass whose ``_run_leaf_pass`` simulates an empty-chunk return.
+
+    Used to verify ``auth_failure`` STAYS False on the empty-chunk
+    path — the bug before 04-02 was that both paths conflated.
+    """
+
+    def __init__(self, **engine_kwargs: object) -> None:
+        super().__init__(**engine_kwargs)  # type: ignore[arg-type]
+        self.leaf_pass_calls = 0
+
+    def _run_leaf_pass(
+        self,
+        *,
+        conversation_id: int,
+        summarize: SummarizeFn,
+        previous_summary_content: str | None,
+        summary_model: str | None,
+    ) -> LeafPassOutcome:
+        del conversation_id, summarize, previous_summary_content, summary_model
+        self.leaf_pass_calls += 1
+        return LeafPassOutcome(summary=None, auth_failure=False)
+
+
+class TestAuthFailurePropagation:
+    """``_run_leaf_pass`` → ``compact_full_sweep`` auth-failure split (PR #81).
+
+    Closes reviewer MAJOR finding: before this split, ``compact_full_sweep``
+    could not distinguish "empty chunk" from "auth failure" because both
+    funneled through the same ``None`` return. The TS source at
+    ``compaction.ts:685-687`` explicitly sets ``hadAuthFailure = true``
+    on the auth path, and ``compact_until_under`` (TS lines 831-838)
+    reads it to short-circuit the round loop instead of retrying across
+    a provider outage.
+    """
+
+    def _setup_stores(
+        self,
+    ) -> tuple[_StubSummaryStore, _StubConversationStore]:
+        """Build stores with enough context to trigger compaction."""
+        context_items = [
+            _StubContextItem(ordinal=i, item_type="message", message_id=i + 1) for i in range(12)
+        ]
+        messages = {
+            i + 1: _StubMessage(
+                message_id=i + 1,
+                content=f"msg{i}",
+                token_count=100,
+                created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            for i in range(12)
+        }
+        # 100k token count, threshold = 10k × 0.85 = 8500 → trigger fires.
+        summary_store = _StubSummaryStore(
+            context_token_count=100_000,
+            context_items=context_items,
+        )
+        conversation_store = _StubConversationStore(messages=messages)
+        return summary_store, conversation_store
+
+    def test_auth_failure_propagates_to_compact_full_sweep_result(self) -> None:
+        """AC: ``CompactionResult.auth_failure=True`` when leaf-pass auth-fails.
+
+        Mirror of TS ``hadAuthFailure = true; break`` (compaction.ts:686).
+        The sweep stops after the first pass and surfaces the auth flag
+        through the result. Before the protocol split the sweep would
+        complete normally with ``auth_failure=False`` — the bug PR #81
+        reviewer caught.
+        """
+        summary_store, conversation_store = self._setup_stores()
+        engine = _AuthFailingEngine(
+            conversation_store=conversation_store,
+            summary_store=summary_store,
+            config=CompactionConfig(fresh_tail_count=8),
+        )
+        result = engine.compact_full_sweep(
+            conversation_id=1,
+            token_budget=10_000,
+            summarize=_scripted_summarize("ignored"),
+        )
+        # CRITICAL: the auth flag is now set on the CompactionResult.
+        assert result.auth_failure is True
+        # Sweep stopped after exactly 1 pass (the auth break).
+        assert engine.leaf_pass_calls == 1
+        # Auth failure happens BEFORE any pass body could run, so no
+        # passes are completed and no summary was created.
+        assert result.passes_completed == 0
+        assert result.action_taken is False
+        assert result.created_summary_id is None
+
+    def test_empty_chunk_does_not_set_auth_failure(self) -> None:
+        """AC: ``CompactionResult.auth_failure`` stays False on empty-chunk break.
+
+        The empty-chunk path is TS lines 673-675 — a clean break that
+        leaves ``hadAuthFailure`` at its initial ``false``. Before the
+        protocol split, the empty-chunk path was indistinguishable from
+        the auth-failure path in Python because both returned ``None``.
+        This test pins the disambiguation.
+        """
+        summary_store, conversation_store = self._setup_stores()
+        engine = _EmptyChunkEngine(
+            conversation_store=conversation_store,
+            summary_store=summary_store,
+            config=CompactionConfig(fresh_tail_count=8),
+        )
+        result = engine.compact_full_sweep(
+            conversation_id=1,
+            token_budget=10_000,
+            summarize=_scripted_summarize("ignored"),
+        )
+        # CRITICAL: empty-chunk does NOT set auth_failure.
+        assert result.auth_failure is False
+        # One call to _run_leaf_pass (returned empty → phase-1 broke).
+        assert engine.leaf_pass_calls == 1
+        # No pass actually produced a summary.
+        assert result.passes_completed == 0
+        assert result.action_taken is False
+
+    def test_auth_failure_short_circuits_compact_until_under(self) -> None:
+        """End-to-end: ``compact_until_under`` returns ``auth_failure=True`` after 1 round.
+
+        This is the integration the protocol split exists to support:
+        ``compact_until_under`` reads ``CompactionResult.auth_failure``
+        at TS lines 831-838 (Python lines 2034-2042) to short-circuit
+        the round loop instead of burning through ``max_rounds``
+        retries against a dead provider.
+        """
+        summary_store, conversation_store = self._setup_stores()
+        engine = _AuthFailingEngine(
+            conversation_store=conversation_store,
+            summary_store=summary_store,
+            config=CompactionConfig(fresh_tail_count=8, max_rounds=5),
+        )
+        result = engine.compact_until_under(
+            conversation_id=1,
+            token_budget=10_000,
+            summarize=_scripted_summarize("ignored"),
+            target_tokens=1_000,
+        )
+        # The round loop broke after exactly 1 round on the auth flag.
+        assert result.success is False
+        assert result.auth_failure is True
+        assert result.rounds == 1
+        # And the engine only attempted one leaf-pass call total
+        # (not max_rounds × N).
+        assert engine.leaf_pass_calls == 1
+
+    def test_leaf_pass_auth_failure_sets_outcome_flag_directly(self) -> None:
+        """The :meth:`_run_leaf_pass` body itself catches and signals auth.
+
+        Unit-level coverage of the catch-and-signal path inside
+        :meth:`_leaf_pass`: when the summarizer raises
+        :class:`LcmProviderAuthError`, the body returns
+        ``LeafPassOutcome(summary=None, auth_failure=True)`` directly —
+        the flag is set inside the engine, NOT only by the test
+        subclass.
+        """
+        # Build the same 12-message context as TestLeafPassBody.
+        context_items = [
+            _StubContextItem(ordinal=i, item_type="message", message_id=i + 1) for i in range(12)
+        ]
+        messages = {
+            i + 1: _StubMessage(
+                message_id=i + 1,
+                content=f"msg{i}",
+                token_count=100,
+                created_at=datetime(2026, 4, 22, 10, i, tzinfo=timezone.utc),
+            )
+            for i in range(12)
+        }
+        engine, _, _ = _make_engine(
+            context_items=context_items,
+            messages=messages,
+            config=CompactionConfig(fresh_tail_count=8, leaf_chunk_tokens=10_000),
+        )
+
+        def auth_failing(text: str, aggressive: bool = False, options: dict | None = None) -> str:
+            del text, aggressive, options
+            raise LcmProviderAuthError("provider down")
+
+        outcome = engine._run_leaf_pass(
+            conversation_id=1,
+            summarize=auth_failing,
+            previous_summary_content=None,
+            summary_model=None,
+        )
+        # The auth_failure flag is set BY the engine body (not by a
+        # test override).
+        assert outcome.summary is None
+        assert outcome.auth_failure is True
