@@ -65,10 +65,8 @@ See:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +81,7 @@ from .assemble import _AssembleMixin
 from .compact import _CompactMixin
 from .ingest import _IngestMixin
 from .lifecycle import _LifecycleMixin
+from .session_locks import SessionLockRegistry
 
 __all__ = ["APPLE_SYSTEM_PYTHON_MSG", "LCMEngine"]
 
@@ -253,13 +252,14 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self._maintenance_store: Optional[CompactionMaintenanceStore] = None
 
         # Per-session asyncio locks — see ADR-018 §"Per-session queue".
-        # ``defaultdict`` so callers can ``async with self._session_locks
-        # [session_id]:`` without explicit setdefault. Note that
-        # ``defaultdict(asyncio.Lock)`` here constructs the lock lazily,
-        # in whatever event-loop happens to be running at first access —
-        # acceptable because the same loop services every turn.
-        # 02-08 may extend this with refcount + cleanup pass.
-        self._session_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Issue 02-08 replaces the issue 02-01 ``defaultdict(asyncio.Lock)``
+        # placeholder with a :class:`SessionLockRegistry` that adds a
+        # refcount + lazy prune pass so the lock dict cannot grow
+        # without bound on a long-running gateway (ADR-018 §"Open
+        # questions" line 96–97). Critical sections in Epic 03 (ingest)
+        # / Epic 04 (compact) acquire via
+        # ``async with self._session_locks.acquire(session_id): ...``.
+        self._session_locks: SessionLockRegistry = SessionLockRegistry()
 
         # Circuit-breaker scaffold — body lands in 02-09. Keyed by
         # session/provider scope; values are CircuitBreakerState records
