@@ -33,12 +33,36 @@ instantiate via the bridge's stub ``ContextEngine`` class. See
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.engine import APPLE_SYSTEM_PYTHON_MSG, LCMEngine
+
+# ---------------------------------------------------------------------------
+# Skip marker: actions/setup-python macOS builds lack enable_load_extension
+# ---------------------------------------------------------------------------
+#
+# Mirrors ``_skip_no_extension_loading`` in ``tests/test_db_connection.py``
+# (ADR-004 §Open questions item 1, ADR-028 §Decision point 8). The
+# ``on_session_start`` lifecycle body filled in by issue 02-03 opens an
+# ``open_lcm_db()`` connection that loads sqlite-vec, which is impossible
+# on the actions/setup-python macOS pre-built CPython. The
+# Apple-Python-guard tests below remain runnable on those cells because
+# they monkey-patch ``_has_sqlite_extension_loading`` rather than
+# depending on the OS-level capability.
+_skip_no_extension_loading = pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "enable_load_extension"),
+    reason=(
+        "actions/setup-python on macOS ships a CPython build without "
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load. "
+        "Apple-Python-guard tests still run (they monkey-patch the "
+        "introspection hook). See ADR-004 §Open questions item 1 + "
+        "ADR-028 §Decision point 8."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -249,27 +273,44 @@ def test_update_from_response_computes_total_when_absent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle stubs — raise NotImplementedError
+# Lifecycle methods — bodies landed in Epic 02 issue 02-03
 # ---------------------------------------------------------------------------
+#
+# These were ``NotImplementedError`` stubs at 02-01. Issue 02-03 filled
+# in the heavy-init bodies on ``_LifecycleMixin``. The detailed lifecycle
+# behavior is exercised in ``tests/test_lifecycle.py`` — here we just
+# confirm the surface no longer raises (regression guard that the bodies
+# don't get reverted to stubs).
 
 
-def test_on_session_start_raises_with_epic_pointer() -> None:
-    """AC: lifecycle stubs raise ``NotImplementedError`` naming Epic 02."""
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+@_skip_no_extension_loading
+def test_on_session_start_no_longer_raises(tmp_home: Path) -> None:
+    """02-03: ``on_session_start`` opens the DB rather than raising."""
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    try:
         engine.on_session_start("session-id")
-
-
-def test_on_session_end_raises_with_epic_pointer() -> None:
-    engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
+        # DB connection is now open.
+        assert engine._db is not None
+    finally:
         engine.on_session_end("session-id", [])
 
 
-def test_on_session_reset_raises_with_epic_pointer() -> None:
+@_skip_no_extension_loading
+def test_on_session_end_no_longer_raises(tmp_home: Path) -> None:
+    """02-03: ``on_session_end`` closes the DB rather than raising."""
+    engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
+    engine.on_session_start("session-id")
+    engine.on_session_end("session-id", [])
+    # DB closed.
+    assert engine._db is None
+
+
+def test_on_session_reset_no_longer_raises() -> None:
+    """02-03: ``on_session_reset`` zeroes token state rather than raising."""
     engine = LCMEngine()
-    with pytest.raises(NotImplementedError, match=r"Epic 02"):
-        engine.on_session_reset()
+    engine.last_prompt_tokens = 100
+    engine.on_session_reset()
+    assert engine.last_prompt_tokens == 0
 
 
 # ---------------------------------------------------------------------------
