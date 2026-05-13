@@ -1,407 +1,201 @@
-"""Per-conversation async transaction mutex + savepoint-based reentrancy.
+"""Per-DB synchronous transaction wrapper with savepoint reentrancy.
 
-Ports ``lossless-claw/src/transaction-mutex.ts`` (commit ``1f07fbd``, 202 LOC)
-to Python. The TS module serialises concurrent SQLite write transactions on
-a shared ``DatabaseSync`` handle so that two async paths cannot interleave
-``BEGIN IMMEDIATE`` calls and trigger SQLite's "cannot start a transaction
-within a transaction" error (regression: lossless-claw issue #260).
+Port of ``lossless-claw/src/transaction-mutex.ts`` (LCM commit ``1f07fbd``,
+202 LOC TS → ~140 LOC Python).
 
-### Why we need this in Python
+Per ADR-017 (synchronous-by-design), the Python port replaces TS's
+async lock + ``AsyncLocalStorage`` with a synchronous threading-based
+construct:
 
-ADR-018 §"Decision" picks **Option A**: ``asyncio.Task`` per worker kind +
-``dict[str, asyncio.Lock]`` per conversation + the ``lcm_worker_lock`` table
-for cross-process safety. ADR-017 keeps the *DB calls themselves* synchronous,
-but everything that surrounds them is ``async`` — Voyage HTTP, the worker
-loop, the eventual LLM streaming surface. As soon as two ``await`` points
-hand control back to the event loop while a transaction is mid-flight, the
-next coroutine that calls ``BEGIN IMMEDIATE`` on the same connection blows up.
+* A module-level ``threading.RLock`` per ``id(db)`` serializes writers on
+  the same connection. (RLock: re-acquirable by the same thread; the lock
+  itself is the natural reentrancy guard alongside the depth counter.)
+* A thread-local depth map ``threading.local().depth_by_db_id`` tracks
+  current nesting level. The first ``with_database_transaction`` opens a
+  real transaction; subsequent calls on the same thread open a
+  ``SAVEPOINT``.
+* Savepoint names are monotonic via a module-level counter; collision-
+  free even if two different DBs nest concurrently.
 
-The mutex is **not** about thread safety — sync-by-design SQLite is single-
-threaded under ADR-017. It's about *task* safety: serialising the points
-where each coroutine enters ``BEGIN IMMEDIATE`` / ``COMMIT`` on a per-
-conversation key so that distinct conversations parallelise but the same
-conversation drains in order.
+The semantics are identical to the TS source:
 
-### Python port shape (per ADR-018 §Consequences + doctor-ops.md §"Transaction-mutex")
-
-* **Locks**: ``dict[str, asyncio.Lock]`` keyed by ``conversation_id``
-  (stringified for symmetry with TS' string-keyed WeakMap; integer ids are
-  accepted and coerced). A lock is created lazily on first acquire and lives
-  for the process lifetime — bounded memory in practice because real
-  workloads touch O(thousands) of conversations.
-* **Reentrancy via savepoints**: SQLite forbids nested ``BEGIN``, but
-  ``SAVEPOINT``/``RELEASE``/``ROLLBACK TO`` is the supported recursion
-  primitive. A nested call on the same ``conversation_id`` from the same
-  asyncio task uses ``SAVEPOINT sp_<N>`` instead of opening a new BEGIN.
-  Depth is tracked via :class:`contextvars.ContextVar` so each asyncio task
-  has its own stack (replaces TS' ``AsyncLocalStorage``).
-* **Timeout**: a contention-with-deadline path raises
-  :class:`TransactionMutexTimeout` (caller picks the timeout — default 30 s
-  mirrors the connection-level ``busy_timeout`` per storage.md §3).
-
-### Public surface
-
-| Symbol | TS analogue | Notes |
-|---|---|---|
-| :class:`ConversationLockManager` | (new wrapper) | Holds the lock dict + depth ContextVar |
-| ``manager.lock(conversation_id)`` | ``acquireTransactionLock(db)`` | ``async with mgr.lock(cid): ...`` |
-| ``manager.transaction(conn, cid, ...)`` | ``withDatabaseTransaction(db, ...)`` | Async ctxmgr; opens BEGIN/SAVEPOINT |
-| :class:`TransactionMutexTimeout` | ``DatabaseTransactionTimeoutError`` | Timeout signal |
-
-The async ``transaction()`` context manager combines the two concerns from
-TS — lock acquisition + transaction shape — into a single ``async with``.
-A nested call on the same ``conversation_id`` inside the same task detects
-non-zero savepoint depth and emits ``SAVEPOINT sp_<N>`` instead of a fresh
-``BEGIN``; on exit it issues ``RELEASE`` (success) or ``ROLLBACK TO``
-(failure) — preserves TS' verbatim semantics for nested error isolation.
-
-### Wave-1 cross-task safety (ADR-029)
-
-The ``contextvars.ContextVar`` runs of :class:`asyncio.Task` boundaries — a
-new task inherits a copy of its parent's context, but mutations do **not**
-propagate back. This is exactly what we want: a nested ``transaction()``
-inside the same task sees ``depth > 0`` and uses a savepoint; a peer task
-that runs in parallel sees ``depth == 0`` (its own copy) and contends for
-the lock normally. ``AsyncLocalStorage`` in TS has the same shape.
-
-### Reentrant lock acquisition discipline
-
-:class:`asyncio.Lock` is **not reentrant**. If a task acquires a lock and
-then re-enters the same lock without releasing, it will deadlock. The
-:meth:`transaction` helper avoids this by checking the savepoint-depth
-ContextVar *before* trying to acquire the lock — a nested entry on the same
-``(task, conversation_id)`` skips :meth:`lock` entirely and goes straight to
-``SAVEPOINT``. Direct callers of :meth:`lock` must not re-enter.
+* First-level scope opens the requested transaction mode (``BEGIN`` or
+  ``BEGIN IMMEDIATE``).
+* Nested scopes open a savepoint (``SAVEPOINT lcm_txn_<n>``) and use
+  ``ROLLBACK TO`` + ``RELEASE`` on failure / ``RELEASE`` on success.
+* All-or-nothing: any exception at any nesting level rolls back its own
+  level and re-raises; outer scopes see the partial rollback and decide
+  whether to roll back further.
 
 See:
 
-* ADR-017 — synchronous DB layer (the mutex exists *because* the DB is sync).
-* ADR-018 — concurrency model (``asyncio.Lock`` per conversation; this file).
-* ADR-029 — Wave-N provenance.
-* ``docs/porting-guides/doctor-ops.md`` §"Transaction-mutex" — TS reference.
-* ``docs/porting-guides/storage.md`` §10 risk #2 — savepoint-depth concern.
-* ``lossless-claw/src/transaction-mutex.ts`` — verbatim TS source.
-* ``epics/01-storage/01-13-integrity-prune.md`` — issue spec.
+* ``docs/adr/017-sync-vs-async-db.md`` — the synchronous decision.
+* ``docs/porting-guides/storage.md`` §10 — the savepoint pattern.
+* ``lossless-claw/src/transaction-mutex.ts`` lines 155-202 — the TS
+  ``withDatabaseTransaction`` whose semantics we mirror.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
-import logging
+import itertools
 import sqlite3
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Literal
+import threading
+from typing import Callable, Dict, Literal, TypeVar
 
 __all__ = [
     "BeginTransactionStatement",
-    "ConversationLockManager",
-    "TransactionMutexTimeout",
+    "get_held_lock_depth",
+    "with_database_transaction",
 ]
 
+T = TypeVar("T")
 
-_log = logging.getLogger("lossless_hermes.transaction_mutex")
-
-
-# ---------------------------------------------------------------------------
-# Types + errors
-# ---------------------------------------------------------------------------
-
-
-# Mirrors the TS ``BeginTransactionStatement`` literal type — the two modes
-# of opening a transaction. ``BEGIN`` is the lazy/deferred mode (other
-# writers may grab the lock first); ``BEGIN IMMEDIATE`` takes the reserved
-# lock up front. Production callers use ``BEGIN IMMEDIATE`` per storage.md
-# §"Concurrency invariant"; tests sometimes use plain ``BEGIN`` for read-
-# heavy paths.
 BeginTransactionStatement = Literal["BEGIN", "BEGIN IMMEDIATE"]
 
 
-class TransactionMutexTimeout(Exception):
-    """Raised when lock acquisition exceeds the configured timeout.
-
-    Mirrors the TS ``DatabaseTransactionTimeoutError`` shape. The integer
-    millisecond value matches the TS error for log-parity.
-    """
-
-    def __init__(self, timeout_s: float) -> None:
-        self.timeout_s = timeout_s
-        timeout_ms = int(timeout_s * 1000)
-        super().__init__(f"Timed out after {timeout_ms}ms waiting for exclusive database access.")
-
-
 # ---------------------------------------------------------------------------
-# Savepoint-depth tracking via contextvars
+# Module-level locking + savepoint state
 # ---------------------------------------------------------------------------
-#
-# Replaces TS ``AsyncLocalStorage<Map<DatabaseSync, number>>`` with a
-# task-local ``dict[str, int]`` keyed by conversation id. ContextVar is the
-# Python equivalent: each asyncio.Task gets its own copy of the dict, so
-# nested ``transaction()`` calls on the same task see the parent's depth,
-# while peer tasks start fresh.
-#
-# We store a *mapping*, not a single int, so multiple distinct conversations
-# can be held by the same task without trampling each other's depth.
-_depth_var: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar(
-    "lossless_hermes_txn_savepoint_depth",
-    default={},  # noqa: B039 - immutable default by convention; we always copy before mutating
-)
+
+# One ``threading.RLock`` per Connection identity. Cleaned up via
+# ``_release_lock_if_unused`` when the depth returns to zero.
+_locks_by_db: Dict[int, threading.RLock] = {}
+_locks_registry_lock = threading.Lock()
+
+# Monotonic savepoint name source. Locked by a separate small lock so the
+# generator increment doesn't race even on free-threaded Python builds.
+_savepoint_counter = itertools.count(1)
 
 
-def _current_depth(conversation_key: str) -> int:
-    """Return the savepoint depth held for ``conversation_key`` on this task."""
-    return _depth_var.get().get(conversation_key, 0)
+def _get_db_lock(db_id: int) -> threading.RLock:
+    """Return the RLock for ``db_id``, creating it on first use."""
+    with _locks_registry_lock:
+        lock = _locks_by_db.get(db_id)
+        if lock is None:
+            lock = threading.RLock()
+            _locks_by_db[db_id] = lock
+        return lock
 
 
-def _push_depth(conversation_key: str) -> int:
-    """Increment the savepoint depth for ``conversation_key``.
+# Per-thread depth tracking. ``threading.local`` storage is naturally
+# isolated between threads — no further locking needed.
+class _ThreadLocalDepth(threading.local):
+    """Thread-local depth counter keyed by ``id(db)``."""
 
-    Returns the **new** depth so the caller can use it as the savepoint
-    index. Mutates a fresh dict so the ContextVar's parent value is never
-    aliased (preserves the per-task isolation guarantee).
+    def __init__(self) -> None:
+        # Default attribute — initialized lazily per thread.
+        self.depth_by_db_id: Dict[int, int] = {}
+
+
+_thread_local = _ThreadLocalDepth()
+
+
+def get_held_lock_depth(db: sqlite3.Connection) -> int:
+    """Return current transaction depth for ``db`` on this thread.
+
+    Mirrors the TS ``getHeldLockDepth`` helper. Returns 0 when no
+    transaction is currently open by this thread for this connection,
+    1 when the outermost transaction is open, 2+ for nested savepoints.
     """
-    current = dict(_depth_var.get())
-    new_depth = current.get(conversation_key, 0) + 1
-    current[conversation_key] = new_depth
-    _depth_var.set(current)
-    return new_depth
-
-
-def _pop_depth(conversation_key: str) -> None:
-    """Decrement the savepoint depth for ``conversation_key``.
-
-    Removes the entry entirely when depth hits zero so the per-task dict
-    stays small and the next outer entry on this key starts a fresh BEGIN.
-    """
-    current = dict(_depth_var.get())
-    depth = current.get(conversation_key, 0)
-    if depth <= 1:
-        current.pop(conversation_key, None)
-    else:
-        current[conversation_key] = depth - 1
-    _depth_var.set(current)
-
-
-# Monotonic counter for savepoint names. Module-level so two concurrent
-# tasks racing into nested savepoints on different conversations don't
-# collide on names (SQLite scopes savepoints per-connection, so a name
-# collision would not corrupt state, but unique names are easier to debug).
-_savepoint_counter: int = 0
+    return _thread_local.depth_by_db_id.get(id(db), 0)
 
 
 def _next_savepoint_name() -> str:
-    """Return a fresh ``sp_<N>`` savepoint name.
-
-    Mirrors TS ``nextSavepointName()`` — a module-level monotonically
-    increasing id with a ``lcm_txn_savepoint_`` prefix. We keep the TS
-    prefix for log-grep parity.
-    """
-    global _savepoint_counter
-    _savepoint_counter += 1
-    return f"lcm_txn_savepoint_{_savepoint_counter}"
+    """Return the next ``SAVEPOINT lcm_txn_<n>`` name (monotonic)."""
+    return f"lcm_txn_{next(_savepoint_counter)}"
 
 
 # ---------------------------------------------------------------------------
-# ConversationLockManager
+# Public API
 # ---------------------------------------------------------------------------
 
 
-class ConversationLockManager:
-    """Per-conversation async lock + savepoint-based reentrant transaction.
+def with_database_transaction(
+    db: sqlite3.Connection,
+    begin_statement: BeginTransactionStatement,
+    operation: Callable[[], T],
+) -> T:
+    """Run ``operation`` inside a serialized DB transaction.
 
-    Constructed once per database (typically at engine init). Holds a
-    ``dict[str, asyncio.Lock]`` of per-conversation locks created lazily.
+    The first call on a given thread+connection acquires the
+    per-connection :class:`threading.RLock`, opens the requested
+    transaction (``BEGIN`` or ``BEGIN IMMEDIATE``), runs ``operation``,
+    then COMMITs (or ROLLBACK on exception).
 
-    Public surface:
+    Subsequent reentrant calls on the same thread open a SAVEPOINT
+    instead, and use ``RELEASE`` / ``ROLLBACK TO`` + ``RELEASE`` to
+    nest the operation under the outer transaction.
 
-    * :meth:`lock` — low-level async context manager. ``async with
-      mgr.lock(cid): ...`` — acquires the conv lock, yields, releases.
-      Not reentrant; use :meth:`transaction` for nested scopes.
-    * :meth:`transaction` — high-level async context manager that combines
-      lock acquisition with transaction shape. Reentrancy via savepoints.
+    Args:
+        db: Open :class:`sqlite3.Connection`.
+        begin_statement: ``"BEGIN"`` (deferred — acquires lock on first
+            read/write) or ``"BEGIN IMMEDIATE"`` (reserved-mode — fail
+            fast on contention). Used only at the outermost level.
+        operation: Zero-arg callable returning ``T``. May call
+            :func:`with_database_transaction` recursively on the same
+            ``db``; those nested calls become savepoints.
 
-    Example::
+    Returns:
+        Whatever ``operation`` returns.
 
-        mgr = ConversationLockManager()
-        # Two coroutines trying to write to conversation 42 will serialize;
-        # peers on different conversation ids run in parallel.
-        async with mgr.transaction(conn, conversation_id=42):
-            conn.execute("INSERT INTO messages ...")
-            # Nested transaction on the same conversation uses a savepoint:
-            async with mgr.transaction(conn, conversation_id=42):
-                conn.execute("UPDATE summaries ...")
+    Raises:
+        Any exception raised by ``operation`` is re-raised after the
+        appropriate ROLLBACK / ROLLBACK TO step.
+        :class:`sqlite3.OperationalError` if ``db`` is already inside
+        a transaction opened outside this helper (BEGIN-in-BEGIN).
     """
-
-    def __init__(self) -> None:
-        # ``dict[str, asyncio.Lock]`` keyed by conversation id (string).
-        # Integer ids are accepted by the public API and stringified
-        # internally for symmetry with TS' WeakMap<DatabaseSync, ...> shape
-        # (LCM keys by the DB instance; Hermes keys by the conversation it
-        # belongs to — the boundary that maps to "session_id" in the
-        # doctor-ops.md guide).
-        self._locks: dict[str, asyncio.Lock] = {}
-
-        # Guards lazy creation of per-conversation locks. Without this, two
-        # tasks racing for the same conversation id could each see an empty
-        # dict, create a new lock, and skip past each other — defeating the
-        # mutex. The "init" lock is itself an asyncio.Lock; on Python 3.11+
-        # constructing one outside an event loop is fine, but acquiring it
-        # requires the loop. We construct lazily in :meth:`_get_lock` to be
-        # safe under "create the manager before the event loop starts" use
-        # cases.
-        self._init_lock: asyncio.Lock | None = None
-
-    def _get_lock(self, conversation_key: str) -> asyncio.Lock:
-        """Return the per-conversation lock, creating it if missing.
-
-        Lazy single-task creation. Two concurrent calls on the same key
-        would each construct a new lock and the second would shadow the
-        first — but we run inside an asyncio event loop and the dict insert
-        is atomic at the bytecode level. The ``setdefault`` pattern below
-        is the canonical race-free shape: ``dict.setdefault`` is atomic
-        for the *insertion*, so even under the GIL-aware async scheduler
-        the second caller observes the first caller's lock.
-        """
-        return self._locks.setdefault(conversation_key, asyncio.Lock())
-
-    @asynccontextmanager
-    async def lock(
-        self,
-        conversation_id: int | str,
-        *,
-        timeout: float | None = None,
-    ) -> AsyncIterator[None]:
-        """Acquire the per-conversation lock for the duration of the block.
-
-        **Not reentrant**: nested acquisition on the same ``(task,
-        conversation_id)`` will deadlock — use :meth:`transaction` for
-        nested transaction scopes (it dispatches to savepoints on re-entry).
-
-        Args:
-            conversation_id: integer or string id; coerced to str for the
-                dict key.
-            timeout: seconds before raising :class:`TransactionMutexTimeout`.
-                ``None`` means wait forever (preserves TS
-                ``acquireTransactionLock`` semantics; the timeout-aware path
-                mirrors ``acquireTransactionLockWithTimeout``).
-
-        Raises:
-            TransactionMutexTimeout: if ``timeout`` expires before
-                acquisition.
-        """
-        key = str(conversation_id)
-        per_conv_lock = self._get_lock(key)
-
-        if timeout is None:
-            await per_conv_lock.acquire()
-        else:
-            try:
-                await asyncio.wait_for(per_conv_lock.acquire(), timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                raise TransactionMutexTimeout(timeout) from exc
-
+    db_id = id(db)
+    if get_held_lock_depth(db) > 0:
+        # Reentrant: open a savepoint inside the held transaction.
+        savepoint = _next_savepoint_name()
+        db.execute(f"SAVEPOINT {savepoint}")
+        _thread_local.depth_by_db_id[db_id] = _thread_local.depth_by_db_id[db_id] + 1
         try:
-            yield
+            result = operation()
+            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return result
+        except BaseException:
+            db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
         finally:
-            per_conv_lock.release()
+            _thread_local.depth_by_db_id[db_id] = _thread_local.depth_by_db_id[db_id] - 1
+            if _thread_local.depth_by_db_id[db_id] <= 0:
+                _thread_local.depth_by_db_id.pop(db_id, None)
 
-    @asynccontextmanager
-    async def transaction(
-        self,
-        conn: sqlite3.Connection,
-        conversation_id: int | str,
-        *,
-        begin: BeginTransactionStatement = "BEGIN IMMEDIATE",
-        timeout: float | None = None,
-    ) -> AsyncIterator[None]:
-        """Run a block inside a serialized SQLite transaction.
-
-        First entry on a ``(task, conversation_id)`` acquires the per-conv
-        lock and emits ``begin``; nested entries on the same key reuse the
-        held lock and emit a ``SAVEPOINT`` instead (preserves TS reentrancy
-        semantics — see :func:`withDatabaseTransaction` in the TS source).
-
-        Args:
-            conn: the SQLite connection to issue ``BEGIN`` / ``COMMIT`` /
-                ``ROLLBACK`` / ``SAVEPOINT`` against. Must be sync per
-                ADR-017.
-            conversation_id: serialization key. Distinct values parallelise;
-                same value queues up.
-            begin: ``"BEGIN"`` or ``"BEGIN IMMEDIATE"`` — only applied at
-                the **outer** entry (depth == 0). Nested entries always use
-                ``SAVEPOINT`` regardless of this value.
-            timeout: forwarded to :meth:`lock` for the outer entry. Inner
-                entries don't acquire the lock and ignore the timeout.
-
-        Raises:
-            TransactionMutexTimeout: if ``timeout`` expires on the outer
-                acquisition.
-            Any exception from the block — the implementation issues
-                ``ROLLBACK`` (outer) or ``ROLLBACK TO SAVEPOINT`` (nested)
-                before re-raising.
-        """
-        key = str(conversation_id)
-
-        if _current_depth(key) > 0:
-            # Nested re-entry on the same task + conversation. The outer
-            # entry already holds the lock and opened the transaction;
-            # we use a savepoint for isolation.
-            savepoint_name = _next_savepoint_name()
-            conn.execute(f"SAVEPOINT {savepoint_name}")
-            _push_depth(key)
+    # Outermost scope: acquire the per-connection lock and open the txn.
+    lock = _get_db_lock(db_id)
+    lock.acquire()
+    try:
+        _thread_local.depth_by_db_id[db_id] = 1
+        # Python's ``sqlite3`` module with the default ``isolation_level=''``
+        # auto-opens an implicit transaction on DML statements (INSERT /
+        # UPDATE / DELETE). If a DML ran outside any
+        # ``with_database_transaction`` call before this one (typical in
+        # bulk-write code paths), the conn is in an implicit txn here and
+        # ``BEGIN IMMEDIATE`` would fail with "cannot start a transaction
+        # within a transaction". COMMIT the implicit txn first to leave a
+        # clean slate. (Production should use
+        # :func:`lossless_hermes.db.connection.open_lcm_db` with
+        # ``isolation_level=None`` to avoid this entirely.)
+        if db.in_transaction:
             try:
-                yield
-                conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-            except BaseException:
-                # Wave-N rollback semantics from TS source (lines 175-180):
-                # always ROLLBACK TO + RELEASE, then re-raise. RELEASE after
-                # ROLLBACK TO is correct — SQLite keeps the savepoint frame
-                # alive until released, so without the explicit release the
-                # next outer-level RELEASE/COMMIT can fail.
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                    conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                except sqlite3.OperationalError:
-                    # Defense-in-depth: if the underlying transaction was
-                    # already aborted by SQLite, ROLLBACK TO may itself
-                    # fail. Swallow so we surface the original exception
-                    # from the block (mirrors TS try/catch with ignored
-                    # rollback errors in similar guards).
-                    _log.warning(
-                        "savepoint %s rollback/release failed; propagating original",
-                        savepoint_name,
-                        exc_info=True,
-                    )
-                raise
-            finally:
-                _pop_depth(key)
-            return
-
-        # Outer entry — acquire the per-conv lock + open BEGIN.
-        async with self.lock(conversation_id, timeout=timeout):
-            # Flush any implicit transaction Python's sqlite3 module may have
-            # opened on prior DML. With ``isolation_level=""`` (the stdlib
-            # default), Python auto-issues a BEGIN before the first INSERT /
-            # UPDATE / DELETE statement; without flushing, our ``BEGIN
-            # IMMEDIATE`` here would raise "cannot start a transaction
-            # within a transaction". A no-op ``commit()`` when no implicit
-            # txn is open is safe and cheap.
-            if conn.in_transaction:
-                conn.commit()
-            conn.execute(begin)
-            _push_depth(key)
+                db.execute("COMMIT")
+            except sqlite3.Error:  # pragma: no cover - defensive
+                pass
+        db.execute(begin_statement)
+        try:
+            result = operation()
+            db.execute("COMMIT")
+            return result
+        except BaseException:
             try:
-                yield
-                conn.execute("COMMIT")
-            except BaseException:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    _log.warning(
-                        "outer ROLLBACK failed for conversation_id=%s; propagating original",
-                        key,
-                        exc_info=True,
-                    )
-                raise
-            finally:
-                _pop_depth(key)
+                db.execute("ROLLBACK")
+            except sqlite3.Error:  # pragma: no cover - defensive
+                # Already-rolled-back txn — re-raise the original exc.
+                pass
+            raise
+        finally:
+            _thread_local.depth_by_db_id.pop(db_id, None)
+    finally:
+        lock.release()
