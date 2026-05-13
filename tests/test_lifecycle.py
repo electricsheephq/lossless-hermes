@@ -38,6 +38,7 @@ See:
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -49,12 +50,40 @@ from lossless_hermes.store.compaction_telemetry import CompactionTelemetryStore
 from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
 
+# ---------------------------------------------------------------------------
+# Skip marker: actions/setup-python macOS builds lack enable_load_extension
+# ---------------------------------------------------------------------------
+#
+# Per ADR-004 §Open questions item 1 and ADR-028 §Decision point 8, the
+# actions/setup-python macOS pre-built CPython ships without
+# ``--enable-loadable-sqlite-extensions``. ``on_session_start`` opens an
+# ``open_lcm_db()`` connection that loads sqlite-vec, so the Apple-Python
+# guard fires and raises before any test assertions can run on those
+# cells. The guard-introspection tests below still run — they monkey-
+# patch ``_has_sqlite_extension_loading`` rather than depending on the
+# OS-level capability — so this skip targets only the DB-opening tests.
+#
+# Ubuntu cells + Homebrew/pyenv/uv-managed Python all have extension
+# loading enabled, so the skip only fires on the macOS GH-Actions runners.
+# Mirrors ``_skip_no_extension_loading`` in ``tests/test_db_connection.py``.
+_skip_no_extension_loading = pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "enable_load_extension"),
+    reason=(
+        "actions/setup-python on macOS ships a CPython build without "
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load. "
+        "Apple-Python-guard tests still run (they monkey-patch the "
+        "introspection hook). See ADR-004 §Open questions item 1 + "
+        "ADR-028 §Decision point 8."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # on_session_start — opens DB, runs migrations, instantiates stores
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 def test_on_session_start_opens_db_at_canonical_path(tmp_home: Path) -> None:
     """ADR-002 §Option A: DB lives at ``$HERMES_HOME/lossless-hermes/lcm.db``.
 
@@ -73,6 +102,7 @@ def test_on_session_start_opens_db_at_canonical_path(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_start_honors_explicit_database_path(tmp_home: Path) -> None:
     """``config.database_path`` overrides the canonical fallback.
 
@@ -95,6 +125,7 @@ def test_on_session_start_honors_explicit_database_path(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_start_runs_migrations(tmp_home: Path) -> None:
     """The migration ladder runs once on first ``on_session_start``.
 
@@ -114,6 +145,7 @@ def test_on_session_start_runs_migrations(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_start_migrations_are_idempotent(tmp_home: Path) -> None:
     """A second ``on_session_start`` on the same engine is a no-op DB-open.
 
@@ -135,6 +167,7 @@ def test_on_session_start_migrations_are_idempotent(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_start_instantiates_all_four_stores(tmp_home: Path) -> None:
     """ADR-027 §Consequences: state lives on shell, mixins consume it.
 
@@ -154,6 +187,7 @@ def test_on_session_start_instantiates_all_four_stores(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_start_creates_parent_directory(tmp_home: Path) -> None:
     """The ``$HERMES_HOME/lossless-hermes/`` dir is created by ``open_lcm_db``."""
     # Pre-condition: only ``.hermes`` exists (created by tmp_home fixture).
@@ -229,6 +263,7 @@ def test_apple_python_guard_does_not_fire_at_construction(
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 def test_on_session_end_closes_db(tmp_home: Path) -> None:
     """``on_session_end`` closes the connection via the sanctioned factory."""
     engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
@@ -239,6 +274,7 @@ def test_on_session_end_closes_db(tmp_home: Path) -> None:
     assert engine._db is None
 
 
+@_skip_no_extension_loading
 def test_on_session_end_clears_all_store_references(tmp_home: Path) -> None:
     """After teardown every store reference is ``None`` again."""
     engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
@@ -252,6 +288,7 @@ def test_on_session_end_clears_all_store_references(tmp_home: Path) -> None:
     assert engine._maintenance_store is None
 
 
+@_skip_no_extension_loading
 def test_on_session_end_is_idempotent_after_close(tmp_home: Path) -> None:
     """Calling ``on_session_end`` twice is safe (no crash)."""
     engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
@@ -312,6 +349,7 @@ def test_on_session_reset_clears_last_seen_message_idx(tmp_home: Path) -> None:
     assert engine._last_seen_message_idx == {}
 
 
+@_skip_no_extension_loading
 def test_on_session_reset_does_not_close_db(tmp_home: Path) -> None:
     """``/reset`` is within-process — DB connection stays open."""
     engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
@@ -347,6 +385,7 @@ def test_on_session_reset_without_start(tmp_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 def test_full_lifecycle_round_trip(tmp_home: Path) -> None:
     """A full session: start → use → end → start-again works correctly.
 
@@ -369,6 +408,7 @@ def test_full_lifecycle_round_trip(tmp_home: Path) -> None:
     assert engine._db is None
 
 
+@_skip_no_extension_loading
 def test_db_path_relative_to_hermes_home_param(tmp_home: Path) -> None:
     """``hermes_home`` from the constructor is what gets used.
 

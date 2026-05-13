@@ -35,6 +35,7 @@ See:
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict
@@ -48,6 +49,26 @@ from lossless_hermes.engine.compact import _CompactMixin
 from lossless_hermes.engine.ingest import _IngestMixin
 from lossless_hermes.engine.lifecycle import _LifecycleMixin
 from lossless_hermes.hermes_bridge import ContextEngine
+
+# ---------------------------------------------------------------------------
+# Skip marker: actions/setup-python macOS builds lack enable_load_extension
+# ---------------------------------------------------------------------------
+#
+# Mirrors ``_skip_no_extension_loading`` in ``tests/test_db_connection.py``
+# (ADR-004 §Open questions item 1, ADR-028 §Decision point 8). The
+# ``on_session_start`` lifecycle body filled in by issue 02-03 opens an
+# ``open_lcm_db()`` connection that loads sqlite-vec, which is impossible
+# on the actions/setup-python macOS pre-built CPython. Tests that exercise
+# only the construction-time invariants or monkey-patch the introspection
+# hook remain runnable on those cells.
+_skip_no_extension_loading = pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "enable_load_extension"),
+    reason=(
+        "actions/setup-python on macOS ships a CPython build without "
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load. "
+        "See ADR-004 §Open questions item 1 + ADR-028 §Decision point 8."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +230,7 @@ def test_constructor_does_not_open_db(tmp_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@_skip_no_extension_loading
 def test_on_session_start_no_longer_stubbed(tmp_home: Path) -> None:
     """02-03 filled in the body; ``on_session_start`` now opens the DB.
 
@@ -224,6 +246,7 @@ def test_on_session_start_no_longer_stubbed(tmp_home: Path) -> None:
         engine.on_session_end("sess-1", [])
 
 
+@_skip_no_extension_loading
 def test_on_session_end_no_longer_stubbed(tmp_home: Path) -> None:
     """02-03 filled in the body; ``on_session_end`` now closes the DB."""
     engine = LCMEngine(hermes_home=tmp_home, config=LcmConfig())
