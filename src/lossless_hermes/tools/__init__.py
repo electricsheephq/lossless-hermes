@@ -155,6 +155,7 @@ TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
 from lossless_hermes.tools import expand as _expand  # noqa: F401, E402
 from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
+from lossless_hermes.tools import grep as _grep  # noqa: F401, E402
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402
 
 
