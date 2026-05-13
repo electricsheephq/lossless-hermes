@@ -61,6 +61,7 @@ deploys.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -78,6 +79,14 @@ from lossless_hermes.voyage.client import (
     VoyageClient,
     VoyageError,
 )
+
+# Issue 05-10: INFO-level logger for degradation paths. Each degradation
+# scenario emits a single ``INFO`` line so operators observing high
+# degradation rates can grep these (NOT ``WARNING``: the system is
+# functioning; degradation is informational). Use ``logger.info`` rather
+# than the per-module ``_log`` shorthand from ``store.py`` / ``backfill.py``
+# so the call sites are self-evident at a glance.
+_log = logging.getLogger("lossless_hermes.embeddings.hybrid_search")
 
 __all__ = [
     "DEFAULT_K_FTS",
@@ -217,6 +226,45 @@ class HybridSearchResult:
     Python port surfaces every degraded flag at the top level (no
     optional/undefined gymnastics like TS) so callers can branch on
     boolean fields without ``getattr``.
+
+    **Four degraded-result flags (issue 05-10 contract).** Callers
+    (``lcm_grep`` in Epic 06, ``/lcm health`` in Epic 08) consume these
+    to drive operator-visible warnings / health diagnostics. ``True``
+    on any of the first three means the hits list is still valid but
+    less precise than the healthy path.
+
+    +----------------------------+-------------------------------------------+
+    | Flag                       | True when ... / caller action             |
+    +============================+===========================================+
+    | :attr:`degraded_to_fts_only`           | vec0 unavailable / no profile /          |
+    |                            | semantic Voyage non-auth error /          |
+    |                            | :class:`SemanticSearchUnavailableError`.  |
+    |                            | **Caller:** operator warning;             |
+    |                            | "vec0 missing — install sqlite-vec" or    |
+    |                            | "Voyage down — retry later".              |
+    +----------------------------+-------------------------------------------+
+    | :attr:`degraded_skipped_rerank`        | Rerank Voyage non-auth error,            |
+    |                            | ``rerank=False`` (explicit), or           |
+    |                            | ``rerank_packed`` empty.                  |
+    |                            | **Caller:** RRF used; precision slightly  |
+    |                            | lower than the reranked path.             |
+    +----------------------------+-------------------------------------------+
+    | :attr:`rerank_pack_truncated`          | At least one candidate excluded from     |
+    |                            | the rerank input by the 510K-token cap.   |
+    |                            | **Caller:** operator warning; tail        |
+    |                            | candidates aren't reranked but stay       |
+    |                            | counted in :attr:`candidate_count`.       |
+    +----------------------------+-------------------------------------------+
+    | :attr:`rerank_packed_count`            | Always set when rerank ran. ``0`` when   |
+    |                            | rerank skipped.                          |
+    |                            | **Caller:** diagnostic only; surfaces in |
+    |                            | ``/lcm health`` and ``lcm_grep`` output. |
+    +----------------------------+-------------------------------------------+
+
+    **Auth errors never silently degrade.** :class:`VoyageError` with
+    ``kind="auth"`` propagates out of :func:`run_hybrid_search` so the
+    operator sees an actionable "set VOYAGE_API_KEY" — not a degraded
+    result. Tested in both arms (semantic embed and rerank).
     """
 
     hits: list[HybridHit] = field(default_factory=list)
@@ -232,22 +280,42 @@ class HybridSearchResult:
     rerank call. ``0`` when both are skipped."""
 
     degraded_to_fts_only: bool = False
-    """``True`` when the semantic arm failed (vec0 unavailable OR
-    Voyage non-auth error). Result is FTS-only."""
+    """Issue 05-10 flag #1: ``True`` when the semantic arm failed
+    (vec0 unavailable OR no active profile OR Voyage non-auth error
+    OR :class:`SemanticSearchUnavailableError`). Result is FTS-only.
+
+    **Caller action:** operator warning; results still useful (RRF
+    over FTS rank alone). Don't error — FTS-only is often the right
+    answer when the operator hasn't set ``VOYAGE_API_KEY`` yet.
+    """
 
     degraded_skipped_rerank: bool = False
-    """``True`` when RRF was used instead of rerank (``rerank=False``
-    OR Voyage rerank non-auth error OR packed-empty)."""
+    """Issue 05-10 flag #2: ``True`` when RRF was used instead of
+    Voyage rerank-2.5 (``rerank=False`` OR Voyage rerank non-auth
+    error OR ``rerank_packed`` list was empty after the pack loop).
+
+    **Caller action:** RRF used; precision slightly lower than the
+    reranked path. Diagnostic only; no operator-visible warning.
+    """
 
     rerank_pack_truncated: bool = False
-    """Wave-10: ``True`` when at least one candidate was dropped from
-    the rerank input due to the 510K-token budget. The dropped
-    candidates remain in ``candidate_count`` for backstop visibility
-    but do not get a rerank score."""
+    """Issue 05-10 flag #3 (Wave-10 fix): ``True`` when at least one
+    candidate was dropped from the rerank input due to the 510K-token
+    budget. The dropped candidates remain in :attr:`candidate_count`
+    for backstop visibility but do not get a rerank score.
+
+    **Caller action:** operator warning; "rerank pack truncated —
+    tail candidates excluded". The RRF backstop scores them, but
+    they didn't get rerank precision.
+    """
 
     rerank_packed_count: int = 0
-    """Wave-10: how many candidates actually made it into the rerank
-    call. ``0`` when rerank skipped."""
+    """Issue 05-10 flag #4 (Wave-10): how many candidates actually
+    made it into the rerank call. ``0`` when rerank skipped.
+
+    **Caller action:** diagnostic only; surfaces in ``/lcm health``
+    output and in ``lcm_grep`` tool response.
+    """
 
     model: str = ""
     """Active embedding model used by the semantic arm. Empty when the
@@ -341,7 +409,13 @@ async def _semantic_with_degrade(
             query_vector=query_vector,
             input_type=input_type,
         )
-    except SemanticSearchUnavailableError:
+    except SemanticSearchUnavailableError as e:
+        # Issue 05-10: log the degrade at INFO (not WARNING — the system
+        # is functioning; FTS-only still returns useful results). Include
+        # the unavailability reason so operators can correlate with vec0
+        # config / model registration. The flag ``degraded_to_fts_only``
+        # is set on the result by the caller.
+        _log.info("[hybrid] degraded to FTS-only: semantic unavailable (%s)", e)
         return None
     except VoyageError as e:
         # v4.1 Final.review.3 (Slice 1 Gap A / Loop 8 B-1 HIGH): mirror
@@ -352,6 +426,14 @@ async def _semantic_with_degrade(
         # Original: lossless-claw/src/embeddings/hybrid-search.ts:240-249.
         if e.kind == "auth":
             raise
+        # Issue 05-10: INFO log on Voyage non-auth degrade so operators
+        # observing high rates can grep the path (``kind`` and the message
+        # capture what Voyage actually returned — useful for triage).
+        _log.info(
+            "[hybrid] degraded to FTS-only: semantic arm Voyage error kind=%s msg=%s",
+            e.kind,
+            e,
+        )
         return None
 
 
@@ -585,6 +667,18 @@ async def run_hybrid_search(
             cumulative += cand_tokens
         rerank_packed = packed
 
+        # Issue 05-10: emit a single INFO line summarizing pack-truncation
+        # outcome — operators can grep this to estimate how often the
+        # 510K cap is hit in production. Only emit when truncation actually
+        # occurred; the healthy "all candidates packed" path stays silent.
+        if rerank_pack_truncated:
+            _log.info(
+                "[hybrid] rerank pack truncated: packed=%d / %d candidates fit budget=%d",
+                len(packed),
+                len(candidates),
+                budget,
+            )
+
     # -----------------------------------------------------------------
     # Step 5: Voyage rerank (hybrid-search.ts:362-405)
     # -----------------------------------------------------------------
@@ -629,22 +723,44 @@ async def run_hybrid_search(
             # Original: lossless-claw/src/embeddings/hybrid-search.ts:401-405.
             if e.kind == "auth":
                 raise
+            # Issue 05-10: INFO log on rerank Voyage non-auth degrade.
+            # RRF fallback below still produces a result; this is the
+            # "we tried rerank, Voyage hiccuped, falling back" signal.
+            _log.info(
+                "[hybrid] degraded skipped rerank: Voyage error kind=%s msg=%s",
+                e.kind,
+                e,
+            )
             degraded_skipped_rerank = True
     elif rerank_requested and not rerank_packed:
         # Wave-10: every candidate was individually oversized, OR the
         # cumulative budget was hit before any candidate fit. Skip
         # rerank entirely; RRF below handles ranking.
         # Original: lossless-claw/src/embeddings/hybrid-search.ts:407-410.
+        # Issue 05-10: log the packed-empty case — operator-visible signal
+        # that the corpus has at least one candidate so big that rerank
+        # can't even hold it (rare but real).
+        _log.info(
+            "[hybrid] degraded skipped rerank: every candidate exceeded "
+            "the %d-token budget (rerank_pack_truncated also True)",
+            math.floor(MAX_TOKENS_PER_RERANK_CALL * 0.85),
+        )
         degraded_skipped_rerank = True
     elif rerank_requested and voyage is None:
         # Caller wanted rerank but didn't supply a client. Fall back to
         # RRF rather than crash — matches the spirit of the TS path
         # where ``voyageApiKey`` defaults to env and ``rerankCandidates``
         # raises if missing (we surface earlier as RRF degrade).
+        # Issue 05-10: log the missing-client degrade — useful when wiring
+        # ``lcm_grep`` in Epic 06.
+        _log.info("[hybrid] degraded skipped rerank: rerank=True but no VoyageClient supplied")
         degraded_skipped_rerank = True
     else:
         # rerank_requested is False — explicit RRF mode. Not a degrade,
         # but we still use the RRF code path below.
+        # Issue 05-10: NO log line here — the caller asked for RRF mode
+        # explicitly; informing them is noise. ``degraded_skipped_rerank``
+        # stays False because it's not a degrade — it's the requested mode.
         degraded_skipped_rerank = False
 
     # -----------------------------------------------------------------
