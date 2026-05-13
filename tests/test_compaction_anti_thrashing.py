@@ -58,6 +58,7 @@ from lossless_hermes.compaction import (
     CompactionEngine,
     CompactionResult,
     CompactUntilUnderResult,
+    LeafPassOutcome,
     LeafPassResult,
     SummarizeFn,
 )
@@ -194,11 +195,18 @@ class _ScriptedEngine(CompactionEngine):
         summarize: SummarizeFn,
         previous_summary_content: str | None,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
+    ) -> LeafPassOutcome:
         self.leaf_pass_calls += 1
         if not self.leaf_passes:
-            return None
-        return self.leaf_passes.pop(0)
+            # Empty scripted queue → "nothing left to compact", NOT
+            # auth failure. Matches the natural-termination behavior
+            # the Wave-12 guard tests rely on.
+            return LeafPassOutcome(summary=None, auth_failure=False)
+        scripted = self.leaf_passes.pop(0)
+        # Sentinel ``None`` in the scripted queue is the natural
+        # empty-chunk termination; non-None entries are produced
+        # summaries.
+        return LeafPassOutcome(summary=scripted, auth_failure=False)
 
     def _run_condensed_pass(
         self,
@@ -207,11 +215,12 @@ class _ScriptedEngine(CompactionEngine):
         hard_trigger: bool,
         summarize: SummarizeFn,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
+    ) -> LeafPassOutcome:
         self.condensed_pass_calls += 1
         if not self.condensed_passes:
-            return None
-        return self.condensed_passes.pop(0)
+            return LeafPassOutcome(summary=None, auth_failure=False)
+        scripted = self.condensed_passes.pop(0)
+        return LeafPassOutcome(summary=scripted, auth_failure=False)
 
 
 def _make_scripted_engine(

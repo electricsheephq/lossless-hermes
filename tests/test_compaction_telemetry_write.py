@@ -52,6 +52,7 @@ from lossless_hermes.compaction import (
     CompactionEngine,
     CompactionLevel,
     CompactionResult,
+    LeafPassOutcome,
     LeafPassResult,
     SummarizeFn,
 )
@@ -225,10 +226,14 @@ class _ScriptedEngine(CompactionEngine):
         summarize: SummarizeFn,
         previous_summary_content: str | None,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
+    ) -> LeafPassOutcome:
         if not self.leaf_passes:
-            return None
-        return self.leaf_passes.pop(0)
+            # Empty scripted queue → "nothing left to compact", NOT
+            # an auth failure (per the LeafPassOutcome protocol
+            # introduced by PR #81 reviewer MAJOR fix).
+            return LeafPassOutcome(summary=None, auth_failure=False)
+        scripted = self.leaf_passes.pop(0)
+        return LeafPassOutcome(summary=scripted, auth_failure=False)
 
     def _run_condensed_pass(
         self,
@@ -237,10 +242,11 @@ class _ScriptedEngine(CompactionEngine):
         hard_trigger: bool,
         summarize: SummarizeFn,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
+    ) -> LeafPassOutcome:
         if not self.condensed_passes:
-            return None
-        return self.condensed_passes.pop(0)
+            return LeafPassOutcome(summary=None, auth_failure=False)
+        scripted = self.condensed_passes.pop(0)
+        return LeafPassOutcome(summary=scripted, auth_failure=False)
 
 
 def _make_scripted_engine(

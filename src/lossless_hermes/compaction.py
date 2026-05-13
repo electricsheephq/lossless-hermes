@@ -127,10 +127,16 @@ carry the ``# LCM Wave-N`` comment per ADR-029.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import re
 import sys
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Protocol
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable, Literal, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __all__ = [
     "CompactionConfig",
@@ -142,6 +148,9 @@ __all__ = [
     "CompactUntilUnderResult",
     "DEFAULT_LEAF_CHUNK_TOKENS",
     "EMPTY_FRESH_TAIL_ORDINAL",
+    "LcmProviderAuthError",
+    "LeafChunkSelection",
+    "LeafPassOutcome",
     "LeafPassResult",
     "LeafTriggerReason",
     "LeafTriggerResult",
@@ -312,6 +321,49 @@ class LeafPassResult:
     content: str
     removed_tokens: int
     added_tokens: int
+
+
+@dataclass(frozen=True)
+class LeafPassOutcome:
+    """Discriminated return value of :meth:`CompactionEngine._run_leaf_pass`.
+
+    Distinguishes the three terminal states a leaf-pass (or condensed-pass)
+    hook can reach:
+
+    * **summary produced** — ``summary`` set, ``auth_failure=False``;
+      caller increments the running token delta and continues the phase
+      loop.
+    * **empty chunk / voluntary skip** — ``summary=None``,
+      ``auth_failure=False``; caller breaks the phase loop cleanly. TS
+      equivalent: ``leafChunk.items.length === 0`` short-circuit at
+      ``compaction.ts:673-675`` (Phase-1), or the condensed-pass
+      ``!candidate`` short-circuit at ``compaction.ts:721-723``.
+    * **provider-auth failure** — ``summary=None``, ``auth_failure=True``;
+      caller breaks the phase loop AND sets ``CompactionResult.auth_failure
+      = True`` so :meth:`compact_until_under` can short-circuit the round
+      loop instead of retrying. TS equivalent: the ``hadAuthFailure =
+      true; break`` pair at ``compaction.ts:685-687`` (Phase-1) and
+      ``compaction.ts:733-735`` (Phase-2).
+
+    Issue 04-02 introduced this split. Before 04-02 the protocol was just
+    ``LeafPassResult | None`` and both empty-chunk and auth-failure
+    funneled through the same ``None`` return — meaning
+    :meth:`compact_full_sweep` could not set ``auth_failure=True`` on the
+    final :class:`CompactionResult` and the downstream
+    :meth:`compact_until_under` round loop would silently retry across
+    a provider outage. PR #81 reviewer MAJOR finding.
+
+    Attributes:
+        summary: The :class:`LeafPassResult` produced by a successful
+            pass. ``None`` for both empty-chunk and auth-failure
+            terminations.
+        auth_failure: ``True`` iff the pass aborted because the
+            summarizer raised :class:`LcmProviderAuthError`. ``False``
+            for empty-chunk / voluntary-skip terminations.
+    """
+
+    summary: LeafPassResult | None
+    auth_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -563,15 +615,47 @@ class CompactionConfig:
 
 
 class _SummaryStoreLike(Protocol):
-    """Narrow subset of :class:`SummaryStore` consumed by compaction."""
+    """Narrow subset of :class:`SummaryStore` consumed by compaction.
+
+    Issue 04-02 extends the protocol with the persistence methods the
+    leaf-pass body needs: :meth:`get_summary` (to resolve prior leaf-
+    summary continuity), :meth:`insert_summary` (write the new leaf),
+    :meth:`link_summary_to_messages` (DAG edges), and
+    :meth:`replace_context_range_with_summary` (atomic context swap).
+    :meth:`with_transaction` is required so the leaf-pass write +
+    DAG link + context swap commit together (TS lines 1565-1603).
+    """
 
     def get_context_token_count(self, conversation_id: int) -> int: ...
 
     def get_context_items(self, conversation_id: int) -> "list[_ContextItemLike]": ...
 
+    # --- Methods added in issue 04-02 -----------------------------------------
+
+    def get_summary(self, summary_id: str) -> "_SummaryRecordLike | None": ...
+
+    def insert_summary(self, input_: Any) -> Any: ...
+
+    def link_summary_to_messages(
+        self,
+        summary_id: str,
+        message_ids: list[int],
+    ) -> None: ...
+
+    def replace_context_range_with_summary(self, input_: Any) -> None: ...
+
+    def with_transaction(self) -> Any: ...
+
 
 class _ConversationStoreLike(Protocol):
-    """Narrow subset of :class:`ConversationStore` consumed by compaction."""
+    """Narrow subset of :class:`ConversationStore` consumed by compaction.
+
+    Issue 04-02 extends the protocol with :meth:`get_message_parts` so
+    the leaf-pass body's media-annotation step (TS
+    ``annotateMediaContent`` lines 1457-1485) can inspect the parts
+    table to decide whether to swap message content with
+    ``"[Media attachment]"`` or append ``" [with media attachment]"``.
+    """
 
     def get_message_by_id(
         self,
@@ -579,6 +663,8 @@ class _ConversationStoreLike(Protocol):
         *,
         include_suppressed: bool = ...,
     ) -> "_MessageRecordLike | None": ...
+
+    def get_message_parts(self, message_id: int) -> "list[_MessagePartLike]": ...
 
 
 class _ContextItemLike(Protocol):
@@ -591,10 +677,43 @@ class _ContextItemLike(Protocol):
 
 
 class _MessageRecordLike(Protocol):
-    """Structural shape compaction reads from each messages row."""
+    """Structural shape compaction reads from each messages row.
 
+    Issue 04-02 extends the protocol with ``message_id`` + ``created_at``
+    so the leaf-pass body can emit ``[YYYY-MM-DD HH:mm TZ]`` timestamps
+    and pass the integer ``message_id`` through to ``insert_summary``
+    /``link_summary_to_messages``.
+    """
+
+    message_id: int
     content: str
     token_count: int
+    created_at: datetime
+
+
+class _MessagePartLike(Protocol):
+    """Structural shape compaction reads from each message_parts row.
+
+    Mirrors the narrow shape consumed by TS ``annotateMediaContent``
+    + ``isMediaAttachmentPart`` (compaction.ts lines 1457-1485 and
+    333-347). The 04-02 port reads ``part_type``, ``text_content``,
+    and ``metadata`` only.
+    """
+
+    part_type: str
+    text_content: str | None
+    metadata: str | None
+
+
+class _SummaryRecordLike(Protocol):
+    """Structural shape compaction reads from each summaries row.
+
+    Only the ``content`` field is consumed by the leaf-pass body's
+    ``_resolve_prior_leaf_summary_context`` helper (TS lines
+    1065-1104). The wider ``SummaryRecord`` shape is irrelevant here.
+    """
+
+    content: str
 
 
 class _CompactionTelemetryStoreLike(Protocol):
@@ -700,6 +819,424 @@ def _resolve_fresh_tail_max_tokens(config: CompactionConfig) -> int | None:
     if config.fresh_tail_max_tokens is not None and config.fresh_tail_max_tokens >= 0:
         return int(config.fresh_tail_max_tokens)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Auth-failure sentinel (issue 04-02)
+# ---------------------------------------------------------------------------
+
+
+class LcmProviderAuthError(RuntimeError):
+    """Raised when the summarizer reports a provider-auth failure.
+
+    Ports the TS sentinel that ``_leaf_pass`` swallows to short-circuit
+    persistence (TS line 1571 — ``if (!summary) return null``; the
+    underlying error wrapping happens inside ``summarizeWithEscalation``
+    at TS lines 1410-1448). 04-06 will introduce a richer
+    ``LcmProviderAuthError`` hierarchy alongside the escalation cascade;
+    04-02 lands the minimum sentinel so the leaf-pass auth short-
+    circuit can catch + return ``None``.
+
+    Wave-N tag: not a Wave fix per se, but the auth-short-circuit is
+    LCM-canonical scar tissue — without it, transient provider outages
+    persist truncation-fallback summaries that pollute the DAG. The
+    ``# LCM auth-short-circuit`` comment inside :meth:`CompactionEngine.
+    _leaf_pass` flags the load-bearing return per ADR-029.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Media / structured-content helpers — ported verbatim from TS (issue 04-02)
+# ---------------------------------------------------------------------------
+#
+# These ports mirror the TS regex literals + constant sets in
+# ``lossless-claw/src/compaction.ts`` lines 182-243 byte-for-byte. The
+# leaf-pass body uses these to (a) strip embedded data URLs / MEDIA:/
+# path references before sending text to the summarizer and (b) decide
+# whether a message-parts row counts as a media attachment for the
+# ``[Media attachment]`` / ``[with media attachment]`` annotation.
+#
+# Per ADR-029, the leaf-pass scar tissue is the auth short-circuit and
+# the message-content sanitation. The sanitation is not Wave-tagged in
+# the LCM source (it precedes Wave-1) but is regression-tested via
+# ``test/compaction-maintenance-store.test.ts`` and must port exactly
+# — silent divergence here would change the summarizer's view of every
+# leaf chunk.
+
+#: TS ``MEDIA_PATH_RE`` (line 187). Matches ``MEDIA:/<path>`` references
+#: that appear in message content when the original message was a pure
+#: media attachment.
+_MEDIA_PATH_RE: re.Pattern[str] = re.compile(r"^MEDIA:/.+$")
+
+#: TS ``EMBEDDED_DATA_URL_RE`` (line 188). The ``i`` (case-insensitive)
+#: + ``g`` (global) flags map to ``re.IGNORECASE`` plus the ``findall``/
+#: ``sub`` call semantics in Python (re.sub already does global by
+#: default).
+_EMBEDDED_DATA_URL_RE: re.Pattern[str] = re.compile(
+    r"data:[^;\s\"'`]+;base64,[A-Za-z0-9+/=\s]+",
+    re.IGNORECASE,
+)
+
+#: TS ``MEDIA_ATTACHMENT_PART_TYPES`` (line 189). ``Set`` of part_type
+#: values that ALWAYS indicate a media attachment regardless of
+#: metadata content.
+_MEDIA_ATTACHMENT_PART_TYPES: frozenset[str] = frozenset({"file", "snapshot"})
+
+#: TS ``MEDIA_ATTACHMENT_RAW_TYPES`` (line 190). ``Set`` of values
+#: ``metadata.rawType`` / ``metadata.raw.type`` may carry that indicate
+#: a media attachment when the part_type itself is ambiguous.
+_MEDIA_ATTACHMENT_RAW_TYPES: frozenset[str] = frozenset({"file", "image", "snapshot"})
+
+#: TS ``PROVIDER_REASONING_RAW_TYPES`` (line 191). Structured-content
+#: rawTypes the summarizer must NEVER see (encrypted reasoning blocks
+#: + the agent's chain-of-thought).
+_PROVIDER_REASONING_RAW_TYPES: frozenset[str] = frozenset({"reasoning", "thinking"})
+
+#: TS ``STRUCTURED_MEDIA_TEXT_KEYS`` (line 192). Keys in a structured-
+#: content record whose string values are extracted as fragments.
+_STRUCTURED_MEDIA_TEXT_KEYS: tuple[str, ...] = ("text", "caption", "alt", "title", "summary")
+
+#: TS ``STRUCTURED_MEDIA_NESTED_KEYS`` (line 193). Keys whose values
+#: are recursively walked for more text fragments.
+_STRUCTURED_MEDIA_NESTED_KEYS: tuple[str, ...] = (
+    "content",
+    "parts",
+    "items",
+    "message",
+    "messages",
+)
+
+#: Recursion depth cap matching TS ``extractSanitizedStructuredText``'s
+#: ``depth >= 4`` guard (line 269). Hard-coded both sides; 4 is enough
+#: to walk a parts-of-parts structure without runaway recursion.
+_STRUCTURED_TEXT_MAX_DEPTH: int = 4
+
+
+def _looks_like_binary_payload(value: str) -> bool:
+    """Detect whether a string is mostly base64/binary, not prose.
+
+    Ports TS ``looksLikeBinaryPayload`` (compaction.ts lines 225-242).
+    The heuristics matter: a base64 payload that slips through into the
+    summarizer can blow the prompt budget AND pollute the summary.
+
+    Path:
+
+    1. Empty / whitespace-only → ``False``.
+    2. Starts with ``data:<type>;base64,`` → ``True`` (definite).
+    3. After stripping whitespace, length must be ≥256 AND a multiple
+       of 4 (base64 alignment). Otherwise → ``False``.
+    4. Compact form must be alphanumeric / ``+/=`` only → else
+       ``False``.
+    5. If the original (non-compacted) string contains any punctuation
+       from ``" .,:;!?()[]{}"``, treat as prose → ``False``. Else
+       → ``True``.
+    """
+    if not isinstance(value, str):
+        return False
+    trimmed = value.strip()
+    if not trimmed:
+        return False
+    if re.match(r"^data:[^;\s\"'`]+;base64,", trimmed, re.IGNORECASE):
+        return True
+    compact = re.sub(r"\s+", "", trimmed)
+    if len(compact) < 256 or len(compact) % 4 != 0:
+        return False
+    if not re.match(r"^[A-Za-z0-9+/=]+$", compact):
+        return False
+    # If the trimmed (un-compacted) string contains any common-prose
+    # punctuation, treat as prose despite the base64 character set.
+    return not re.search(r"[ .,:;!?()\[\]{}]", trimmed)
+
+
+def _strip_embedded_media_payloads(content: str) -> str:
+    """Strip attachment payloads from plain strings before the summarizer.
+
+    Ports TS ``stripEmbeddedMediaPayloads`` (compaction.ts lines
+    245-265).
+
+    Path:
+
+    1. Replace embedded ``data:<mime>;base64,...`` runs with the
+       literal ``[embedded media omitted]`` placeholder.
+    2. Split into lines, strip trailing whitespace from each.
+    3. Drop empty lines, ``MEDIA:/<path>`` lines, and lines flagged by
+       :func:`_looks_like_binary_payload`.
+    4. Join surviving lines with ``"\\n"`` + final ``str.strip()``.
+
+    Returns ``""`` for non-string inputs (matches TS ``typeof !==
+    'string'`` guard).
+    """
+    if not isinstance(content, str):
+        return ""
+    without_data_urls = _EMBEDDED_DATA_URL_RE.sub("[embedded media omitted]", content)
+    sanitized_lines: list[str] = []
+    for line in re.split(r"\r?\n", without_data_urls):
+        line = line.rstrip()
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        if _MEDIA_PATH_RE.match(trimmed):
+            continue
+        if _looks_like_binary_payload(trimmed):
+            continue
+        sanitized_lines.append(line)
+    return "\n".join(sanitized_lines).strip()
+
+
+def _extract_sanitized_structured_text(value: Any, depth: int = 0) -> list[str]:
+    """Walk a structured-content value, returning its prose fragments.
+
+    Ports TS ``extractSanitizedStructuredText`` (compaction.ts lines
+    268-310). Recursive walk over dict / list / string with three
+    invariants:
+
+    1. ``PROVIDER_REASONING_RAW_TYPES`` records (rawType == "reasoning"
+       / "thinking") return ``[]`` — encrypted reasoning never reaches
+       the summarizer.
+    2. ``MEDIA_ATTACHMENT_RAW_TYPES`` records (rawType == "image" /
+       "file" / "snapshot") return ONLY the direct text-key fragments;
+       nested keys are NOT walked (the structure inside an image part
+       is media content, not prose).
+    3. Depth ≥ :data:`_STRUCTURED_TEXT_MAX_DEPTH` cuts the walk —
+       matches TS line 269.
+    """
+    if depth >= _STRUCTURED_TEXT_MAX_DEPTH or value is None:
+        return []
+    if isinstance(value, str):
+        sanitized = _strip_embedded_media_payloads(value)
+        return [sanitized] if sanitized else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for entry in value:
+            out.extend(_extract_sanitized_structured_text(entry, depth + 1))
+        return out
+    if not isinstance(value, dict):
+        return []
+
+    record = value
+    raw_type_val = record.get("type")
+    raw_type = raw_type_val.strip().lower() if isinstance(raw_type_val, str) else ""
+    if raw_type in _PROVIDER_REASONING_RAW_TYPES:
+        return []
+    text_fragments: list[str] = []
+    for key in _STRUCTURED_MEDIA_TEXT_KEYS:
+        candidate = record.get(key)
+        if not isinstance(candidate, str):
+            continue
+        sanitized = _strip_embedded_media_payloads(candidate)
+        if sanitized:
+            text_fragments.append(sanitized)
+
+    if raw_type in _MEDIA_ATTACHMENT_RAW_TYPES:
+        return text_fragments
+
+    for key in _STRUCTURED_MEDIA_NESTED_KEYS:
+        text_fragments.extend(_extract_sanitized_structured_text(record.get(key), depth + 1))
+
+    return text_fragments
+
+
+def _extract_meaningful_message_text(content: str) -> str:
+    """Normalize a message content string to summary-safe prose.
+
+    Ports TS ``extractMeaningfulMessageText`` (compaction.ts lines
+    313-331).
+
+    Path:
+
+    1. ``None`` / non-str → ``""``.
+    2. If trimmed starts/ends with ``[]`` or ``{}``, try to parse as
+       JSON. Success → walk via
+       :func:`_extract_sanitized_structured_text` and join fragments
+       with ``"\\n"``.
+    3. Failure or non-JSON → fall through to
+       :func:`_strip_embedded_media_payloads` on the raw string.
+    """
+    if not isinstance(content, str):
+        return ""
+    trimmed = content.strip()
+    if not trimmed:
+        return ""
+    is_json_shaped = (trimmed.startswith("[") and trimmed.endswith("]")) or (
+        trimmed.startswith("{") and trimmed.endswith("}")
+    )
+    if is_json_shaped:
+        try:
+            parsed = json.loads(trimmed)
+        except (json.JSONDecodeError, ValueError):
+            # Fall through to plain-text sanitation below.
+            pass
+        else:
+            extracted = [
+                fragment.strip()
+                for fragment in _extract_sanitized_structured_text(parsed)
+                if fragment.strip()
+            ]
+            return "\n".join(extracted).strip()
+    return _strip_embedded_media_payloads(content)
+
+
+def _parse_message_part_metadata(metadata: str | None) -> dict[str, Any]:
+    """Parse a message-part's ``metadata`` JSON column without raising.
+
+    Ports TS ``parseMessagePartMetadata`` (compaction.ts lines 210-222).
+    Returns an empty dict on missing / unparseable / non-object input.
+    """
+    if not isinstance(metadata, str) or not metadata.strip():
+        return {}
+    try:
+        parsed = json.loads(metadata)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
+
+
+def _is_media_attachment_part(part: _MessagePartLike) -> bool:
+    """Decide whether a stored part represents a media attachment.
+
+    Ports TS ``isMediaAttachmentPart`` (compaction.ts lines 333-347).
+    Two paths to ``True``:
+
+    * ``part_type`` is in :data:`_MEDIA_ATTACHMENT_PART_TYPES`
+      (``"file"`` / ``"snapshot"``).
+    * ``part_type`` is something else (e.g. ``"text"``) but the
+      metadata's ``rawType`` (or nested ``raw.type``) is in
+      :data:`_MEDIA_ATTACHMENT_RAW_TYPES`.
+    """
+    if part.part_type in _MEDIA_ATTACHMENT_PART_TYPES:
+        return True
+    metadata = _parse_message_part_metadata(part.metadata)
+    raw_type_val = metadata.get("rawType")
+    if isinstance(raw_type_val, str):
+        raw_type = raw_type_val.strip().lower()
+    else:
+        raw_obj = metadata.get("raw")
+        if isinstance(raw_obj, dict):
+            inner = raw_obj.get("type")
+            raw_type = inner.strip().lower() if isinstance(inner, str) else ""
+        else:
+            raw_type = ""
+    return raw_type in _MEDIA_ATTACHMENT_RAW_TYPES
+
+
+def _dedupe_ordered_ids(ids: Iterable[str]) -> list[str]:
+    """Return ``ids`` in first-seen order with duplicates removed.
+
+    Ports TS ``dedupeOrderedIds`` (compaction.ts lines 197-207).
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in ids:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _format_timestamp(value: datetime, tz_name: str = "UTC") -> str:
+    """Format a timestamp as ``YYYY-MM-DD HH:mm TZ`` for prompt source text.
+
+    Ports TS ``formatTimestamp`` (compaction.ts lines 125-150). The
+    output is the per-message timestamp header in the concatenated
+    leaf-pass input — agents see it in their compacted summaries when
+    asked "when was this said". Drift here would change the summarizer's
+    view of timestamp framing.
+
+    Path:
+
+    1. Try to load ``tz_name`` as an IANA zone. On
+       :class:`ZoneInfoNotFoundError` (or non-string input), fall back
+       to UTC.
+    2. Convert ``value`` into the target zone.
+    3. Format as ``YYYY-MM-DD HH:mm <abbrev>``. The abbreviation is the
+       resolved ``tzname()`` of the localized timestamp; UTC always
+       reports ``"UTC"``.
+
+    Args:
+        value: The timestamp to format. Naive datetimes are assumed
+            UTC (matches TS ``Date`` behavior — the source has been
+            UTC-tagged at ingest by ConversationStore).
+        tz_name: An IANA timezone name (e.g. ``"America/Los_Angeles"``).
+            Default ``"UTC"``.
+
+    Returns:
+        A string of the form ``"2026-04-22 14:35 UTC"`` (or
+        ``"2026-04-22 07:35 PDT"`` if a non-UTC zone resolves).
+    """
+    # Treat naive timestamps as UTC. The conversation store always
+    # stores ISO-with-zone, so naive only happens in tests.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    target: timezone | ZoneInfo
+    if tz_name == "UTC":
+        target = timezone.utc
+        abbrev = "UTC"
+    else:
+        try:
+            target = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            # TS falls back to UTC on invalid timezone (lines 142-149).
+            target = timezone.utc
+            abbrev = "UTC"
+        else:
+            localized = value.astimezone(target)
+            abbrev = localized.tzname() or tz_name
+    localized = value.astimezone(target)
+    return (
+        f"{localized.year:04d}-{localized.month:02d}-{localized.day:02d} "
+        f"{localized.hour:02d}:{localized.minute:02d} {abbrev}"
+    )
+
+
+def _generate_summary_id(content: str) -> str:
+    """Build a deterministic-ish summary id from content + current time.
+
+    Ports TS ``generateSummaryId`` (compaction.ts lines 168-176): the
+    ID is ``"sum_" + sha256(content + str(now_ms))[:16]``. The
+    current-time suffix lets back-to-back identical summaries get
+    distinct IDs.
+    """
+    now_ms = int(time.time() * 1000)
+    digest = hashlib.sha256((content + str(now_ms)).encode("utf-8")).hexdigest()
+    return "sum_" + digest[:16]
+
+
+# ---------------------------------------------------------------------------
+# :class:`LeafChunkSelection` — return type for :meth:`_select_oldest_leaf_chunk`
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LeafChunkSelection:
+    """Result of selecting the next leaf-eligible chunk.
+
+    Mirrors TS ``LeafChunkSelection`` (compaction.ts inline return type
+    at line 1008). Returned from
+    :meth:`CompactionEngine._select_oldest_leaf_chunk`.
+
+    Attributes:
+        items: The selected context-item rows (in ordinal-ascending
+            order). Empty when no chunk is eligible — caller treats as
+            "no leaf pass to run". MAY contain a single oversize item
+            (the always-include-≥1-message invariant guarantees we
+            never return an empty chunk while compactable raw messages
+            exist).
+        raw_tokens_outside_tail: Sum of message token counts for every
+            raw-message item with ``ordinal < fresh_tail_ordinal``.
+            Telemetry signal — not used to terminate selection (the
+            threshold cap does that). Returned so the caller / decision
+            log can record "we had X raw tokens to draw from this pass".
+        threshold: The leaf-chunk size cap that bounded the selection.
+            ``leaf_chunk_tokens_override or config.leaf_chunk_tokens or
+            DEFAULT_LEAF_CHUNK_TOKENS``.
+    """
+
+    items: list[_ContextItemLike]
+    raw_tokens_outside_tail: int
+    threshold: int
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1623,246 @@ class CompactionEngine:
         return raw_tokens
 
     # ------------------------------------------------------------------
+    # Leaf-pass helpers — issue 04-02
+    # ------------------------------------------------------------------
+
+    def _select_oldest_leaf_chunk(
+        self,
+        conversation_id: int,
+        leaf_chunk_tokens_override: int | None = None,
+    ) -> LeafChunkSelection:
+        """Pick the oldest contiguous raw-message chunk outside the fresh tail.
+
+        Ports TS :meth:`CompactionEngine.selectOldestLeafChunk`
+        (compaction.ts lines 1005-1057). The chunk is bounded by
+        ``leaf_chunk_tokens`` but ALWAYS includes ≥1 message when any
+        compactable raw message exists (TS lines 1024-1052) — the
+        always-include-one invariant.
+
+        Termination conditions (in order, matching TS verbatim):
+
+        1. We're at ``ordinal >= fresh_tail_ordinal`` → stop the walk
+           (TS lines 1015-1017, 1028-1030).
+        2. We haven't started a chunk yet and the current item is a
+           non-message → skip and keep walking (TS lines 1032-1035).
+        3. We've started a chunk and the next item is a non-message →
+           STOP at it (TS lines 1037-1039). The TS source treats ANY
+           non-message item as a chunk-boundary, not just summaries —
+           future item types are guarded by the same rule.
+        4. We have ≥1 message in the chunk and adding the next message
+           would push tokens above the cap → break BEFORE adding it
+           (TS lines 1045-1047). The always-include-one invariant
+           guarantees a single oversize message is still included.
+        5. After adding a message, if the running token total is
+           already ≥ cap → break (TS lines 1051-1053).
+
+        Args:
+            conversation_id: The conversation to scan.
+            leaf_chunk_tokens_override: Optional per-call override of
+                ``config.leaf_chunk_tokens``. Negative / zero falls
+                through to the config / :data:`DEFAULT_LEAF_CHUNK_TOKENS`.
+
+        Returns:
+            A :class:`LeafChunkSelection` with the selected items +
+            telemetry signals. ``items`` is empty when no compactable
+            chunk exists (no raw messages outside the fresh tail OR the
+            very first eligible item is at the fresh-tail boundary).
+        """
+        context_items = self._summary_store.get_context_items(conversation_id)
+        fresh_tail_ordinal = self._resolve_fresh_tail_ordinal(context_items)
+        threshold = _resolve_leaf_chunk_tokens(self._config, leaf_chunk_tokens_override)
+
+        # TS lines 1013-1022: pre-walk computes the raw-tokens-outside-tail
+        # telemetry signal. We could re-use _count_raw_tokens_outside_fresh_tail
+        # here, but inlining matches the TS source (the helper calls a
+        # different cached path — we're outside ``withContextCache`` here)
+        # and avoids double-walking the items list.
+        raw_tokens_outside_tail = 0
+        for item in context_items:
+            if item.ordinal >= fresh_tail_ordinal:
+                break
+            if item.item_type != "message" or item.message_id is None:
+                continue
+            raw_tokens_outside_tail += self._get_message_token_count(item.message_id)
+
+        chunk: list[_ContextItemLike] = []
+        chunk_tokens = 0
+        started = False
+        # TS lines 1024-1054: chunk-selection walk.
+        for item in context_items:
+            if item.ordinal >= fresh_tail_ordinal:
+                break
+
+            if not started:
+                if item.item_type != "message" or item.message_id is None:
+                    # TS lines 1033-1034: skip non-messages until first
+                    # raw message — context may have leading summaries.
+                    continue
+                started = True
+            elif item.item_type != "message" or item.message_id is None:
+                # TS lines 1037-1038: ANY non-message item terminates
+                # the chunk once started — guards future item types,
+                # not just "summary".
+                break
+
+            # TS line 1041-1042: defensive — the started/elif branches
+            # above already enforce message_id != None for chunk items.
+            if item.message_id is None:  # pragma: no cover
+                continue
+            message_tokens = self._get_message_token_count(item.message_id)
+            # TS lines 1045-1046: always-include-one — only respect the
+            # cap when we already have at least one message in the chunk.
+            if chunk and chunk_tokens + message_tokens > threshold:
+                break
+
+            chunk.append(item)
+            chunk_tokens += message_tokens
+            # TS lines 1051-1052: stop greedily once we're at/past cap.
+            if chunk_tokens >= threshold:
+                break
+
+        return LeafChunkSelection(
+            items=chunk,
+            raw_tokens_outside_tail=raw_tokens_outside_tail,
+            threshold=threshold,
+        )
+
+    def _resolve_prior_leaf_summary_context(
+        self,
+        conversation_id: int,
+        message_items: list[_ContextItemLike],
+    ) -> str | None:
+        """Resolve up-to-2 prior summary contexts for iterative continuity.
+
+        Ports TS :meth:`CompactionEngine.resolvePriorLeafSummaryContext`
+        (compaction.ts lines 1065-1104). The last 2 summary items with
+        ``ordinal < min(chunk_ordinals)`` are loaded; their content
+        fields are trimmed, filtered for empties, then joined with
+        ``"\\n\\n"``.
+
+        Args:
+            conversation_id: The conversation being compacted.
+            message_items: The chunk picked by
+                :meth:`_select_oldest_leaf_chunk`. Empty → return
+                ``None``.
+
+        Returns:
+            Joined prior-summary content for the summarizer's
+            ``previous_summary`` option, or ``None`` when no eligible
+            summaries exist (or none have non-empty content).
+        """
+        if not message_items:
+            return None
+        start_ordinal = min(item.ordinal for item in message_items)
+
+        # TS lines 1074-1081: ordinal < start_ordinal AND item_type ==
+        # "summary" AND summary_id is a string. Take the LAST 2 such
+        # items (most-recent-by-ordinal).
+        context_items = self._summary_store.get_context_items(conversation_id)
+        prior_summary_items = [
+            item
+            for item in context_items
+            if item.ordinal < start_ordinal
+            and item.item_type == "summary"
+            and isinstance(item.summary_id, str)
+        ][-2:]
+
+        if not prior_summary_items:
+            return None
+
+        summary_contents: list[str] = []
+        for item in prior_summary_items:
+            if not isinstance(item.summary_id, str):  # pragma: no cover
+                continue
+            summary = self._summary_store.get_summary(item.summary_id)
+            if summary is None:
+                continue
+            content = summary.content.strip() if isinstance(summary.content, str) else ""
+            if content:
+                summary_contents.append(content)
+
+        if not summary_contents:
+            return None
+        return "\n\n".join(summary_contents)
+
+    def _annotate_media_content(self, message_id: int, content: str) -> str:
+        """Return ``content`` annotated with media-attachment markers.
+
+        Ports TS :meth:`CompactionEngine.annotateMediaContent`
+        (compaction.ts lines 1457-1485).
+
+        Path:
+
+        1. Fetch ``conversation_store.get_message_parts(message_id)``.
+        2. If no part is a media attachment (per
+           :func:`_is_media_attachment_part`) → return ``content``
+           unchanged.
+        3. Collect non-media-part ``text_content`` values, strip
+           embedded media payloads, join with ``"\\n"``, trim. Fall
+           back to :func:`_extract_meaningful_message_text` on the
+           original ``content`` if the parts list is empty / pure-
+           media.
+        4. Pure-media result → ``"[Media attachment]"``.
+        5. Mixed result with text → append ``" [with media attachment]"``
+           UNLESS it's already present.
+
+        Args:
+            message_id: The owning message's primary key.
+            content: The raw ``messages.content`` string for the row.
+
+        Returns:
+            The annotated content string suitable for the summarizer
+            prompt.
+        """
+        parts = self._conversation_store.get_message_parts(message_id)
+        has_media_parts = any(_is_media_attachment_part(p) for p in parts)
+        if not has_media_parts:
+            return content
+
+        # Build the "prose only" view from non-media parts.
+        part_text_fragments: list[str] = []
+        for part in parts:
+            if _is_media_attachment_part(part):
+                continue
+            text = part.text_content if isinstance(part.text_content, str) else ""
+            stripped = _strip_embedded_media_payloads(text).strip()
+            if stripped:
+                part_text_fragments.append(stripped)
+        part_text = "\n".join(part_text_fragments).strip()
+        fallback_text = _extract_meaningful_message_text(content)
+        meaningful_text = (part_text or fallback_text).strip()
+
+        if not meaningful_text:
+            return "[Media attachment]"
+        # TS line 1482: don't double-annotate.
+        if "[with media attachment]" in meaningful_text:
+            return meaningful_text
+        return f"{meaningful_text} [with media attachment]"
+
+    def _invalidate_context_cache(self, conversation_id: int) -> None:
+        """Invalidate the per-conversation context cache after a mutation.
+
+        Ports TS :meth:`CompactionEngine.invalidateContextCache`
+        (compaction.ts lines 385-388). The 04-02 :class:`CompactionEngine`
+        doesn't yet expose the context-cache (that lands as part of the
+        ``with_context_cache`` refactor in 04-03/04-04 followup); the
+        method exists as a no-op so the leaf-pass body's cache-
+        invalidation step is properly wired and a future cache addition
+        slots in without touching the leaf-pass code.
+
+        Args:
+            conversation_id: The conversation whose cache entry is
+                invalidated. Currently unused — kept on the signature so
+                the caller doesn't need updating when the cache lands.
+        """
+        # 04-02 placeholder. The cache itself lives in TS lines 362-403
+        # (``_contextItemsCache`` + ``getContextItemsCached`` + ref-
+        # counted ``withContextCache``). Once that lands in the Python
+        # port, this method becomes a one-liner ``self._context_items_cache
+        # .pop(conversation_id, None)``.
+        del conversation_id
+
+    # ------------------------------------------------------------------
     # compact_full_sweep() — phase-1 + phase-2 loops with Wave-12 guards
     # ------------------------------------------------------------------
 
@@ -1215,19 +1992,28 @@ class CompactionEngine:
         running_tokens = tokens_before
         while True:
             pass_tokens_before = running_tokens
-            leaf_result = self._run_leaf_pass(
+            leaf_outcome = self._run_leaf_pass(
                 conversation_id=conversation_id,
                 summarize=summarize,
                 previous_summary_content=previous_summary_content,
                 summary_model=summary_model,
             )
-            if leaf_result is None:
-                # TS line 685-687: either nothing left to compact (TS
-                # treats ``leafChunk.items.length === 0`` as a clean
-                # break) OR a provider-auth failure surfaced from
-                # ``_leafPass``. 04-04 skeleton funnels both through
-                # the same ``None`` return; 04-02 will split them.
+            if leaf_outcome.auth_failure:
+                # TS lines 685-687: a provider-auth failure surfaced
+                # from ``_leafPass``. Mirror the TS ``hadAuthFailure =
+                # true; break`` pair so the final ``CompactionResult``
+                # propagates ``auth_failure=True`` (which
+                # ``compact_until_under`` reads at TS lines 831-838 to
+                # short-circuit the round loop instead of retrying
+                # across a provider outage).
+                had_auth_failure = True
                 break
+            if leaf_outcome.summary is None:
+                # TS lines 673-675: empty chunk / voluntary skip —
+                # clean termination, NOT an auth failure. Caller
+                # leaves ``had_auth_failure = False``.
+                break
+            leaf_result = leaf_outcome.summary
 
             pass_tokens_after = (
                 pass_tokens_before - leaf_result.removed_tokens + leaf_result.added_tokens
@@ -1282,17 +2068,24 @@ class CompactionEngine:
         # ended the sweep.
         while force or previous_tokens > threshold:
             pass_tokens_before = running_tokens
-            condense_result = self._run_condensed_pass(
+            condense_outcome = self._run_condensed_pass(
                 conversation_id=conversation_id,
                 hard_trigger=hard_trigger,
                 summarize=summarize,
                 summary_model=summary_model,
             )
-            if condense_result is None:
-                # TS lines 721-723 (no candidate) + 733-735 (auth
-                # failure). 04-04 skeleton conflates these the same
-                # way phase-1 does.
+            if condense_outcome.auth_failure:
+                # TS lines 733-735: provider-auth failure surfaces the
+                # same way phase-1 does — set the
+                # ``CompactionResult.auth_failure`` flag and break so
+                # ``compact_until_under`` short-circuits.
+                had_auth_failure = True
                 break
+            if condense_outcome.summary is None:
+                # TS lines 721-723: no candidate / voluntary skip — a
+                # clean break that leaves ``auth_failure`` False.
+                break
+            condense_result = condense_outcome.summary
 
             pass_tokens_after = (
                 pass_tokens_before - condense_result.removed_tokens + condense_result.added_tokens
@@ -1753,41 +2546,349 @@ class CompactionEngine:
         summarize: SummarizeFn,
         previous_summary_content: str | None,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
-        """Run one leaf pass and return the resulting summary, or ``None``.
+    ) -> LeafPassOutcome:
+        """Run one leaf pass and return a :class:`LeafPassOutcome`.
 
-        04-04 skeletal stub. Production body lands in issue 04-02
-        (``_leafPass`` in TS, ``compaction.ts:1492-1607``). Return
-        ``None`` to terminate the phase-1 loop — semantic overload that
-        04-02 will split into "no chunk left" (clean break) vs
-        "provider-auth failure" (sets ``auth_failure=True`` on the
-        result).
+        Issue 04-02 production body. Ports TS ``leafPass``
+        (``compaction.ts:1492-1607``) end-to-end:
 
-        04-04 default returns ``None`` so a vanilla
-        :class:`CompactionEngine` exits the phase-1 loop immediately
-        without doing any work. Regression tests subclass and override
-        to return controlled :class:`LeafPassResult` instances.
+        1. Select the next chunk via :meth:`_select_oldest_leaf_chunk`.
+           Empty selection → return ``LeafPassOutcome(summary=None,
+           auth_failure=False)`` (clean "nothing to do" termination —
+           caller breaks the phase-1 loop with ``auth_failure`` clear).
+        2. Resolve prior leaf-summary context via
+           :meth:`_resolve_prior_leaf_summary_context` for iterative
+           continuity.
+        3. Fetch full message rows, annotate media via
+           :meth:`_annotate_media_content`, strip reasoning blocks via
+           :func:`_extract_meaningful_message_text`, and concatenate
+           ``[YYYY-MM-DD HH:mm TZ]\\n<text>`` entries with ``"\\n\\n"``.
+        4. Extract file IDs from the annotated content via
+           :func:`~lossless_hermes.large_files.extract_file_ids_from_content`.
+        5. Call :meth:`_summarize_with_escalation` (a 04-02 stub; the
+           full escalation cascade lands in issue 04-06). On
+           :class:`LcmProviderAuthError` raised by the summarizer →
+           return ``LeafPassOutcome(summary=None, auth_failure=True)``.
+           The caller distinguishes this from the empty-chunk case and
+           propagates ``CompactionResult.auth_failure=True`` so
+           :meth:`compact_until_under` can short-circuit the round
+           loop. TS line 685-687 (``hadAuthFailure = true; break``).
+        6. Persist atomically inside ``summary_store.with_transaction()``:
+           ``insert_summary`` → ``link_summary_to_messages`` →
+           ``replace_context_range_with_summary``.
+        7. Invalidate the context cache via
+           :meth:`_invalidate_context_cache` (04-02 no-op until the
+           cache lands).
+        8. Return :class:`LeafPassOutcome` carrying a
+           :class:`LeafPassResult` with the running-delta
+           ``removed_tokens`` / ``added_tokens`` Wave-12 guard consumes.
+
+        Subclasses (regression tests, 04-04 scripted engines) may
+        override to inject scripted results without standing up real
+        stores. Overrides MUST return a :class:`LeafPassOutcome` and
+        MUST set ``auth_failure=True`` on the provider-auth path so the
+        sweep flag propagates correctly.
 
         Args:
             conversation_id: The conversation being compacted.
             summarize: The summarize callback passed down from
                 :meth:`compact_full_sweep`.
             previous_summary_content: ``content`` field from the most
-                recent ``LeafPassResult``, or ``None`` on the first
-                call. Provides iterative-summarization continuity.
+                recent successful :class:`LeafPassResult`, or ``None``
+                on the first call. Provides iterative-summarization
+                continuity.
             summary_model: Optional model override for this pass.
 
         Returns:
-            A :class:`LeafPassResult` if a pass produced a summary,
-            ``None`` otherwise. The Wave-12 guard inspects
-            ``removed_tokens`` + ``added_tokens`` (via the
-            running-delta arithmetic) to decide whether the pass made
-            progress.
+            A :class:`LeafPassOutcome` whose ``summary`` field carries
+            the produced :class:`LeafPassResult` (when a pass succeeded)
+            and whose ``auth_failure`` flag distinguishes the
+            provider-auth path from the empty-chunk path.
         """
-        # Silence the unused-arg warnings without ignoring the names —
-        # subclasses in 04-02 + tests use every parameter.
-        del conversation_id, summarize, previous_summary_content, summary_model
-        return None
+        return self._leaf_pass(
+            conversation_id=conversation_id,
+            summarize=summarize,
+            previous_summary_content=previous_summary_content,
+            summary_model=summary_model,
+        )
+
+    def _leaf_pass(
+        self,
+        *,
+        conversation_id: int,
+        summarize: SummarizeFn,
+        previous_summary_content: str | None,
+        summary_model: str | None,
+    ) -> LeafPassOutcome:
+        """Body of one leaf pass — chunk → summarize → persist.
+
+        Ports TS ``leafPass`` (compaction.ts lines 1492-1607). See
+        :meth:`_run_leaf_pass` for the algorithm summary.
+
+        Separated from :meth:`_run_leaf_pass` so subclasses (04-04
+        scripted engines, 04-03 condensed-pass-only overrides) can
+        replace the dispatching hook without losing access to the
+        full body when they want to test the persistence path
+        directly.
+        """
+        from lossless_hermes.large_files import extract_file_ids_from_content
+
+        # 1. Select chunk
+        selection = self._select_oldest_leaf_chunk(conversation_id)
+        message_items = selection.items
+        if not message_items:
+            # TS lines 673-675 — empty chunk is a clean termination,
+            # NOT an auth failure. Caller breaks the phase-1 loop with
+            # ``CompactionResult.auth_failure`` left False.
+            return LeafPassOutcome(summary=None, auth_failure=False)
+
+        # 2. Resolve prior leaf-summary continuity. ``previous_summary_content``
+        #    from the caller wins (when set — TS reuses the most recent
+        #    pass's content as the continuity signal inside one sweep);
+        #    fall back to walking the context items when the caller has
+        #    no continuity yet (first pass in the sweep).
+        if previous_summary_content is not None and previous_summary_content.strip():
+            previous_summary: str | None = previous_summary_content
+        else:
+            previous_summary = self._resolve_prior_leaf_summary_context(
+                conversation_id,
+                message_items,
+            )
+
+        # 3. Fetch full message rows, annotate media, build per-message
+        #    descriptors.
+        message_contents: list[
+            dict[str, Any]
+        ] = []  # {message_id, content, created_at, token_count}
+        for item in message_items:
+            if item.message_id is None:  # pragma: no cover
+                continue
+            msg = self._conversation_store.get_message_by_id(
+                item.message_id,
+                include_suppressed=True,
+            )
+            if msg is None:
+                continue
+            annotated = self._annotate_media_content(msg.message_id, msg.content)
+            message_contents.append({
+                "message_id": msg.message_id,
+                "content": annotated,
+                "created_at": msg.created_at,
+                "token_count": self._resolve_message_token_count(msg),
+            })
+
+        # 4. Concatenate. Reasoning/thinking blocks stripped via
+        #    extract_meaningful_message_text; empty results filtered.
+        concatenated_parts: list[str] = []
+        for entry in message_contents:
+            text = _extract_meaningful_message_text(entry["content"])
+            if not text:
+                continue
+            timestamp = _format_timestamp(entry["created_at"], self._config.timezone)
+            concatenated_parts.append(f"[{timestamp}]\n{text}")
+        concatenated = "\n\n".join(concatenated_parts)
+
+        # 5. Extract file ids for the new summary's file_ids index.
+        flat_ids: list[str] = []
+        for entry in message_contents:
+            flat_ids.extend(extract_file_ids_from_content(entry["content"]))
+        file_ids = _dedupe_ordered_ids(flat_ids)
+
+        # 6. Summarize (04-02 stub → 04-06 escalation cascade).
+        try:
+            summary = self._summarize_with_escalation(
+                source_text=concatenated,
+                summarize=summarize,
+                target_tokens=self._config.leaf_target_tokens,
+                previous_summary=previous_summary,
+                is_condensed=False,
+                summary_model=summary_model,
+            )
+        except LcmProviderAuthError:
+            # LCM auth-short-circuit: avoid persisting fallback-truncation summaries
+            # during transient provider outages — preserves DAG integrity.
+            # Original: lossless-claw/src/compaction.ts:1571 (early-return on null).
+            # Signal auth_failure=True so ``compact_full_sweep`` sets
+            # ``CompactionResult.auth_failure=True`` (mirror of TS
+            # ``hadAuthFailure = true`` at compaction.ts:686).
+            return LeafPassOutcome(summary=None, auth_failure=True)
+        if summary is None:
+            # Per TS lines 1544-1549 — summarizer voluntarily skipped
+            # (e.g. empty source after sanitation). This is NOT an
+            # auth failure; caller treats as non-compacting skip with
+            # ``auth_failure`` left False.
+            return LeafPassOutcome(summary=None, auth_failure=False)
+
+        # 7. Persist atomically.
+        summary_content: str = summary["content"]
+        summary_level: CompactionLevel = summary["level"]
+
+        summary_id = _generate_summary_id(summary_content)
+        # estimate_tokens import is local to avoid circular dependency
+        # if estimate_tokens ever grows compaction-aware logic.
+        from lossless_hermes.estimate_tokens import estimate_tokens
+
+        token_count = estimate_tokens(summary_content)
+        # Note: removed_tokens uses _resolve_message_token_count values
+        # (which fall back to estimate_tokens for messages with
+        # token_count <= 0). This can diverge from get_context_token_count
+        # which would sum the stored 0. The delta feeds into stopping
+        # decisions (threshold checks, progress guards), but the
+        # divergence is bounded to empty/corrupt messages
+        # (token_count=0) which are rare. TS source comments at lines
+        # 1554-1559.
+        removed_tokens = sum(max(0, int(entry["token_count"])) for entry in message_contents)
+
+        # Earliest / latest timestamps for the summary's metadata.
+        if message_contents:
+            timestamps = [entry["created_at"] for entry in message_contents]
+            earliest_at: datetime | None = min(timestamps)
+            latest_at: datetime | None = max(timestamps)
+        else:
+            earliest_at = None
+            latest_at = None
+
+        ordinals = [item.ordinal for item in message_items]
+        start_ordinal = min(ordinals)
+        end_ordinal = max(ordinals)
+        message_ids = [entry["message_id"] for entry in message_contents]
+
+        from lossless_hermes.store.summary import (
+            CreateSummaryInput,
+            ReplaceContextRangeInput,
+        )
+
+        create_input = CreateSummaryInput(
+            summary_id=summary_id,
+            conversation_id=conversation_id,
+            kind="leaf",
+            depth=0,
+            content=summary_content,
+            token_count=token_count,
+            file_ids=file_ids,
+            earliest_at=earliest_at,
+            latest_at=latest_at,
+            descendant_count=0,
+            descendant_token_count=0,
+            source_message_token_count=removed_tokens,
+            model=summary_model,
+        )
+        replace_input = ReplaceContextRangeInput(
+            conversation_id=conversation_id,
+            start_ordinal=start_ordinal,
+            end_ordinal=end_ordinal,
+            summary_id=summary_id,
+        )
+
+        with self._summary_store.with_transaction():
+            self._summary_store.insert_summary(create_input)
+            # Link to source messages BEFORE the context swap becomes
+            # visible (TS lines 1588-1590).
+            if message_ids:
+                self._summary_store.link_summary_to_messages(summary_id, message_ids)
+            self._summary_store.replace_context_range_with_summary(replace_input)
+
+        # 8. Invalidate context cache after the swap.
+        self._invalidate_context_cache(conversation_id)
+
+        return LeafPassOutcome(
+            summary=LeafPassResult(
+                summary_id=summary_id,
+                level=summary_level,
+                content=summary_content,
+                removed_tokens=removed_tokens,
+                added_tokens=token_count,
+            ),
+            auth_failure=False,
+        )
+
+    def _resolve_message_token_count(self, message: _MessageRecordLike) -> int:
+        """Resolve a message's token count with content-length fallback.
+
+        Ports TS ``resolveMessageTokenCount`` (compaction.ts lines
+        1118-1128). Unlike :meth:`_get_message_token_count` (which
+        takes a primary key + fetches the row), this overload reads
+        the count off an already-loaded :class:`_MessageRecordLike`.
+
+        Path:
+
+        1. If ``message.token_count > 0`` → return it (rounded toward
+           zero).
+        2. Else fall back to
+           :func:`~lossless_hermes.estimate_tokens.estimate_tokens` on
+           ``message.content``.
+        """
+        from lossless_hermes.estimate_tokens import estimate_tokens
+
+        if message.token_count > 0:
+            return int(message.token_count)
+        return estimate_tokens(message.content)
+
+    def _summarize_with_escalation(
+        self,
+        *,
+        source_text: str,
+        summarize: SummarizeFn,
+        target_tokens: int,
+        previous_summary: str | None,
+        is_condensed: bool,
+        summary_model: str | None,
+    ) -> dict[str, Any] | None:
+        """Run the summarize cascade and return ``{content, level}``.
+
+        04-02 STUB. The full escalation cascade (normal → aggressive
+        → deterministic fallback → cap) lands in issue 04-06
+        (``summarizeWithEscalation`` in TS at lines 1410-1448 plus the
+        per-pass length check). For 04-02 we use a single-shot
+        ``summarize(...)`` call so the leaf-pass body's atomic persist /
+        DAG-link / context-swap path can be tested without 04-06 being
+        complete.
+
+        Subclasses (regression tests for 04-02 acceptance criteria,
+        the eventual 04-06 production wiring) MAY override this method
+        to inject controlled outputs. Tests use the override to verify
+        ``LcmProviderAuthError`` short-circuits, fallback-level
+        propagation, etc.
+
+        Args:
+            source_text: The concatenated message text the leaf-pass
+                produced. May be empty when all messages stripped to
+                empty after sanitation.
+            summarize: The :data:`SummarizeFn` provided by the caller.
+            target_tokens: Target output size in tokens
+                (``config.leaf_target_tokens`` for leaf passes,
+                ``config.condensed_target_tokens`` for condensed).
+            previous_summary: Prior leaf-summary content for iterative
+                continuity. ``None`` when no prior context exists.
+            is_condensed: ``True`` for condensed passes (04-03+);
+                ``False`` for leaf passes. Forwarded into the
+                ``options`` dict of the summarize callback so 04-06's
+                template dispatcher can pick the right prompt builder.
+            summary_model: Optional model override.
+
+        Returns:
+            ``{"content": <str>, "level": "normal" | "aggressive" |
+            "fallback" | "capped"}`` on success. ``None`` when the
+            summarizer voluntarily skipped (e.g. empty / unsalvageable
+            source). Raises :class:`LcmProviderAuthError` on provider
+            auth failure so the caller can short-circuit.
+        """
+        if not source_text.strip():
+            return None
+
+        options: dict[str, Any] = {
+            "previous_summary": previous_summary,
+            "is_condensed": is_condensed,
+            "target_tokens": target_tokens,
+            "summary_model": summary_model,
+        }
+        # 04-02 stub: single-shot summarize call. The escalation
+        # cascade (Guard 3) lands in 04-06 alongside the prompt-
+        # template dispatcher. Until then any output is "normal" level.
+        content = summarize(source_text, False, options)
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return {"content": content, "level": "normal"}
 
     def _run_condensed_pass(
         self,
@@ -1796,12 +2897,20 @@ class CompactionEngine:
         hard_trigger: bool,
         summarize: SummarizeFn,
         summary_model: str | None,
-    ) -> LeafPassResult | None:
-        """Run one condensed pass and return the resulting summary, or ``None``.
+    ) -> LeafPassOutcome:
+        """Run one condensed pass and return a :class:`LeafPassOutcome`.
 
         04-04 skeletal stub. Production body lands in issue 04-03
         (the condensed-pass + chunk-selection helpers in TS). Same
-        ``None``-terminates-the-loop contract as :meth:`_run_leaf_pass`.
+        outcome-discrimination contract as :meth:`_run_leaf_pass`:
+
+        * empty candidate / voluntary skip → ``LeafPassOutcome(summary=None,
+          auth_failure=False)`` (TS lines 721-723).
+        * provider-auth failure → ``LeafPassOutcome(summary=None,
+          auth_failure=True)`` (TS lines 733-735, ``hadAuthFailure =
+          true`` parity with phase-1).
+        * pass produced a summary →
+          ``LeafPassOutcome(summary=LeafPassResult(...), auth_failure=False)``.
 
         Args:
             conversation_id: The conversation being compacted.
@@ -1812,9 +2921,11 @@ class CompactionEngine:
             summary_model: Optional model override for this pass.
 
         Returns:
-            A :class:`LeafPassResult` if a pass produced a summary,
-            ``None`` otherwise. Phase-2's Wave-12 guard inspects the
-            same fields as phase-1.
+            A :class:`LeafPassOutcome` whose ``summary`` field carries
+            the produced :class:`LeafPassResult` (when a pass
+            succeeded) and whose ``auth_failure`` flag mirrors the
+            phase-1 contract so ``compact_full_sweep`` propagates the
+            sweep-level auth flag identically across both phases.
         """
         del conversation_id, hard_trigger, summarize, summary_model
-        return None
+        return LeafPassOutcome(summary=None, auth_failure=False)
