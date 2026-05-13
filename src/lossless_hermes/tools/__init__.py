@@ -152,6 +152,7 @@ TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 # Ordering note: import order = registration order. Tests rely on the
 # tool list being stable; adding a new per-tool module appends; the
 # 06-02 dispatch table sees the same order.
+from lossless_hermes.tools import compact as _compact  # noqa: F401, E402
 from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
 from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402
