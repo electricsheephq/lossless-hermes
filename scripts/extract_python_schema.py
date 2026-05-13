@@ -16,6 +16,7 @@ Status (2026-05-13): This script is a Wave 0 SCAFFOLD. Python migrations are
 delivered by Epic 01 (Wave 2). Until then this script intentionally errors with
 a clear message — that's expected behavior in Wave 0 / Wave 1.
 """
+
 from __future__ import annotations
 
 import argparse
