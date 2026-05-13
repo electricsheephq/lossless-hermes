@@ -186,7 +186,6 @@ def test_unknown_cmd_returns_unknown_message() -> None:
 @pytest.mark.parametrize(
     "subcommand,expected_epic",
     [
-        ("purge", "Epic 08"),
         ("health", "Epic 08"),
         ("doctor", "Epic 08"),
         ("rotate", "Epic 08"),
@@ -197,6 +196,10 @@ def test_unknown_cmd_returns_unknown_message() -> None:
         # Note: ``backup`` was previously stubbed; issue 08-09 wired the
         # real body in ``lossless_hermes.commands.backup``. The dedicated
         # tests live in ``tests/commands/test_backup.py``.
+        # Note: ``purge`` was previously stubbed; issue 08-04 wired the
+        # real body in ``lossless_hermes.commands.purge``. The dedicated
+        # tests live in ``tests/commands/test_purge.py`` +
+        # ``tests/operator/test_purge.py``.
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
@@ -293,16 +296,22 @@ def test_args_passed_to_handler() -> None:
 def test_shlex_quoting_preserves_quoted_args() -> None:
     """`/lcm purge --reason "test with spaces"` — quoted args don't break routing.
 
-    Smoke test for Epic 08's purge subcommand which will need
-    ``--reason "..."``. At 02-10 it returns the Epic-08 stub; what we
-    care about here is that the dispatcher routes to ``purge`` correctly
-    despite the embedded spaces.
+    Smoke test for the dispatcher's shlex handling of multi-word quoted
+    flag values. Issue 08-04 wired the real ``purge`` body; this test
+    only verifies the dispatcher routes correctly and the handler sees
+    the quoted reason (the rich purge output is exercised by the
+    dedicated tests in ``tests/commands/test_purge.py``).
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle('purge --reason "test with spaces"')
-    assert "/lcm purge" in out
-    assert "not yet implemented" in out
-    assert "Epic 08" in out
+    # The handler renders "Lossless Claw Purge" — that's the routing
+    # signal we care about here. The "test with spaces" reason is
+    # consumed by the handler (so by the time we see this output the
+    # handler's parser successfully unquoted it).
+    assert "Lossless Claw Purge" in out
+    # The criteria echo should NOT show "(EMPTY)" — that would mean the
+    # reason didn't parse correctly through shlex.
+    assert "(EMPTY)" not in out
 
 
 def test_unbalanced_quotes_returns_parse_error() -> None:
