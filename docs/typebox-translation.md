@@ -272,3 +272,4 @@ Mechanical checklist for issues 06-07..06-14:
    (most enums use `Type.String({enum})`). If we hit one, the policy
    is to translate to `string_field(enum=[...])` and document the
    choice on the per-tool module.
+# CI retrigger 7500a9e — empty commits did not propagate to runners
