@@ -19,14 +19,31 @@ pieces ported in epic 07:
   :class:`LlmCall` Protocol consumed by the dispatcher; the entity
   extractor in :mod:`lossless_hermes.extraction.extractor` defines an
   equivalent :class:`LlmCompleteFn` Protocol with the same shape.
+* ``cache_key`` (issue 07-06) — 7-field cache-key derivation +
+  single-flight INSERT-OR-IGNORE for :sql:`lcm_synthesis_cache`.
+  Centralises the Wave-10 ``tier_label + prompt_id`` widening so
+  callers cannot accidentally pick a different shape.
 
-Issues 07-06 (cache) and 07-09 (audit) build on this foundation. The
-TS canonical source (commit ``1f07fbd`` on branch ``pr-613``) is
+Issue 07-09 (audit) builds on this foundation. The TS canonical source
+(commit ``1f07fbd`` on branch ``pr-613``) is
 :file:`lossless-claw/src/synthesis/`.
 """
 
 from __future__ import annotations
 
+from lossless_hermes.synthesis.cache_key import (
+    DEFAULT_SESSION_KEY,
+    LEAF_FINGERPRINT_HEX_LEN,
+    CacheKey,
+    CacheRowInsertResult,
+    ExistingCacheRow,
+    InvalidLeafIdError,
+    generate_cache_id,
+    insert_cache_row_single_flight,
+    leaf_fingerprint,
+    lookup_cache_row,
+    resolve_session_key,
+)
 from lossless_hermes.synthesis.dispatch import (
     DEFAULT_MODEL_BY_TIER,
     HARD_CAP_BEST_OF_N,
@@ -65,9 +82,15 @@ from lossless_hermes.synthesis.types import (
 __all__ = [
     "DEFAULT_MODEL_BY_TIER",
     "DEFAULT_PROMPTS",
+    "DEFAULT_SESSION_KEY",
     "HARD_CAP_BEST_OF_N",
+    "LEAF_FINGERPRINT_HEX_LEN",
     "PASS_STRATEGY_BY_TIER",
     "BestOfNDetail",
+    "CacheKey",
+    "CacheRowInsertResult",
+    "ExistingCacheRow",
+    "InvalidLeafIdError",
     "LlmCall",
     "LlmCallArgs",
     "LlmCallResult",
@@ -84,9 +107,14 @@ __all__ = [
     "TierLabel",
     "bump_bundle_version",
     "dispatch_synthesis",
+    "generate_cache_id",
     "get_active_prompt",
     "get_prompt_by_id",
+    "insert_cache_row_single_flight",
+    "leaf_fingerprint",
     "list_active_prompts",
+    "lookup_cache_row",
     "register_prompt",
+    "resolve_session_key",
     "seed_default_prompts",
 ]
