@@ -6,11 +6,11 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W4 ready to dispatch (Epic 03 Ingest+Assembly + Epic 05 Embeddings parallel)** |
+| **Current wave** | **W4 in flight** — Epic 05 batch A dispatched (05-01 voyage, 05-04 open_db, 05-05 worker_loop, 05-06 worker_lock); Epic 03 batch B pending PR #34 stabilization |
 | **Current milestone** | M1 ✅, M2 ✅, M3 ✅ (engine round-trips through Hermes hooks + slash commands + lifecycle); M4 next (per-turn ingest + assembly live) |
-| **Last merged PR** | [#33](https://github.com/electricsheephq/lossless-hermes/pull/33) `[02-02][02-06] engine state fields + compress refinement — CLOSES WAVE 3` |
-| **Last commit on main** | `a81b5f5` |
-| **Total PRs merged today** | **35** (Wave 0–3 + chores) |
+| **Last merged PR** | [#34](https://github.com/electricsheephq/lossless-hermes/pull/34) `chore(engine): convert post/pre_llm_call hooks async->sync (Epic 03 prep)` |
+| **Last commit on main** | `8c653d0` |
+| **Total PRs merged today** | **36** (Wave 0–3 + chores + 02-07 async→sync follow-up) |
 | **Total tests** | 1101 passing, 2 skipped (live-gated) |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
