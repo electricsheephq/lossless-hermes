@@ -1,31 +1,33 @@
-"""LIKE-based search plan + snippet builder for the FTS5-unavailable / CJK paths.
+"""LIKE search plan + CJK detection + snippet builder.
 
-Ports ``lossless-claw/src/store/full-text-fallback.ts`` (LCM commit
-``1f07fbd``, 84 LOC TS → ~120 LOC Python). Used when:
+Port of ``lossless-claw/src/store/full-text-fallback.ts`` (LCM commit
+``1f07fbd``, 84 LOC TS → Python).
 
-* FTS5 is not compiled into the host Python build, and
-* CJK queries route through the LIKE path even on FTS5-available hosts (FTS5
-  unicode61 cannot segment CJK ideographs).
+Used when:
 
-Surface (mirrors TS):
+1. FTS5 is unavailable on the SQLite build (e.g. custom-compiled with
+   ``--disable-fts5``).
+2. FTS5 unicode61 tokenizer cannot handle CJK text correctly — the LIKE
+   path uses raw substring matching which handles CJK by default.
 
-* :func:`contains_cjk` — detect CJK (Unified, Compat, Kana, Hangul).
-* :func:`build_like_search_plan` — convert a free-text query into a list of
-  normalized terms + ``WHERE`` fragments + bound args.
-* :func:`create_fallback_snippet` — center a short window of content around
-  the first matching term.
+Three exports:
 
-See:
-
-* ``/Volumes/LEXAR/Claude/lossless-claw/src/store/full-text-fallback.ts`` — TS
-  canonical (commit ``1f07fbd``).
-* ``docs/porting-guides/storage.md`` §4.2 row "full-text-fallback.ts".
+* :func:`contains_cjk` — detect CJK characters in a query string. Used by
+  ConversationStore.search_messages to route through LIKE when the query
+  contains any CJK character.
+* :func:`build_like_search_plan` — convert a free-text query into a list
+  of normalized terms + parameterized ``WHERE LOWER(<column>) LIKE ?``
+  clauses + escaped LIKE pattern arguments.
+* :func:`create_fallback_snippet` — build a compact ``...content...``
+  snippet centered on the earliest matching term, for the result row's
+  ``snippet`` column.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import List
 
 __all__ = [
     "LikeSearchPlan",
@@ -34,105 +36,82 @@ __all__ = [
     "create_fallback_snippet",
 ]
 
-# Raw token extractor: prefers double-quoted phrases; falls back to whitespace
-# tokens. Matches TS ``RAW_TERM_RE = /"([^"]+)"|(\S+)/g``.
+# Match each non-quoted whitespace-delimited token OR each "..."-wrapped
+# phrase. Group 1 = phrase contents (no quotes); group 2 = bare token.
 _RAW_TERM_RE = re.compile(r'"([^"]+)"|(\S+)')
 
-# CJK detection: covers CJK Unified, Compat, Kana, Hangul. Translated 1:1 from
-# TS ``CJK_RE = /[⺀-鿿㐀-䶿豈-﫿가-힯
-# ぀-ゟ゠-ヿ]/``. We use explicit ``\u`` escapes here to keep
-# the file round-trippable through every editor / encoding pipeline.
-_CJK_RE = re.compile("[⺀-鿿㐀-䶿豈-﫿가-힯぀-ゟ゠-ヿ]")
+# CJK Unicode block ranges (CJK Unified, CJK Extension A, CJK Compat,
+# Hangul, Hiragana, Katakana) — matches the TS regex character class
+# verbatim.
+_CJK_RE = re.compile(r"[⺀-鿿㐀-䶿豈-﫿가-힯぀-ゟ゠-ヿ]")
 
-# Edge punctuation stripped during normalization. Same set as TS, including
-# the closing-bracket family.
-_EDGE_PUNCT_RE = re.compile(
-    r"^[`'\"()\[\]{}<>.,:;!?*_+=|\\/\-]+|[`'\"()\[\]{}<>.,:;!?*_+=|\\/\-]+$"
-)
+# Punctuation to trim from term edges (leading or trailing).
+_EDGE_PUNCT_RE = re.compile(r"^[`'\"()\[\]{}<>.,:;!?*_+=|\\/-]+|[`'\"()\[\]{}<>.,:;!?*_+=|\\/-]+$")
 
 
-@dataclass
+@dataclass(frozen=True)
 class LikeSearchPlan:
-    """A LIKE-backed search plan with three parallel arrays.
+    """A normalized LIKE-fallback search plan.
 
     Attributes:
-        terms: Normalized search tokens. Snippet builder uses these to find
-            the earliest match in the content.
-        where: Parallel SQL ``WHERE`` fragments (each ``LOWER(<col>) LIKE ?
-            ESCAPE '\\'``). Same length as ``args``.
-        args: Parallel bound-parameter values (each ``%<escaped>%``). Same
-            length as ``where``.
+        terms: Normalized lowercase tokens (edge punctuation stripped,
+            de-duplicated, in first-seen order).
+        where: Parameterized ``LOWER(<column>) LIKE ? ESCAPE '\\'``
+            clauses, one per term.
+        args: Escaped LIKE pattern arguments (``%term%``), one per term.
     """
 
-    terms: list[str] = field(default_factory=list)
-    where: list[str] = field(default_factory=list)
-    args: list[str] = field(default_factory=list)
+    terms: List[str]
+    where: List[str]
+    args: List[str]
 
 
 def contains_cjk(text: str) -> bool:
-    """Detect whether ``text`` contains CJK characters.
+    """Return ``True`` when ``text`` contains any CJK character.
 
-    Covers CJK Unified Ideographs (``\\u2E80-\\u9FFF``), CJK Extension A
-    (``\\u3400-\\u4DBF``), CJK Compatibility Ideographs (``\\uF900-\\uFAFF``),
-    Hangul Syllables (``\\uAC00-\\uD7AF``), Hiragana (``\\u3040-\\u309F``), and
-    Katakana (``\\u30A0-\\u30FF``).
-
-    Args:
-        text: Any string. Empty string returns ``False``.
-
-    Returns:
-        ``True`` if any CJK character is present; ``False`` otherwise.
+    Used by :meth:`ConversationStore.search_messages` to route through
+    the LIKE fallback when the query contains CJK — FTS5 unicode61
+    tokenizer cannot index/match CJK reliably (the tokenizer splits on
+    Unicode word boundaries that don't align with CJK character
+    boundaries).
     """
     return bool(_CJK_RE.search(text))
 
 
 def _normalize_fallback_term(raw: str) -> str:
-    """Strip edge punctuation, trim, lowercase."""
+    """Trim whitespace + edge punctuation; lowercase.
+
+    Mirrors ``normalizeFallbackTerm`` in TS. Non-string inputs return
+    the empty string (TS used a ``typeof !== "string"`` guard).
+    """
     if not isinstance(raw, str):
         return ""
     return _EDGE_PUNCT_RE.sub("", raw.strip()).lower()
 
 
 def _escape_like(term: str) -> str:
-    """Escape ``\\``, ``%``, ``_`` for SQLite ``LIKE ... ESCAPE '\\'``.
-
-    Args:
-        term: A search token.
-
-    Returns:
-        The token with backslashes, percents, and underscores prefixed by
-        ``\\``.
-    """
-    out_chars: list[str] = []
-    for ch in term:
-        if ch in ("\\", "%", "_"):
-            out_chars.append("\\")
-        out_chars.append(ch)
-    return "".join(out_chars)
+    """Escape ``\\``, ``%``, and ``_`` for use with ``LIKE ? ESCAPE '\\'``."""
+    return re.sub(r"([\\%_])", r"\\\1", term)
 
 
 def build_like_search_plan(column: str, query: str) -> LikeSearchPlan:
-    """Convert a free-text query into a conservative LIKE search plan.
+    """Convert a free-text query into a LIKE-fallback search plan.
 
-    The fallback keeps phrase tokens when the query uses double quotes, and
-    otherwise searches for all normalized tokens as case-insensitive
-    substrings. All terms must match (implicit AND).
+    Mirrors ``buildLikeSearchPlan`` in TS. Each whitespace-delimited
+    token (or double-quoted phrase) becomes one normalized term; terms
+    are de-duplicated in first-seen order.
 
     Args:
-        column: Column expression (without alias) to search against — e.g.
-            ``"content"``. Caller is responsible for any required aliasing.
-        query: The user query. Quoted phrases (e.g. ``"foo bar"``) become
-            single phrase tokens; everything else splits on whitespace.
+        column: SQL expression for the searchable text column, e.g.
+            ``"content"``.
+        query: Free-text user query.
 
     Returns:
-        A :class:`LikeSearchPlan` with empty fields when the query has no
-        usable terms (caller should short-circuit to an empty result).
+        A :class:`LikeSearchPlan` with one entry per unique term.
     """
-    terms: list[str] = []
+    terms: List[str] = []
     for match in _RAW_TERM_RE.finditer(query):
-        raw = match.group(1) if match.group(1) is not None else match.group(2)
-        if raw is None:
-            continue
+        raw = match.group(1) or match.group(2) or ""
         normalized = _normalize_fallback_term(raw)
         if normalized and normalized not in terms:
             terms.append(normalized)
@@ -149,23 +128,26 @@ def build_like_search_plan(column: str, query: str) -> LikeSearchPlan:
     )
 
 
-def create_fallback_snippet(content: str, terms: list[str]) -> str:
-    """Build a short snippet centered on the earliest term hit.
+def create_fallback_snippet(content: str, terms: List[str]) -> str:
+    """Build a compact ``...content...`` snippet centered on the earliest match.
 
-    When no term matches, returns the first 80 characters of ``content``
-    (with ellipsis when truncated). When a term matches, returns a window
-    that spans 24 chars before to ``max(term_len, 1) + 40`` chars after the
-    earliest hit, prefixed/suffixed with ``"..."`` if cut off at either end.
+    Mirrors ``createFallbackSnippet`` in TS. Strategy:
+
+    1. Find the earliest match for any of the terms in
+       ``content.lower()``.
+    2. Return ``content[max(0, match - 24) : min(len, match + max(termlen, 1) + 40)]``
+       with leading/trailing ``...`` markers when the window doesn't reach
+       the edges.
+    3. If no term matches, return ``content.strip()`` truncated to 80
+       characters with a trailing ``...`` if longer.
 
     Args:
-        content: Raw content text.
-        terms: Normalized search terms (lowercase). Used as substring needles
-            against a lower-cased haystack for case-insensitive matching.
+        content: The full message/summary text.
+        terms: Normalized terms from :class:`LikeSearchPlan`.
 
     Returns:
-        A snippet string. Always non-empty when ``content`` is non-empty
-        (matches TS — even an empty terms list falls through to the
-        head-of-content path).
+        A snippet string (UTF-8 safe — no surrogate-pair concerns since
+        Python ``str`` indexes code points, not UTF-16 units).
     """
     haystack = content.lower()
     match_index = -1
@@ -179,7 +161,7 @@ def create_fallback_snippet(content: str, terms: list[str]) -> str:
 
     if match_index == -1:
         head = content.strip()
-        return head if len(head) <= 80 else head[:77].rstrip() + "..."
+        return head if len(head) <= 80 else f"{head[:77].rstrip()}..."
 
     start = max(0, match_index - 24)
     end = min(len(content), match_index + max(match_length, 1) + 40)

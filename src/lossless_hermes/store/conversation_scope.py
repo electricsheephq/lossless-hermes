@@ -1,89 +1,110 @@
-"""Build the optional ``WHERE conversation_id IN (...)`` fragment for searches.
+"""Build ``WHERE conversation_id IN (...)`` fragments.
 
-Ports ``lossless-claw/src/store/conversation-scope.ts`` (LCM commit ``1f07fbd``,
-34 LOC TS → ~40 LOC Python). Used by every search path in
-:mod:`lossless_hermes.store.summary` (FTS5, LIKE, CJK trigram, CJK LIKE, regex)
-to optionally narrow the query to one or many conversations.
+Port of ``lossless-claw/src/store/conversation-scope.ts`` (LCM commit
+``1f07fbd``). 34 LOC TS → Python.
 
-The single-conv case (``conversation_id`` scalar) is the hot path; the
-many-conv case (``conversation_ids`` list) is used by cross-conversation
-retrieval features added in v4.1. When neither is supplied, no constraint is
-appended — searches span the whole DB.
-
-See:
-
-* ``/Volumes/LEXAR/Claude/lossless-claw/src/store/conversation-scope.ts`` —
-  TS canonical (commit ``1f07fbd``).
-* ``docs/porting-guides/storage.md`` §4.2 row "conversation-scope.ts".
+The helper centralizes the "single conversation_id" vs. "multiple
+conversation_ids" branching that appears across every search backend
+(:func:`ConversationStore._search_full_text`,
+:func:`ConversationStore._search_like`,
+:func:`ConversationStore._search_regex`, and the analogous summary-store
+paths). Without it, each backend would re-implement the same de-dup /
+length-1 fast-path / parameterized IN-list pattern.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable, List
+
+__all__ = ["append_conversation_scope_constraint"]
 
 
 def append_conversation_scope_constraint(
     *,
-    where: list[str],
-    args: list[Any],
+    where: List[str],
+    args: List[Any],
     column_expr: str,
     conversation_id: int | None = None,
-    conversation_ids: list[int] | None = None,
+    conversation_ids: Iterable[int] | None = None,
 ) -> None:
-    """Append a ``WHERE`` fragment that scopes the search to one or many convs.
+    """Append a ``conversation_id``-scope predicate to a WHERE clause builder.
 
-    Mirrors TS ``appendConversationScopeConstraint``. Mutates ``where`` and
-    ``args`` in place — chosen to match the TS call sites that thread a single
-    pair of accumulators through several builders.
+    Mirrors ``appendConversationScopeConstraint`` in TS verbatim. Mutates
+    ``where`` (appends one SQL fragment) and ``args`` (appends the bind
+    parameters) in place — no return value.
 
     Resolution order:
 
-    1. ``conversation_ids`` (if non-empty) wins. Single-element lists collapse
-       to ``= ?``; multi-element lists become ``IN (?, ?, ...)``.
-    2. Falls back to ``conversation_id`` (the scalar path) when
-       ``conversation_ids`` is empty/missing.
-    3. No constraint appended when both are ``None``/empty — caller's query
-       runs DB-wide.
+    1. If ``conversation_ids`` is non-empty (after de-dup + integer
+       coercion + filter-out-NaN), use it; ignore ``conversation_id``.
+    2. Otherwise if ``conversation_id`` is non-None, use it as a single-row
+       filter.
+    3. Otherwise add nothing.
 
     Args:
-        where: Mutable list of ``WHERE`` clauses; new fragment(s) appended.
-        args: Mutable list of bound-parameter values; new value(s) appended in
-            the same order as the ``WHERE`` fragments.
-        column_expr: Fully-qualified column reference (e.g. ``"s.conversation_id"``
-            or ``"conversation_id"``) — depends on whether the caller's query
-            uses a table alias.
-        conversation_id: Single conversation scope. Used when
-            ``conversation_ids`` is None or empty.
-        conversation_ids: Many-conversation scope. Empty list ≡ ``None``.
-            Duplicates and non-integer values are filtered out — the TS source
-            uses ``new Set(...)`` + ``Math.trunc``; we mirror via dict-from-keys
-            (preserves insertion order) + ``int()`` coercion.
+        where: List of SQL fragment strings (mutated in place).
+        args: List of bind parameter values (mutated in place).
+        column_expr: SQL expression for the conversation_id column, e.g.
+            ``"m.conversation_id"`` or ``"conversation_id"``.
+        conversation_id: Single-row filter (used only when
+            ``conversation_ids`` is absent/empty).
+        conversation_ids: Multi-row filter; values are de-duplicated and
+            coerced to integers.
+
+    Examples:
+        Single-row filter via ``conversation_id``::
+
+            where: list[str] = []
+            args: list[Any] = []
+            append_conversation_scope_constraint(
+                where=where, args=args, column_expr="conversation_id",
+                conversation_id=42,
+            )
+            # where == ["conversation_id = ?"]
+            # args == [42]
+
+        Multi-row filter via ``conversation_ids`` (length 1 fast-path)::
+
+            append_conversation_scope_constraint(
+                where=where, args=args, column_expr="m.conversation_id",
+                conversation_ids=[7],
+            )
+            # where == ["m.conversation_id = ?"]
+            # args == [7]
+
+        Multi-row filter via ``conversation_ids`` (proper IN list)::
+
+            append_conversation_scope_constraint(
+                where=where, args=args, column_expr="m.conversation_id",
+                conversation_ids=[7, 9, 11],
+            )
+            # where == ["m.conversation_id IN (?, ?, ?)"]
+            # args == [7, 9, 11]
     """
-    # Filter + dedupe (preserving insertion order, like a TS Set).
-    if conversation_ids:
-        normalized_ids: list[int] = []
+    # Normalize conversation_ids: filter finite ints, de-dup preserving order.
+    normalized: List[int] = []
+    if conversation_ids is not None:
         seen: set[int] = set()
         for value in conversation_ids:
-            if not isinstance(value, (int, float)):
+            if value is None:
                 continue
-            # ``Math.trunc`` rounds toward zero for floats. Python's ``int()``
-            # does the same on floats.
-            truncated = int(value)
-            if truncated not in seen:
-                seen.add(truncated)
-                normalized_ids.append(truncated)
-    else:
-        normalized_ids = []
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if int_value in seen:
+                continue
+            seen.add(int_value)
+            normalized.append(int_value)
 
-    if normalized_ids:
-        if len(normalized_ids) == 1:
+    if normalized:
+        if len(normalized) == 1:
             where.append(f"{column_expr} = ?")
-            args.append(normalized_ids[0])
+            args.append(normalized[0])
             return
-
-        placeholders = ", ".join("?" for _ in normalized_ids)
+        placeholders = ", ".join("?" for _ in normalized)
         where.append(f"{column_expr} IN ({placeholders})")
-        args.extend(normalized_ids)
+        args.extend(normalized)
         return
 
     if conversation_id is not None:

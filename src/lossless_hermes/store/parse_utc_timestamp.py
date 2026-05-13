@@ -1,25 +1,21 @@
 """Reinterpret SQLite ``datetime('now')`` strings as UTC.
 
-Ports ``lossless-claw/src/store/parse-utc-timestamp.ts`` (LCM commit
-``1f07fbd``, 26 LOC TS → ~30 LOC Python). SQLite stores ``datetime('now')``
-results without a ``Z`` suffix (e.g. ``"2026-01-15 12:34:56"``), and a naive
-``datetime.fromisoformat`` parse would treat the string as host-local time —
-shifting timestamps by the host's UTC offset on every read. This module's
-single job is to coerce SQLite naive UTC strings into Python aware
-``datetime`` objects.
+Port of ``lossless-claw/src/store/parse-utc-timestamp.ts`` (LCM commit ``1f07fbd``).
 
-The TS reference uses the ``Date`` constructor; the Python port returns a
-:class:`datetime.datetime` with ``tzinfo=timezone.utc`` set.
+SQLite's ``datetime('now')`` writes timestamps in the form
+``YYYY-MM-DD HH:MM:SS`` (space-separated, no trailing ``Z``). The TS code
+ran into a subtle bug where Node's ``new Date(value)`` parses such strings
+as **local time** rather than UTC — see
+https://github.com/Martian-Engineering/lossless-claw/issues/216.
 
-See:
+The Python equivalent — :func:`datetime.fromisoformat` — has the same
+issue: strings without a trailing ``Z`` or ``+HH:MM`` offset are treated
+as naive (no tzinfo). The TS fix detects naive strings and forces UTC by
+appending ``Z`` and re-parsing; our port does the same by attaching
+:class:`datetime.timezone.utc` after :func:`datetime.fromisoformat`
+succeeds on the normalized form.
 
-* ``/Volumes/LEXAR/Claude/lossless-claw/src/store/parse-utc-timestamp.ts`` —
-  TS canonical (commit ``1f07fbd``).
-* https://github.com/Martian-Engineering/lossless-claw/issues/216 — original
-  bug report (Asia/Shanghai users saw 8 h offset on all timestamps).
-* ``docs/porting-guides/storage.md`` §4.2 row "parse-utc-timestamp.ts".
-* ``epics/01-storage/01-09-summary-store.md`` — this module is one of the
-  Phase-0 leaves that 01-09 ports inline.
+The function ALWAYS returns an aware :class:`datetime.datetime` in UTC.
 """
 
 from __future__ import annotations
@@ -29,66 +25,64 @@ from datetime import datetime, timezone
 
 __all__ = ["parse_utc_timestamp", "parse_utc_timestamp_or_null"]
 
-# Matches a trailing ``Z`` / ``+HH:MM`` / ``-HH:MM`` — i.e. an explicit
-# timezone offset that means we should NOT default-apply ``Z``.
-_TZ_SUFFIX_RE = re.compile(r"(?:[zZ]|[+-]\d{2}:\d{2})$")
+# Detects an explicit timezone tail (``Z`` or ``+HH:MM`` / ``-HH:MM``).
+_TZ_TAIL_RE = re.compile(r"(?:[zZ]|[+-]\d{2}:\d{2})$")
 
 
 def parse_utc_timestamp(value: str) -> datetime:
-    """Parse a SQLite UTC timestamp string into an aware UTC :class:`datetime`.
+    """Parse a SQLite UTC timestamp string into an aware :class:`datetime`.
 
-    Handles the two SQLite output shapes:
+    Mirrors ``parseUtcTimestamp`` in
+    ``lossless-claw/src/store/parse-utc-timestamp.ts``: if the input
+    carries an explicit ``Z`` / ``+HH:MM`` offset it's parsed directly;
+    otherwise the string is treated as a SQLite-emitted local-form
+    timestamp and rewritten with a ``T`` separator (if needed) and a
+    trailing ``Z`` so :func:`datetime.fromisoformat` produces an aware UTC
+    datetime.
 
-    * ``"2026-01-15 12:34:56"`` (datetime('now') default) — no ``T``, no ``Z``.
-    * ``"2026-01-15T12:34:56"`` (round-tripped through a ``Date.toISOString()``
-      in the TS source then re-stored).
-
-    If the input already carries a timezone (``Z`` or ``+HH:MM``), it is parsed
-    as-is. Otherwise we append ``Z`` so the resulting ``datetime`` is aware.
+    If ``value`` is not a string this returns the Python equivalent of
+    JS's ``new Date(NaN)`` — :func:`datetime.fromtimestamp` cannot
+    express ``NaN``; we raise :class:`TypeError` instead because callers
+    rely on the function returning a valid object.
 
     Args:
-        value: SQLite-formatted timestamp string. A non-string input (None,
-            int, float) yields ``datetime.fromisoformat("NaN")`` equivalent —
-            but in practice the caller should branch on the column being null
-            before calling this; see :func:`parse_utc_timestamp_or_null`.
+        value: A SQLite timestamp string. Accepted forms:
+
+            * ``"2026-05-13 10:22:42"`` (SQLite ``datetime('now')`` form)
+            * ``"2026-05-13T10:22:42"`` (ISO 8601 with ``T`` separator)
+            * ``"2026-05-13T10:22:42Z"`` (explicit UTC marker)
+            * ``"2026-05-13T10:22:42+00:00"`` (explicit offset)
 
     Returns:
-        A timezone-aware :class:`datetime` in UTC.
+        An aware :class:`datetime.datetime` in UTC.
 
     Raises:
-        ValueError: When ``value`` cannot be parsed by
-            :meth:`datetime.fromisoformat`. The TS source returns
-            ``new Date(NaN)`` in that case; Python's stricter parser raises,
-            which is the better failure mode (it surfaces the bug instead of
-            silently producing an invalid Date).
+        TypeError: ``value`` is not a string.
+        ValueError: ``value`` does not match an ISO-8601-ish form that
+            Python's :func:`datetime.fromisoformat` accepts.
     """
     if not isinstance(value, str):
-        # TS returns `new Date(NaN)`; Python's stricter approach: raise.
-        raise ValueError(f"parse_utc_timestamp: expected str, got {type(value).__name__}")
-
+        raise TypeError(f"parse_utc_timestamp: expected str, got {type(value).__name__}")
     s = value.strip()
-    if _TZ_SUFFIX_RE.search(s):
-        # Already has a tz suffix — parse directly.
-        # Python's fromisoformat in 3.11+ handles 'Z' suffix natively.
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if _TZ_TAIL_RE.search(s):
+        # Replace trailing "Z" with "+00:00" for compatibility with all
+        # Python 3.x fromisoformat implementations (3.11+ accepts both).
+        if s.endswith(("z", "Z")):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
 
-    # No tz suffix — normalize ``'YYYY-MM-DD HH:MM:SS'`` to ISO 8601 and add
-    # ``+00:00`` so the resulting datetime is aware-UTC.
-    normalized = s if "T" in s else s.replace(" ", "T")
-    return datetime.fromisoformat(f"{normalized}+00:00")
+    normalized = s if "T" in s else s.replace(" ", "T", 1)
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def parse_utc_timestamp_or_null(value: str | None) -> datetime | None:
     """Parse a nullable SQLite UTC timestamp string.
 
-    Returns ``None`` for null/empty inputs; otherwise delegates to
-    :func:`parse_utc_timestamp`.
-
-    Args:
-        value: SQLite column value (``None`` for SQL ``NULL``, else string).
-
-    Returns:
-        Timezone-aware UTC :class:`datetime` or ``None``.
+    Mirrors ``parseUtcTimestampOrNull`` in TS. Returns ``None`` when the
+    input is ``None``; otherwise delegates to :func:`parse_utc_timestamp`.
     """
     if value is None:
         return None
