@@ -38,6 +38,7 @@ dev = [
     "ruff==0.15.10",              # matches Hermes pin
     "ty==0.0.21",                 # matches Hermes pin
     "pre-commit==4.0.1",
+    "pydantic-settings==2.14.1",  # Optional env-var-loader helper — see issue 01-02 (not used in resolver but available for future fields)
 ]
 # Opt-in: legacy type-check via mypy for IDE plugins that don't yet speak ty.
 type-mypy = ["mypy==1.13.0"]

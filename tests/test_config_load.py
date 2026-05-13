@@ -1,24 +1,20 @@
-"""Smoke tests for the ``lossless_hermes.db.config`` skeleton.
+"""Loader-shape tests for ``lossless_hermes.db.config.load_config``.
 
-Covers the four acceptance criteria called out in
-``epics/00-scaffolding/issues/00-07-config-skeleton.md`` §"Smoke test":
+Originally written as a v0 skeleton (issue #00-07). Updated for issue
+#01-02 — the model now has all ~52 fields per the TS source, so
+"empty model" assertions have been replaced with "sensible defaults"
+checks. The loader contract is otherwise unchanged:
 
-1. Empty YAML namespace (``lossless_hermes: {}``) yields ``LcmConfig()``
-   with defaults — the v0 skeleton has no fields, so this just means the
-   model instantiates with no args.
-2. Missing config file ⇒ ``LcmConfig()`` with defaults.
-3. An unknown key under ``lossless_hermes:`` ⇒ ``pydantic.ValidationError``
-   because ``LcmConfig`` is declared with ``extra='forbid'`` (ADR-023
-   §Consequences "catch typos at startup, not at first use").
+1. Missing config file ⇒ defaults applied (loader does NOT raise).
+2. ``lossless_hermes: {}`` is the explicit-empty case → defaults.
+3. An unknown key under ``lossless_hermes:`` ⇒
+   :class:`pydantic.ValidationError` because ``LcmConfig`` is declared
+   with ``extra='forbid'`` (ADR-023 §Consequences).
 4. ``${VAR}`` references in the YAML body are interpolated against
-   ``os.environ`` when the variable is set.
+   :data:`os.environ` when the variable is set.
 
-The skeleton has no fields at v0, so we cannot assert on a specific
-default value (e.g. ``context_threshold == 0.75``). Field-level tests
-land alongside the PR that ports the corresponding TS knob — see the
-docstring of ``lossless_hermes.db.config`` and the §"Configuration
-surface — full inventory" table in
-``docs/porting-guides/tests-and-config.md``.
+Field-level coverage (precedence, clamps, derived defaults, alias
+deprecation warnings) lives in ``test_db_config.py``.
 """
 
 from __future__ import annotations
@@ -37,16 +33,25 @@ from lossless_hermes.db.config import LcmConfig, WorkerConfig, load_config
 
 
 def test_lcm_config_instantiates_with_no_args() -> None:
-    """``LcmConfig()`` is the v0 default-everything constructor.
+    """``LcmConfig()`` constructs with all defaults from the TS source.
 
-    The model is intentionally empty at v0 (issue #00-07 AC: "Model is
-    empty for v0 (no fields). It must be instantiable as LcmConfig()
-    with no args"). This test pins that contract so a future PR that
-    adds a required field has to update the test deliberately.
+    Post-01-02 (full model port), the constructor applies ~50 default
+    values matching ``src/db/config.ts``. We assert on a handful of
+    load-bearing ones so a future PR that drifts a default has a clear
+    failure here. Full field coverage lives in ``test_db_config.py``.
     """
     cfg = LcmConfig()
-    # No fields at v0 — model_dump() must be the empty mapping.
-    assert cfg.model_dump() == {}
+    # Sample of the contract: every TS default mirrors here.
+    assert cfg.enabled is True
+    assert cfg.context_threshold == 0.75
+    assert cfg.leaf_chunk_tokens == 20000
+    assert cfg.leaf_target_tokens == 4000  # v4.1 (A.10): raised from 2400
+    assert cfg.fresh_tail_count == 64
+    assert cfg.proactive_threshold_compaction_mode == "deferred"
+    assert cfg.summary_max_overage_factor == 3.0
+    assert cfg.cache_aware_compaction.enabled is True
+    assert cfg.cache_aware_compaction.cache_ttl_seconds == 300
+    assert cfg.dynamic_leaf_chunk_tokens.enabled is True
 
 
 def test_lcm_config_rejects_unknown_field_at_construct_time() -> None:
@@ -83,41 +88,58 @@ def test_worker_config_rejects_unknown_field() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_file_returns_default_config(tmp_path: Path) -> None:
+def test_missing_file_returns_default_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Missing ``config.yaml`` is the first-run path — defaults apply.
 
     The operator may install lossless-hermes before populating
-    ``~/.hermes/config.yaml``. The loader must NOT raise in that case
-    (issue #00-07 AC: "If the file does not exist, returns LcmConfig()").
+    ``~/.hermes/config.yaml``. The loader must NOT raise in that case;
+    it falls through to env-driven defaults (post-01-02 the model has
+    all fields, so we assert on the canonical default value).
     """
+    # Clear env vars that would otherwise leak through resolve_lcm_config.
+    for var in (
+        "HERMES_CONTEXT_THRESHOLD",
+        "LCM_CONTEXT_THRESHOLD",
+        "HERMES_LEAF_CHUNK_TOKENS",
+        "LCM_LEAF_CHUNK_TOKENS",
+    ):
+        monkeypatch.delenv(var, raising=False)
     missing = tmp_path / "does-not-exist.yaml"
     assert not missing.exists()
     cfg = load_config(missing)
     assert isinstance(cfg, LcmConfig)
-    assert cfg.model_dump() == {}
+    assert cfg.context_threshold == 0.75
+    assert cfg.leaf_chunk_tokens == 20000
 
 
-def test_empty_namespace_yields_defaults(tmp_path: Path) -> None:
+def test_empty_namespace_yields_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``lossless_hermes: {}`` is the explicit-but-empty configuration.
 
     Same observable behavior as the missing-file case, but exercises a
     different code path inside ``load_config`` (file present, YAML
     parsed, namespace present-but-empty).
     """
+    for var in ("HERMES_CONTEXT_THRESHOLD", "LCM_CONTEXT_THRESHOLD"):
+        monkeypatch.delenv(var, raising=False)
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text("lossless_hermes: {}\n", encoding="utf-8")
     cfg = load_config(cfg_path)
     assert isinstance(cfg, LcmConfig)
-    assert cfg.model_dump() == {}
+    assert cfg.context_threshold == 0.75
+    assert cfg.enabled is True
 
 
-def test_missing_namespace_yields_defaults(tmp_path: Path) -> None:
+def test_missing_namespace_yields_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``config.yaml`` without a ``lossless_hermes:`` key still loads.
 
     Operators may install lossless-hermes alongside other Hermes plugins
     and leave the namespace unset (using defaults). The loader treats a
     missing namespace the same as ``lossless_hermes: {}``.
     """
+    for var in ("HERMES_CONTEXT_THRESHOLD", "LCM_CONTEXT_THRESHOLD"):
+        monkeypatch.delenv(var, raising=False)
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
         "context:\n  engine: lcm\nplugins:\n  enabled:\n    - lossless-hermes\n",
@@ -125,7 +147,8 @@ def test_missing_namespace_yields_defaults(tmp_path: Path) -> None:
     )
     cfg = load_config(cfg_path)
     assert isinstance(cfg, LcmConfig)
-    assert cfg.model_dump() == {}
+    assert cfg.context_threshold == 0.75
+    assert cfg.enabled is True
 
 
 def test_unknown_key_raises_validation_error(tmp_path: Path) -> None:
@@ -236,7 +259,8 @@ def test_default_path_uses_hermes_home(tmp_path: Path, monkeypatch: pytest.Monke
     )
     cfg = load_config()
     assert isinstance(cfg, LcmConfig)
-    assert cfg.model_dump() == {}
+    # Post-01-02: model has defaults. Spot-check one canonical value.
+    assert cfg.context_threshold == 0.75
 
 
 def test_default_path_falls_back_when_hermes_home_unset(
@@ -250,8 +274,11 @@ def test_default_path_falls_back_when_hermes_home_unset(
     """
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("HERMES_CONTEXT_THRESHOLD", "LCM_CONTEXT_THRESHOLD"):
+        monkeypatch.delenv(var, raising=False)
     # No file at $HOME/.hermes/config.yaml — loader must fall through
     # to defaults rather than raise.
     cfg = load_config()
     assert isinstance(cfg, LcmConfig)
-    assert cfg.model_dump() == {}
+    # Post-01-02: model has defaults. Spot-check one canonical value.
+    assert cfg.context_threshold == 0.75
