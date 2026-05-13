@@ -6,13 +6,14 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W1 (Epic 00 Scaffolding)** |
-| **Current milestone** | M1 (plugin loads as no-op) — pending Wave 1 close |
-| **Last merged PR** | [#1](https://github.com/electricsheephq/lossless-hermes/pull/1) `[00-01] pyproject.toml + src package skeleton` (merged 2026-05-13T10:38:48Z) |
-| **Last commit on main** | `9893bf1` |
-| **Next issues (parallel)** | 00-02 CI matrix, 00-03 pre-commit, 00-04 test harness, 00-05 hermes bridge stub, 00-06 noop engine, 00-07 config skeleton, 00-08 README |
+| **Current wave** | **W1 (Epic 00 Scaffolding) — closing** |
+| **Current milestone** | M1 (plugin loads as no-op) — closes after 00-06 lands |
+| **Last merged PR** | [#6](https://github.com/electricsheephq/lossless-hermes/pull/6) `[00-08] README + CONTRIBUTING` (merged 2026-05-13T11:09:56Z) |
+| **Last commit on main** | `9c2e68c` |
+| **Next issue** | [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) — depends on 00-05 (bridge, merged) + 00-07 (config, merged); ready to dispatch |
 | **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
+| **Dependabot** | 1 moderate vulnerability flagged; triaged post-Wave-1 |
 
 ## Wave 0 — Pre-execution spikes ✅ CLOSED
 
@@ -24,20 +25,25 @@
 | 0d | GitNexus LCM index verified | ✅ done | `openclaw-code-index` MCP server, repo `lossless-claw`, 7382 nodes, 6836 embeddings |
 | 0e | Single-issue dry run on 00-01 | ✅ done | PR #1 merged 2026-05-13; Issue Executor + Pair Reviewer (97% confidence APPROVE) loop validated |
 
-## Wave 1 — Epic 00 Scaffolding (in progress)
+## Wave 1 — Epic 00 Scaffolding (7/8 merged; 00-06 pending)
 
 | Issue | Status | PR |
 |---|---|---|
 | [00-01 pyproject + package skeleton](./epics/00-scaffolding/issues/00-01-pyproject-and-package-skeleton.md) | ✅ merged | [#1](https://github.com/electricsheephq/lossless-hermes/pull/1) |
-| [00-02 CI matrix](./epics/00-scaffolding/issues/00-02-ci-matrix.md) | ⏳ pending | — |
-| [00-03 pre-commit hooks](./epics/00-scaffolding/issues/00-03-precommit-hooks.md) | ⏳ pending | — |
-| [00-04 test harness fixtures](./epics/00-scaffolding/issues/00-04-test-harness-fixtures.md) | ⏳ pending | — |
-| [00-05 hermes bridge stub](./epics/00-scaffolding/issues/00-05-hermes-bridge-stub.md) | ⏳ pending | — |
-| [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) | ⏳ pending | — |
-| [00-07 config skeleton](./epics/00-scaffolding/issues/00-07-config-skeleton.md) | ⏳ pending | — |
-| [00-08 README + docs](./epics/00-scaffolding/issues/00-08-readme-and-docs.md) | ⏳ pending | — |
+| [00-02 CI matrix](./epics/00-scaffolding/issues/00-02-ci-matrix.md) | ✅ merged | [#5](https://github.com/electricsheephq/lossless-hermes/pull/5) |
+| [00-03 pre-commit hooks](./epics/00-scaffolding/issues/00-03-precommit-hooks.md) | ✅ merged | [#2](https://github.com/electricsheephq/lossless-hermes/pull/2) |
+| [00-04 test harness fixtures](./epics/00-scaffolding/issues/00-04-test-harness-fixtures.md) | ✅ merged | [#4](https://github.com/electricsheephq/lossless-hermes/pull/4) |
+| [00-05 hermes bridge stub](./epics/00-scaffolding/issues/00-05-hermes-bridge-stub.md) | ✅ merged | [#3](https://github.com/electricsheephq/lossless-hermes/pull/3) |
+| [00-06 noop engine](./epics/00-scaffolding/issues/00-06-noop-engine.md) | ⏳ next | — |
+| [00-07 config skeleton](./epics/00-scaffolding/issues/00-07-config-skeleton.md) | ✅ merged | [#7](https://github.com/electricsheephq/lossless-hermes/pull/7) |
+| [00-08 README + docs](./epics/00-scaffolding/issues/00-08-readme-and-docs.md) | ✅ merged | [#6](https://github.com/electricsheephq/lossless-hermes/pull/6) |
 
-**Wave 1 exit gate:** all 8 issues merged; CI matrix green on `{macOS-latest, ubuntu-latest} × {python-3.11, 3.12, 3.13}`; Hermes loads plugin as no-op via `hermes` startup log line.
+**Wave 1 exit gate:** 00-06 merged + CI matrix green on `{macOS-latest, ubuntu-latest} × {python-3.11, 3.12, 3.13}` (currently green on main) + Hermes loads plugin as no-op via `hermes` startup log line.
+
+**Wave 1 operational lessons (recorded for Wave 2+):**
+1. **Per-worktree isolation is mandatory** for 2+ parallel Executors. Shared working tree caused branch-checkout collisions during Wave 1 (mid-commit branch flips, recovered via post-hoc cherry-picks). Now documented in [`CLAUDE.md`](./CLAUDE.md) as the standing convention.
+2. **CI gate-vs-merge timing matters:** PR #7 merged before PR #5's CI workflow landed → format issue slipped through → caught on next PR's rebase. Fix-forward applied. Going forward: dispatch CI workflow PR first when possible.
+3. **README rebase pattern:** when one PR rewrites a file and a sibling PR adds to it, `git checkout --theirs` during rebase is the clean resolution (use the rewriter's version).
 
 ## Milestone progress
 
