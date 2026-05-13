@@ -40,7 +40,7 @@ labels: 'port, tool'
   1. Try `lcm_search_entities` with `mode='prefix'`.
   2. Try `lcm_grep` with `mode='hybrid'`.
   3. Try `lcm_grep` with `mode='verbatim'`.
-  
+
   **Critical UX detail — keep verbatim in the port** per tools.md line 429.
 - [ ] **Existence-probing defense:** the `not found` payload is INTENTIONALLY indistinguishable from "all mentions suppressed" — same shape, no leakage. Pin this with a test.
 - [ ] **Mention list:** `SELECT m.* FROM lcm_entity_mentions m JOIN summaries s ON s.summary_id = m.summary_id WHERE m.entity_id=? AND s.suppressed_at IS NULL ORDER BY m.mentioned_at DESC LIMIT ?`.
