@@ -28,6 +28,17 @@ See:
 
 from __future__ import annotations
 
+from lossless_hermes.embeddings.hybrid_search import (
+    DEFAULT_K_FTS,
+    DEFAULT_K_SEMANTIC,
+    DEFAULT_TOP_N,
+    RRF_K,
+    FtsHit,
+    FtsSearchFn,
+    HybridHit,
+    HybridSearchResult,
+    run_hybrid_search,
+)
 from lossless_hermes.embeddings.semantic_search import (
     COSINE_BAND_HIGH,
     COSINE_BAND_LOW,
@@ -61,9 +72,17 @@ __all__ = [
     "COSINE_BAND_HIGH",
     "COSINE_BAND_LOW",
     "COSINE_BAND_MEDIUM",
+    "DEFAULT_K_FTS",
+    "DEFAULT_K_SEMANTIC",
+    "DEFAULT_TOP_N",
+    "RRF_K",
     "ConfidenceBand",
     "EmbeddedKind",
     "EmbeddingProfile",
+    "FtsHit",
+    "FtsSearchFn",
+    "HybridHit",
+    "HybridSearchResult",
     "SearchHit",
     "SearchSimilarOptions",
     "SemanticHit",
@@ -80,6 +99,7 @@ __all__ = [
     "record_embedding",
     "register_embedding_profile",
     "replace_embedding",
+    "run_hybrid_search",
     "run_semantic_search",
     "search_similar",
 ]
