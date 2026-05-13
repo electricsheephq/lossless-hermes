@@ -302,6 +302,21 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self._telemetry_store: Optional[CompactionTelemetryStore] = None
         self._maintenance_store: Optional[CompactionMaintenanceStore] = None
 
+        # ``current_session_id`` — most-recent Hermes session_id seen by
+        # ``on_session_start``. Used by Epic 08 ``/lcm`` handlers to resolve
+        # "the current conversation" without a ``PluginCommandContext`` to
+        # consult (Hermes's slash-command hook signature is ``(raw_args)
+        # -> str | None`` — no session context piggybacks).
+        # Per ``docs/porting-guides/plugin-glue.md`` §"Per-subcommand
+        # translation table" line 650, the TS ``ctx.sessionId`` /
+        # ``ctx.sessionKey`` maps to this engine-tracked field. Stays
+        # ``None`` before the first ``on_session_start`` (CLI pre-first-
+        # message; gateway with no active conversation) — handlers must
+        # treat ``None`` as "no active conversation" rather than
+        # rendering an "id=None" field. Cleared on ``on_session_end``
+        # for symmetry with the DB-close path.
+        self.current_session_id: Optional[str] = None
+
         # Per-session asyncio locks — see ADR-018 §"Per-session queue".
         # Issue 02-08 replaces the issue 02-01 ``defaultdict(asyncio.Lock)``
         # placeholder with a :class:`SessionLockRegistry` that adds a
