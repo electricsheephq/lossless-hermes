@@ -133,6 +133,7 @@ import logging
 import re
 import sys
 import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Literal, Protocol
@@ -146,6 +147,8 @@ __all__ = [
     "CompactionReason",
     "CompactionResult",
     "CompactUntilUnderResult",
+    "CondensedChunkSelection",
+    "CondensedPhaseCandidate",
     "DEFAULT_LEAF_CHUNK_TOKENS",
     "EMPTY_FRESH_TAIL_ORDINAL",
     "LcmProviderAuthError",
@@ -178,6 +181,17 @@ DEFAULT_LEAF_CHUNK_TOKENS = 20_000
 #: helper takes ``ResolvedItem`` while compaction's takes
 #: ``ContextItemRecord`` — different walks over different inputs).
 EMPTY_FRESH_TAIL_ORDINAL = sys.maxsize
+
+
+#: Ratio floor for :meth:`CompactionEngine._resolve_condensed_min_chunk_tokens`.
+#: Mirrors TS ``CONDENSED_MIN_INPUT_RATIO`` (compaction.ts line 195). The
+#: condensed-pass eligibility gate requires the candidate chunk's summary-
+#: tokens to be at least ``max(config.condensed_target_tokens,
+#: floor(leaf_chunk_tokens * CONDENSED_MIN_INPUT_RATIO))`` — the ratio
+#: floor guards against the "10 trivial-size leaves collapse into a
+#: bigger condensed than the source" degenerate case that wastes a
+#: summarize call.
+CONDENSED_MIN_INPUT_RATIO = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +638,11 @@ class _SummaryStoreLike(Protocol):
     :meth:`replace_context_range_with_summary` (atomic context swap).
     :meth:`with_transaction` is required so the leaf-pass write +
     DAG link + context swap commit together (TS lines 1565-1603).
+
+    Issue 04-03 (condensation pass) widens further to include
+    :meth:`get_distinct_depths_in_context` (depth picker) and
+    :meth:`link_summary_to_parents` (summary→summary DAG edges
+    distinct from the leaf pass's summary→message edges).
     """
 
     def get_context_token_count(self, conversation_id: int) -> int: ...
@@ -632,7 +651,12 @@ class _SummaryStoreLike(Protocol):
 
     # --- Methods added in issue 04-02 -----------------------------------------
 
-    def get_summary(self, summary_id: str) -> "_SummaryRecordLike | None": ...
+    def get_summary(
+        self,
+        summary_id: str,
+        *,
+        include_suppressed: bool = ...,
+    ) -> "_SummaryRecordLike | None": ...
 
     def insert_summary(self, input_: Any) -> Any: ...
 
@@ -644,7 +668,26 @@ class _SummaryStoreLike(Protocol):
 
     def replace_context_range_with_summary(self, input_: Any) -> None: ...
 
-    def with_transaction(self) -> Any: ...
+    def with_transaction(self) -> AbstractContextManager[None]: ...
+
+    # --- Methods added in issue 04-03 -----------------------------------------
+    # ``_condensed_pass`` consumes the depth picker + summary→summary
+    # DAG link. Real callers route through
+    # :class:`lossless_hermes.store.summary.SummaryStore`; tests supply
+    # in-memory stand-ins.
+
+    def get_distinct_depths_in_context(
+        self,
+        conversation_id: int,
+        *,
+        max_ordinal_exclusive: int | None = ...,
+    ) -> list[int]: ...
+
+    def link_summary_to_parents(
+        self,
+        summary_id: str,
+        parent_summary_ids: list[str],
+    ) -> None: ...
 
 
 class _ConversationStoreLike(Protocol):
@@ -708,12 +751,26 @@ class _MessagePartLike(Protocol):
 class _SummaryRecordLike(Protocol):
     """Structural shape compaction reads from each summaries row.
 
-    Only the ``content`` field is consumed by the leaf-pass body's
-    ``_resolve_prior_leaf_summary_context`` helper (TS lines
-    1065-1104). The wider ``SummaryRecord`` shape is irrelevant here.
+    The leaf-pass body's :meth:`_resolve_prior_leaf_summary_context`
+    helper (TS lines 1065-1104) consumes just ``content``. The
+    condensed-pass body (issue 04-03) widens the Protocol to include
+    the token-count + depth dispatch fields
+    (:meth:`_select_oldest_chunk_at_depth`) and the timestamp
+    aggregation + descendant arithmetic + DAG-link source fields
+    (:meth:`_condensed_pass`).
+
+    The structural-typing approach lets test fixtures supply a tiny
+    in-memory stand-in (just the fields named here) without standing
+    up a real SQLite row mapper.
     """
 
+    summary_id: str
+    depth: int
     content: str
+    token_count: int
+    earliest_at: datetime | None
+    latest_at: datetime | None
+    created_at: datetime
 
 
 class _CompactionTelemetryStoreLike(Protocol):
@@ -1237,6 +1294,59 @@ class LeafChunkSelection:
     items: list[_ContextItemLike]
     raw_tokens_outside_tail: int
     threshold: int
+
+
+# ---------------------------------------------------------------------------
+# Condensation-pass return shapes — :class:`CondensedChunkSelection` and
+# :class:`CondensedPhaseCandidate`
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CondensedChunkSelection:
+    """Result of :meth:`CompactionEngine._select_oldest_chunk_at_depth`.
+
+    Mirrors TS ``CondensedChunkSelection`` (compaction.ts lines 88-91).
+    Returned by the inner chunk-walker; consumed by
+    :meth:`CompactionEngine._select_shallowest_condensation_candidate`
+    to check fanout + min-chunk-tokens eligibility before committing
+    to a condensation pass at a given depth.
+
+    Attributes:
+        items: The selected context-item rows at the target depth, in
+            ordinal-ascending order. Empty when no same-depth chunk
+            exists; partial when termination (depth mismatch / token
+            cap / non-summary item) cut the walk short.
+        summary_tokens: Sum of resolved token counts across
+            ``items``. Compared against the min-chunk-tokens floor
+            (see :meth:`CompactionEngine._resolve_condensed_min_chunk_tokens`)
+            and the leaf-chunk-tokens cap (the walk terminates when
+            adding the next would exceed it).
+    """
+
+    items: list[_ContextItemLike]
+    summary_tokens: int
+
+
+@dataclass(frozen=True)
+class CondensedPhaseCandidate:
+    """Result of :meth:`CompactionEngine._select_shallowest_condensation_candidate`.
+
+    Mirrors TS ``CondensedPhaseCandidate`` (compaction.ts lines 92-95).
+    Carries the chosen depth + the qualifying chunk so the caller can
+    invoke :meth:`CompactionEngine._condensed_pass` without re-walking
+    the context.
+
+    Attributes:
+        target_depth: The depth of the summaries being condensed. The
+            produced summary will be at ``target_depth + 1``.
+        chunk: The :class:`CondensedChunkSelection` carrying the items
+            to condense + their summary-token total (for telemetry +
+            assertion).
+    """
+
+    target_depth: int
+    chunk: CondensedChunkSelection
 
 
 # ---------------------------------------------------------------------------
@@ -1861,6 +1971,820 @@ class CompactionEngine:
         # port, this method becomes a one-liner ``self._context_items_cache
         # .pop(conversation_id, None)``.
         del conversation_id
+
+    # ------------------------------------------------------------------
+    # Condensation-pass helpers — issue 04-03
+    # ------------------------------------------------------------------
+    #
+    # The condensation pass collapses N contiguous **same-depth**
+    # summaries into one depth+1 condensed summary. It is the phase-2
+    # body of :meth:`compact_full_sweep` once phase-1 (leaf passes) has
+    # pushed enough raw messages into the leaf-summary layer that a
+    # condensed pass can make further progress.
+    #
+    # The pieces below mirror the TS source verbatim:
+    #
+    # * Fanout dispatch — :meth:`_resolve_fanout_for_depth` (TS lines
+    #   1173-1181) picks the minimum-chunk-size gate based on
+    #   ``hard_trigger`` + ``depth``.
+    # * Min-chunk-tokens floor — :meth:`_resolve_condensed_min_chunk_tokens`
+    #   (TS lines 1184-1188) uses the :data:`CONDENSED_MIN_INPUT_RATIO`
+    #   ratio of ``leaf_chunk_tokens`` as a lower bound, max'd with the
+    #   ``condensed_target_tokens`` target.
+    # * Depth picker — :meth:`_select_shallowest_condensation_candidate`
+    #   (TS lines 1193-1222) walks ``get_distinct_depths_in_context``
+    #   shallowest-first and returns the first depth with a valid chunk.
+    # * Chunk walker — :meth:`_select_oldest_chunk_at_depth` (TS lines
+    #   1230-1282) walks ordinal-ascending, terminating on any
+    #   non-summary, depth mismatch, or when adding the next summary
+    #   would push tokens above ``leaf_chunk_tokens``.
+    # * Prior-summary context resolver — :meth:`_resolve_prior_summary_context_at_depth`
+    #   (TS lines 1284-1325) — only at depth 0; walk back ≤4 candidates,
+    #   take last 2 joined ``\n\n``.
+    # * Condensed-pass body — :meth:`_condensed_pass` (TS lines
+    #   1614-1751) fetches the chunk's summary records, concatenates
+    #   them with date-range headers, calls
+    #   :meth:`_summarize_with_escalation_condensed` with
+    #   ``options.is_condensed=True`` / ``options.depth=target_depth+1``,
+    #   then atomically inserts the new summary + links DAG edges to
+    #   parents + swaps the context range.
+    #
+    # Both selectors are sync (per ADR-017); the chunk walker reads
+    # full :class:`SummaryRecord` rows on demand via
+    # ``summary_store.get_summary``. Tests can supply minimal stand-ins
+    # by populating an in-memory ``summaries`` dict on the stub store
+    # (no SQLite migration needed).
+
+    def _resolve_summary_token_count(self, summary: _SummaryRecordLike) -> int:
+        """Resolve a summary's token count with content-length fallback.
+
+        Ports TS :meth:`CompactionEngine.resolveSummaryTokenCount`
+        (compaction.ts lines 1107-1116). Mirror of
+        :meth:`_get_message_token_count` (and its
+        :meth:`_resolve_message_token_count` overload) but for summary
+        rows.
+
+        Path:
+
+        1. If ``summary.token_count > 0`` → return it (truncated to
+           ``int``).
+        2. Else fall back to
+           :func:`~lossless_hermes.estimate_tokens.estimate_tokens` on
+           ``summary.content``.
+
+        Args:
+            summary: An already-loaded :class:`_SummaryRecordLike` row.
+
+        Returns:
+            A non-negative integer token count.
+        """
+        from lossless_hermes.estimate_tokens import estimate_tokens
+
+        if summary.token_count > 0:
+            return int(summary.token_count)
+        return estimate_tokens(summary.content)
+
+    def _resolve_leaf_min_fanout(self) -> int:
+        """Resolve the leaf-pass minimum fanout.
+
+        Ports TS :meth:`CompactionEngine.resolveLeafMinFanout`
+        (compaction.ts lines 1130-1140). Returns
+        ``config.leaf_min_fanout`` when positive, else the TS default
+        ``8``. Used by :meth:`_resolve_fanout_for_depth` on the
+        soft-trigger + depth=0 path.
+        """
+        if self._config.leaf_min_fanout > 0:
+            return int(self._config.leaf_min_fanout)
+        return 8
+
+    def _resolve_condensed_min_fanout(self) -> int:
+        """Resolve the condensed-pass minimum fanout (depth > 0).
+
+        Ports TS :meth:`CompactionEngine.resolveCondensedMinFanout`
+        (compaction.ts lines 1141-1150). Returns
+        ``config.condensed_min_fanout`` when positive, else the TS
+        default ``4``. Used by :meth:`_resolve_fanout_for_depth` on
+        the soft-trigger + depth>0 path.
+        """
+        if self._config.condensed_min_fanout > 0:
+            return int(self._config.condensed_min_fanout)
+        return 4
+
+    def _resolve_condensed_min_fanout_hard(self) -> int:
+        """Resolve the hard-trigger minimum fanout.
+
+        Ports TS :meth:`CompactionEngine.resolveCondensedMinFanoutHard`
+        (compaction.ts lines 1152-1161). Returns
+        ``config.condensed_min_fanout_hard`` when positive, else the TS
+        default ``2``. Used by :meth:`_resolve_fanout_for_depth` on the
+        hard-trigger path; the hard trigger relaxes the fanout floor so
+        a forced sweep can collapse chunks the soft path would skip.
+        """
+        if self._config.condensed_min_fanout_hard > 0:
+            return int(self._config.condensed_min_fanout_hard)
+        return 2
+
+    def _resolve_fanout_for_depth(self, target_depth: int, hard_trigger: bool) -> int:
+        """Pick the minimum-chunk-size gate for a candidate condensation depth.
+
+        Ports TS :meth:`CompactionEngine.resolveFanoutForDepth`
+        (compaction.ts lines 1173-1181). Three-way dispatch:
+
+        * ``hard_trigger=True`` → :meth:`_resolve_condensed_min_fanout_hard`
+          (default 2) for all depths.
+        * ``hard_trigger=False`` AND ``target_depth == 0`` →
+          :meth:`_resolve_leaf_min_fanout` (default 8).
+        * ``hard_trigger=False`` AND ``target_depth > 0`` →
+          :meth:`_resolve_condensed_min_fanout` (default 4).
+
+        The dispatch is intentionally asymmetric: leaves want a high
+        fanout (8 leaves → 1 condensed) because each leaf is itself a
+        compression artifact; deeper tiers tolerate a smaller fanout
+        (4 condensed → 1 deeper-condensed) because the absolute size
+        savings per pass shrinks at higher depths.
+
+        Args:
+            target_depth: The depth of the source summaries being
+                considered for condensation. Produced summary is at
+                ``target_depth + 1``.
+            hard_trigger: ``True`` for forced sweeps
+                (:meth:`compact_until_under` / ``/lcm compact``). Loosens
+                the fanout floor to enable aggressive collapsing when
+                context is genuinely overflowing.
+
+        Returns:
+            A positive integer fanout — the minimum number of
+            same-depth summaries the candidate chunk must contain.
+        """
+        # TS lines 1174-1176: hard_trigger overrides all depth dispatch.
+        if hard_trigger:
+            return self._resolve_condensed_min_fanout_hard()
+        # TS lines 1177-1179: soft-trigger + leaf depth uses leaf_min_fanout.
+        if target_depth == 0:
+            return self._resolve_leaf_min_fanout()
+        # TS line 1180: soft-trigger + deeper depth uses condensed_min_fanout.
+        return self._resolve_condensed_min_fanout()
+
+    def _resolve_condensed_min_chunk_tokens(self) -> int:
+        """Compute the minimum candidate-chunk summary-tokens floor.
+
+        Ports TS :meth:`CompactionEngine.resolveCondensedMinChunkTokens`
+        (compaction.ts lines 1184-1188). Defends against the degenerate
+        case where N trivially-small summaries clear the fanout count
+        but contain so little text that condensing them would consume
+        a summarize call to produce a summary larger than the source.
+
+        Formula: ``max(condensed_target_tokens, floor(leaf_chunk_tokens
+        * CONDENSED_MIN_INPUT_RATIO))``. The TS source uses
+        :data:`CONDENSED_MIN_INPUT_RATIO` = 0.1, so the floor is 10% of
+        the leaf-chunk size — typically a 2k-token ceiling on a 20k
+        leaf-chunk default.
+
+        Returns:
+            A non-negative integer minimum.
+        """
+        chunk_target = _resolve_leaf_chunk_tokens(self._config, None)
+        ratio_floor = int(chunk_target * CONDENSED_MIN_INPUT_RATIO)
+        return max(int(self._config.condensed_target_tokens), ratio_floor)
+
+    def _select_oldest_chunk_at_depth(
+        self,
+        conversation_id: int,
+        target_depth: int,
+        fresh_tail_override: int | None = None,
+    ) -> CondensedChunkSelection:
+        """Select the oldest contiguous summary chunk at a specific depth.
+
+        Ports TS :meth:`CompactionEngine.selectOldestChunkAtDepth`
+        (compaction.ts lines 1230-1282). Walks ``context_items`` in
+        ordinal-ascending order, picking up same-depth summary rows
+        until termination.
+
+        Termination conditions (in order, matching TS verbatim):
+
+        1. ``ordinal >= fresh_tail_ordinal`` → stop the walk (TS lines
+           1245-1247). Fresh-tail summaries are protected from
+           condensation.
+        2. Item is not a summary (``item_type != "summary"`` OR
+           ``summary_id is None``):
+
+           * If chunk is empty → continue (skip leading non-summaries).
+           * If chunk has started → STOP (TS lines 1248-1253). ANY
+             non-summary item terminates a started chunk so the
+             condensation stays contiguous.
+
+        3. ``summary_store.get_summary(summary_id)`` returns ``None``:
+
+           * If chunk is empty → continue (skip missing rows).
+           * If chunk has started → STOP (TS lines 1256-1261).
+
+        4. Loaded summary's ``depth != target_depth``:
+
+           * If chunk is empty → continue (skip wrong-depth leading
+             rows).
+           * If chunk has started → STOP (TS lines 1262-1267). Mixed-
+             depth condensation would violate the depth-ladder
+             invariant.
+
+        5. Adding this summary would push ``summary_tokens +
+           token_count > leaf_chunk_tokens`` AND the chunk is
+           non-empty → STOP BEFORE adding (TS lines 1270-1272). The
+           always-include-one-by-fanout invariant doesn't apply here
+           (unlike :meth:`_select_oldest_leaf_chunk`) because
+           condensation eligibility is gated by minimum fanout in the
+           caller (:meth:`_select_shallowest_condensation_candidate`),
+           not by always-include-one.
+
+        6. After adding, if ``summary_tokens >= leaf_chunk_tokens`` →
+           STOP (TS lines 1276-1278). Greedy cap-respecting break.
+
+        Args:
+            conversation_id: The conversation to scan.
+            target_depth: The depth of summaries to include in the
+                chunk.
+            fresh_tail_override: Optional pre-computed fresh-tail
+                ordinal. When ``None``, the walker resolves it from
+                the context items. The override path is used by
+                :meth:`_select_shallowest_condensation_candidate` to
+                avoid re-walking the items twice (once for depth
+                discovery, once per depth probe).
+
+        Returns:
+            A :class:`CondensedChunkSelection` with the selected items
+            + their summary-token total. Empty ``items`` when no
+            same-depth chunk exists at the head of the context.
+        """
+        context_items = self._summary_store.get_context_items(conversation_id)
+        if fresh_tail_override is not None:
+            fresh_tail_ordinal = fresh_tail_override
+        else:
+            fresh_tail_ordinal = self._resolve_fresh_tail_ordinal(context_items)
+        chunk_token_budget = _resolve_leaf_chunk_tokens(self._config, None)
+
+        chunk: list[_ContextItemLike] = []
+        summary_tokens = 0
+        # TS lines 1244-1279: chunk-selection walk.
+        for item in context_items:
+            # TS lines 1245-1247: stop at the fresh-tail boundary.
+            if item.ordinal >= fresh_tail_ordinal:
+                break
+
+            # TS lines 1248-1253: skip non-summary items when chunk is
+            # empty; STOP when chunk is started. The TS source uses
+            # ``item.itemType !== "summary" || item.summaryId == null``
+            # — the null guard catches malformed rows that claim
+            # ``itemType="summary"`` but never linked to a summary id.
+            if item.item_type != "summary" or item.summary_id is None:
+                if chunk:
+                    break
+                continue
+
+            # TS line 1255: fetch the full row. The condensed-pass
+            # caller re-fetches these inside ``_condensed_pass`` but
+            # the depth + token-count gates need them now.
+            summary = self._summary_store.get_summary(item.summary_id)
+
+            # TS lines 1256-1261: summary row missing (purged /
+            # suppressed). Same skip-or-stop branch.
+            if summary is None:
+                if chunk:
+                    break
+                continue
+
+            # TS lines 1262-1267: depth mismatch. The chunk must
+            # contain ONLY same-depth summaries — a depth=1 row in a
+            # depth=0 walk terminates the chunk so the eventual
+            # condensation does not mix tiers.
+            if summary.depth != target_depth:
+                if chunk:
+                    break
+                continue
+
+            token_count = self._resolve_summary_token_count(summary)
+
+            # TS lines 1270-1272: token-cap break BEFORE adding. Only
+            # applies when the chunk is non-empty — first item is
+            # always added even if oversize (the caller's fanout +
+            # min-tokens gate handles the "chunk too big to be
+            # condensed cleanly" case at the eligibility level).
+            if chunk and summary_tokens + token_count > chunk_token_budget:
+                break
+
+            chunk.append(item)
+            summary_tokens += token_count
+
+            # TS lines 1276-1278: greedy break once at/over the cap.
+            if summary_tokens >= chunk_token_budget:
+                break
+
+        return CondensedChunkSelection(items=chunk, summary_tokens=summary_tokens)
+
+    def _select_shallowest_condensation_candidate(
+        self,
+        conversation_id: int,
+        hard_trigger: bool = False,
+    ) -> CondensedPhaseCandidate | None:
+        """Pick the shallowest depth with an eligible same-depth chunk.
+
+        Ports TS :meth:`CompactionEngine.selectShallowestCondensationCandidate`
+        (compaction.ts lines 1193-1222). Iterates
+        ``get_distinct_depths_in_context`` shallowest-first and returns
+        the first depth whose oldest same-depth chunk passes BOTH:
+
+        * Fanout: ``chunk.items.length >=
+          resolve_fanout_for_depth(depth, hard_trigger)``.
+        * Min-chunk-tokens: ``chunk.summary_tokens >=
+          _resolve_condensed_min_chunk_tokens()``.
+
+        Why shallowest-first: collapsing leaves before condensed
+        depth-1, and condensed depth-1 before depth-2, preserves the
+        depth-ladder invariant — the ladder grows from the bottom up,
+        not from the middle. A deep-first picker would create gaps in
+        the ladder (e.g. a depth-3 condensed sitting on top of a stack
+        of unmerged depth-0 leaves).
+
+        Args:
+            conversation_id: The conversation to scan.
+            hard_trigger: When ``True`` use
+                :meth:`_resolve_condensed_min_fanout_hard` (default 2)
+                for the fanout gate at every depth. Soft trigger uses
+                the depth-dispatched value (8 at depth 0, 4 at deeper).
+
+        Returns:
+            A :class:`CondensedPhaseCandidate` for the shallowest
+            qualifying depth, or ``None`` when no depth has an
+            eligible chunk.
+        """
+        context_items = self._summary_store.get_context_items(conversation_id)
+        fresh_tail_ordinal = self._resolve_fresh_tail_ordinal(context_items)
+        min_chunk_tokens = self._resolve_condensed_min_chunk_tokens()
+
+        # TS lines 1201-1203: depth list filter (only depths present in
+        # the context, below the fresh-tail boundary).
+        depth_levels = self._summary_store.get_distinct_depths_in_context(
+            conversation_id,
+            max_ordinal_exclusive=(
+                fresh_tail_ordinal if fresh_tail_ordinal != EMPTY_FRESH_TAIL_ORDINAL else None
+            ),
+        )
+
+        # TS lines 1205-1219: shallowest-first iteration.
+        for target_depth in depth_levels:
+            fanout = self._resolve_fanout_for_depth(target_depth, hard_trigger)
+            chunk = self._select_oldest_chunk_at_depth(
+                conversation_id,
+                target_depth,
+                fresh_tail_override=fresh_tail_ordinal,
+            )
+            # TS lines 1212-1214: fanout gate.
+            if len(chunk.items) < fanout:
+                continue
+            # TS lines 1215-1217: min-chunk-tokens floor.
+            if chunk.summary_tokens < min_chunk_tokens:
+                continue
+            # TS line 1218: first qualifying depth wins.
+            return CondensedPhaseCandidate(target_depth=target_depth, chunk=chunk)
+
+        # TS line 1221: no qualifying depth — nothing to condense.
+        return None
+
+    def _resolve_prior_summary_context_at_depth(
+        self,
+        conversation_id: int,
+        summary_items: list[_ContextItemLike],
+        target_depth: int,
+    ) -> str | None:
+        """Resolve up-to-2 prior same-depth summaries for iterative continuity.
+
+        Ports TS :meth:`CompactionEngine.resolvePriorSummaryContextAtDepth`
+        (compaction.ts lines 1284-1325). Walks back from the chunk's
+        ``min(ordinals)``, keeps the last 4 same-depth summary
+        candidates, then takes the last 2 with non-empty content
+        joined ``\\n\\n``.
+
+        Called by :meth:`_condensed_pass` ONLY at depth 0 (TS lines
+        1648-1651). At deeper depths the prompt templates (D2/D3+) do
+        not include a ``<previous_context>`` block — depth>=2
+        condensations are pure-collapse and don't need iterative
+        continuity.
+
+        Args:
+            conversation_id: The conversation being compacted.
+            summary_items: The chunk picked by
+                :meth:`_select_oldest_chunk_at_depth`. Empty → return
+                ``None``.
+            target_depth: The depth of the chunk items.
+                ``previous_summary`` candidates must match this depth
+                — a depth-1 summary preceding a depth-0 chunk is NOT
+                continuity context (it's a deeper-tier sibling that
+                came from condensing earlier leaves).
+
+        Returns:
+            Joined prior-summary content for the summarizer's
+            ``previous_summary`` option, or ``None`` when no eligible
+            same-depth summaries exist (or none have non-empty
+            content).
+        """
+        if not summary_items:
+            return None
+        start_ordinal = min(item.ordinal for item in summary_items)
+
+        # TS lines 1294-1301: candidates filter + slice. We take the
+        # LAST 4 (most-recent-by-ordinal) same-depth summary items
+        # below ``start_ordinal`` so prior_summary represents the
+        # *immediately preceding* depth-N summaries, not the
+        # earliest. The slice happens against the filter not the
+        # raw items so leading messages don't push summaries off
+        # the back of the candidate window.
+        context_items = self._summary_store.get_context_items(conversation_id)
+        prior_summary_items = [
+            item
+            for item in context_items
+            if item.ordinal < start_ordinal
+            and item.item_type == "summary"
+            and isinstance(item.summary_id, str)
+        ][-4:]
+
+        if not prior_summary_items:
+            return None
+
+        # TS lines 1306-1319: fetch + filter by depth + extract trimmed
+        # content. Depth mismatch skips the row entirely (not stops
+        # the walk — unlike chunk selection, the prior-summary walk
+        # is allowed to include same-depth summaries even if a
+        # different-depth row sits between them).
+        summary_contents: list[str] = []
+        for item in prior_summary_items:
+            if not isinstance(item.summary_id, str):  # pragma: no cover
+                continue
+            summary = self._summary_store.get_summary(item.summary_id)
+            if summary is None or summary.depth != target_depth:
+                continue
+            content = summary.content.strip() if isinstance(summary.content, str) else ""
+            if content:
+                summary_contents.append(content)
+
+        # TS line 1321-1324: empty content → None; else take last 2
+        # joined ``\n\n``.
+        if not summary_contents:
+            return None
+        return "\n\n".join(summary_contents[-2:])
+
+    def _summarize_with_escalation_condensed(
+        self,
+        *,
+        source_text: str,
+        summarize: SummarizeFn,
+        target_tokens: int,
+        previous_summary: str | None,
+        target_depth: int,
+        summary_model: str | None,
+    ) -> dict[str, Any] | None:
+        """Run the summarize cascade for a condensed pass; return ``{content, level}``.
+
+        04-03 STUB. The full escalation cascade (normal → aggressive →
+        deterministic fallback → cap) lands in issue 04-06
+        (``summarizeWithEscalation`` in TS at lines 1334-1443 plus the
+        per-pass length check). For 04-03 we use a single-shot
+        ``summarize(...)`` call so the condensed-pass body's atomic
+        persist / DAG-link / context-swap path can be tested without
+        04-06 being complete.
+
+        Mirrors TS ``summarizeWithEscalation`` (compaction.ts lines
+        1334-1443) at the contract level — return ``{content, level}``
+        on success, ``None`` on voluntary skip, raise
+        :class:`~lossless_hermes.summarize.LcmProviderAuthError` on
+        provider auth failure. The cascade body is the deliverable of
+        04-06; this stub captures the contract so 04-03's body is
+        testable.
+
+        Subclasses (04-03 regression tests, the eventual 04-06 production
+        wiring) MAY override this method to inject controlled outputs
+        without affecting the base class's leaf-pass-side stub (which
+        04-02 lands separately as ``_summarize_with_escalation``).
+
+        Args:
+            source_text: The concatenated date-headered summary text
+                the chunk produced. May be empty when the chunk's
+                summaries all collapsed to empty content.
+            summarize: The :data:`SummarizeFn` provided by the caller.
+            target_tokens: ``config.condensed_target_tokens``.
+            previous_summary: Prior-summary content for iterative
+                continuity (only set at depth 0).
+            target_depth: The depth of the source summaries.
+                Forwarded into ``options.depth = target_depth + 1`` so
+                04-06's template dispatcher can pick D1/D2/D3+
+                prompts.
+            summary_model: Optional model override.
+
+        Returns:
+            ``{"content": <str>, "level": "normal" | "aggressive" |
+            "fallback" | "capped"}`` on success. ``None`` when the
+            summarizer voluntarily skipped (e.g. empty / unsalvageable
+            source).
+        """
+        del target_tokens  # 04-03 stub doesn't enforce the hard cap (04-06's job).
+        if not source_text.strip():
+            return None
+
+        options: dict[str, Any] = {
+            "previous_summary": previous_summary,
+            "is_condensed": True,
+            "depth": target_depth + 1,
+            "summary_model": summary_model,
+        }
+        # 04-03 stub: single-shot summarize call. The escalation
+        # cascade (Guard 3) lands in 04-06 alongside the prompt-
+        # template dispatcher. Until then any output is "normal" level.
+        content = summarize(source_text, False, options)
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return {"content": content, "level": "normal"}
+
+    def _condensed_pass(
+        self,
+        conversation_id: int,
+        summary_items: list[_ContextItemLike],
+        target_depth: int,
+        summarize: SummarizeFn,
+        summary_model: str | None = None,
+    ) -> LeafPassResult | None:
+        """Condense one chunk of same-depth summaries into a depth+1 summary.
+
+        Ports TS :meth:`CompactionEngine.condensedPass` (compaction.ts
+        lines 1614-1751). The phase-2 production body the 04-04
+        skeletal :meth:`_run_condensed_pass` previously deferred.
+
+        Algorithm (matches TS verbatim):
+
+        1. Fetch full :class:`_SummaryRecordLike` rows for every item
+           in ``summary_items`` (skip missing rows defensively, mirroring
+           TS lines 1622-1631).
+        2. Concatenate child summaries with date-range headers
+           ``[<earliest_iso> - <latest_iso>]\\n<content>`` joined by
+           ``"\\n\\n"`` (TS lines 1633-1641). Date format derives from
+           :func:`_format_timestamp` using
+           ``config.timezone``. ``earliest_at`` / ``latest_at`` fall
+           back to ``created_at`` when null (TS lines 1635-1636).
+        3. Flatten + dedupe file ids from child summaries
+           (``summary.file_ids`` + parsed-from-content via
+           :func:`~lossless_hermes.large_files.extract_file_ids_from_content`)
+           per TS lines 1642-1647. Used by the new summary's
+           ``file_ids`` index for retrieval.
+        4. Resolve prior-summary continuity ONLY at depth 0 (TS lines
+           1648-1651) via
+           :meth:`_resolve_prior_summary_context_at_depth`. Depth-≥1
+           condensations don't carry prior-summary continuity — the
+           D2/D3+ prompt templates don't include a
+           ``<previous_context>`` block.
+        5. Call :meth:`_summarize_with_escalation_condensed` with
+           ``target_tokens = config.condensed_target_tokens``,
+           ``options.is_condensed = True``,
+           ``options.depth = target_depth + 1`` (TS lines 1652-1661).
+           Voluntary skip → log a warning + return ``None`` (TS lines
+           1662-1667). Provider-auth failure short-circuits via
+           :class:`~lossless_hermes.summarize.LcmProviderAuthError`
+           propagating from the cascade.
+        6. Persist atomically (TS lines 1669-1743):
+
+           * ``summary_id = "sum_" + sha256(content + now_ms)[:16]``
+             (deterministic-ish ID; the now_ms suffix prevents
+             collisions when two identical summaries land back-to-back).
+           * ``insert_summary`` with ``kind="condensed"``,
+             ``depth=target_depth+1``, the aggregated descendant counts.
+           * ``link_summary_to_parents`` — DAG edges to the **child
+             summaries**, NOT messages. The condensed summary's
+             provenance points at the leaves/condensed-rows it
+             collapsed, not at the raw messages those leaves were
+             distilled from.
+           * ``replace_context_range_with_summary`` — atomic swap of
+             the summary range with one new summary item.
+
+        7. Invalidate the context cache after the swap.
+
+        8. Return a :class:`LeafPassResult` with the running-delta
+           ``removed_tokens`` / ``added_tokens`` Wave-12 guard
+           consumes. ``removed_tokens`` = sum of child token counts;
+           ``added_tokens`` = the new condensed summary's token count.
+
+        Args:
+            conversation_id: The conversation being compacted.
+            summary_items: The chunk picked by
+                :meth:`_select_shallowest_condensation_candidate`.
+            target_depth: The depth of the source summaries. Produced
+                summary is at ``target_depth + 1``.
+            summarize: The summarize callback passed down from
+                :meth:`compact_full_sweep`.
+            summary_model: Optional model override forwarded to the
+                summarize callback.
+
+        Returns:
+            A :class:`LeafPassResult` if the pass produced a summary;
+            ``None`` if the summarizer voluntarily skipped (empty
+            input / unsalvageable content). Raises
+            :class:`~lossless_hermes.summarize.LcmProviderAuthError`
+            on provider auth failure (caller in
+            :meth:`compact_full_sweep` catches and short-circuits).
+        """
+        from lossless_hermes.estimate_tokens import estimate_tokens
+        from lossless_hermes.large_files import extract_file_ids_from_content
+        from lossless_hermes.store.summary import (
+            CreateSummaryInput,
+            ReplaceContextRangeInput,
+        )
+
+        # 1. Fetch full summary records (TS lines 1622-1631).
+        summary_records: list[_SummaryRecordLike] = []
+        for item in summary_items:
+            if item.summary_id is None:  # pragma: no cover
+                continue
+            rec = self._summary_store.get_summary(item.summary_id)
+            if rec is not None:
+                summary_records.append(rec)
+
+        # 2. Concatenate child summaries with date-range headers
+        #    (TS lines 1633-1641). The earliest/latest fallback to
+        #    created_at matches TS lines 1635-1636.
+        concatenated_parts: list[str] = []
+        for summary in summary_records:
+            earliest_at = (
+                summary.earliest_at if summary.earliest_at is not None else summary.created_at
+            )
+            latest_at = summary.latest_at if summary.latest_at is not None else summary.created_at
+            header = (
+                f"[{_format_timestamp(earliest_at, self._config.timezone)} - "
+                f"{_format_timestamp(latest_at, self._config.timezone)}]"
+            )
+            concatenated_parts.append(f"{header}\n{summary.content}")
+        concatenated = "\n\n".join(concatenated_parts)
+
+        # 3. Flatten + dedupe file ids (TS lines 1642-1647).
+        flat_file_ids: list[str] = []
+        for summary in summary_records:
+            # The TS source uses ``summary.fileIds`` (already-parsed
+            # list on the row); the Python port mirrors this via the
+            # :class:`SummaryRecord.file_ids` attribute. We tolerate
+            # missing attribute on the structural Protocol (test stubs
+            # may omit it) by defaulting to ``[]``.
+            row_file_ids = getattr(summary, "file_ids", None) or []
+            flat_file_ids.extend(row_file_ids)
+            flat_file_ids.extend(extract_file_ids_from_content(summary.content))
+        file_ids = _dedupe_ordered_ids(flat_file_ids)
+
+        # 4. Prior-summary continuity (depth 0 only — TS lines
+        #    1648-1651). At depth >= 1 the prompt template doesn't
+        #    have a ``<previous_context>`` block so passing one would
+        #    waste tokens.
+        if target_depth == 0:
+            previous_summary_content = self._resolve_prior_summary_context_at_depth(
+                conversation_id,
+                summary_items,
+                target_depth,
+            )
+        else:
+            previous_summary_content = None
+
+        # 5. Summarize (TS lines 1652-1661). The 04-03 stub returns
+        #    ``{content, level}`` on success / ``None`` on skip.
+        #    04-06 will replace the stub with the full escalation
+        #    cascade. ``LcmProviderAuthError`` from the cascade
+        #    propagates out of this method — the caller in
+        #    :meth:`_run_condensed_pass` translates it for the sweep
+        #    loop.
+        condensed = self._summarize_with_escalation_condensed(
+            source_text=concatenated,
+            summarize=summarize,
+            target_tokens=self._config.condensed_target_tokens,
+            previous_summary=previous_summary_content,
+            target_depth=target_depth,
+            summary_model=summary_model,
+        )
+        if condensed is None:
+            # TS lines 1662-1667: voluntary skip (empty source /
+            # unsalvageable). Log a warning and return None; the
+            # caller treats the same as "no progress" and breaks out
+            # of phase-2 without recording an auth-failure (this is a
+            # non-LLM-provider-fault skip).
+            self._log.warning(
+                "[lcm] condensed compaction skipped summary write; "
+                "conversation_id=%d; depth=%d; chunk_summaries=%d",
+                conversation_id,
+                target_depth,
+                len(summary_records),
+            )
+            return None
+
+        summary_content: str = condensed["content"]
+        summary_level: CompactionLevel = condensed["level"]
+
+        # 6. Persist atomically (TS lines 1669-1743).
+        summary_id = _generate_summary_id(summary_content)
+        token_count = estimate_tokens(summary_content)
+
+        # Earliest / latest aggregation over child summaries
+        # (TS lines 1682-1701). Both fall back to ``created_at`` per
+        # child when the per-summary field is null.
+        if summary_records:
+            earliest_candidates = [
+                (s.earliest_at if s.earliest_at is not None else s.created_at)
+                for s in summary_records
+            ]
+            latest_candidates = [
+                (s.latest_at if s.latest_at is not None else s.created_at) for s in summary_records
+            ]
+            earliest_at_agg: datetime | None = min(earliest_candidates)
+            latest_at_agg: datetime | None = max(latest_candidates)
+        else:
+            earliest_at_agg = None
+            latest_at_agg = None
+
+        # Descendant arithmetic (TS lines 1702-1724). Each child
+        # contributes its own subtree count + 1 (for itself); each
+        # child's descendant_token_count + its own token_count
+        # accumulate into the new condensed row's
+        # ``descendant_token_count``. Both clamp non-finite / negative
+        # child values to 0 to preserve the non-negative invariant —
+        # TS uses ``Math.max(0, Math.floor(x))``.
+        descendant_count = 0
+        descendant_token_count = 0
+        source_message_token_count = 0
+        for summary in summary_records:
+            child_descendants = max(0, int(getattr(summary, "descendant_count", 0) or 0))
+            child_descendant_tokens = max(
+                0, int(getattr(summary, "descendant_token_count", 0) or 0)
+            )
+            child_token_count = max(0, int(summary.token_count or 0))
+            child_source_message_tokens = max(
+                0, int(getattr(summary, "source_message_token_count", 0) or 0)
+            )
+            # TS line 1707: ``count + childDescendants + 1`` — the +1
+            # accounts for the child itself, not just its subtree.
+            descendant_count += child_descendants + 1
+            # TS lines 1709-1716: ``count + childDescendantTokens +
+            # childTokenCount`` — accumulate both the child's own
+            # token mass and its subtree's mass.
+            descendant_token_count += child_descendant_tokens + child_token_count
+            # TS lines 1717-1724: accumulate per-child source message
+            # token counts (the "how many raw message tokens did this
+            # whole condensed subtree come from" telemetry signal).
+            source_message_token_count += child_source_message_tokens
+
+        create_input = CreateSummaryInput(
+            summary_id=summary_id,
+            conversation_id=conversation_id,
+            kind="condensed",
+            depth=target_depth + 1,
+            content=summary_content,
+            token_count=token_count,
+            file_ids=file_ids,
+            earliest_at=earliest_at_agg,
+            latest_at=latest_at_agg,
+            descendant_count=descendant_count,
+            descendant_token_count=descendant_token_count,
+            source_message_token_count=source_message_token_count,
+            model=summary_model,
+        )
+
+        # Compute ordinals BEFORE the txn so the input is fully built.
+        ordinals = [item.ordinal for item in summary_items]
+        start_ordinal = min(ordinals)
+        end_ordinal = max(ordinals)
+        replace_input = ReplaceContextRangeInput(
+            conversation_id=conversation_id,
+            start_ordinal=start_ordinal,
+            end_ordinal=end_ordinal,
+            summary_id=summary_id,
+        )
+        # Parent IDs = the child summaries we're collapsing. The DAG
+        # edges go FROM the new condensed summary INTO each child
+        # (matches TS line 1729 ``parentSummaryIds = summaryRecords.
+        # map((s) => s.summaryId)``). Per spec: "DAG edge is
+        # summary→summary".
+        parent_summary_ids = [s.summary_id for s in summary_records]
+
+        with self._summary_store.with_transaction():
+            self._summary_store.insert_summary(create_input)
+            # Link to parent summaries BEFORE the context swap becomes
+            # visible (TS lines 1728-1730).
+            if parent_summary_ids:
+                self._summary_store.link_summary_to_parents(summary_id, parent_summary_ids)
+            self._summary_store.replace_context_range_with_summary(replace_input)
+
+        # 7. Invalidate context cache after the swap (TS line 1744).
+        self._invalidate_context_cache(conversation_id)
+
+        # 8. Return the result. ``removed_tokens`` = sum of child
+        #    token counts (the tokens we're DROPPING from the
+        #    context); ``added_tokens`` = the new condensed summary's
+        #    token count (what we're ADDING).
+        removed_tokens = sum(max(0, int(s.token_count or 0)) for s in summary_records)
+        return LeafPassResult(
+            summary_id=summary_id,
+            level=summary_level,
+            content=summary_content,
+            removed_tokens=removed_tokens,
+            added_tokens=token_count,
+        )
 
     # ------------------------------------------------------------------
     # compact_full_sweep() — phase-1 + phase-2 loops with Wave-12 guards
@@ -2900,22 +3824,33 @@ class CompactionEngine:
     ) -> LeafPassOutcome:
         """Run one condensed pass and return a :class:`LeafPassOutcome`.
 
-        04-04 skeletal stub. Production body lands in issue 04-03
-        (the condensed-pass + chunk-selection helpers in TS). Same
-        outcome-discrimination contract as :meth:`_run_leaf_pass`:
+        Issue 04-03 production body. Ports TS ``compactFullSweep``'s
+        phase-2 dispatch wrapper (compaction.ts lines 717-735) onto
+        the 04-02 ``LeafPassOutcome`` outcome-discrimination contract:
 
-        * empty candidate / voluntary skip → ``LeafPassOutcome(summary=None,
-          auth_failure=False)`` (TS lines 721-723).
-        * provider-auth failure → ``LeafPassOutcome(summary=None,
-          auth_failure=True)`` (TS lines 733-735, ``hadAuthFailure =
-          true`` parity with phase-1).
-        * pass produced a summary →
-          ``LeafPassOutcome(summary=LeafPassResult(...), auth_failure=False)``.
+        1. :meth:`_select_shallowest_condensation_candidate` picks the
+           shallowest depth + chunk that qualifies (fanout + min-chunk-
+           tokens). No candidate → return
+           ``LeafPassOutcome(summary=None, auth_failure=False)`` (clean
+           termination of the phase-2 loop — same as the leaf-pass
+           "nothing to do" path).
+        2. :meth:`_condensed_pass` collapses the chunk into a depth+1
+           condensed summary and returns its
+           :class:`LeafPassResult`. Voluntary summarizer skip surfaces
+           as ``LeafPassOutcome(summary=None, auth_failure=False)``.
+        3. :class:`~lossless_hermes.summarize.LcmProviderAuthError`
+           raised from the summarize cascade is caught here and
+           translated to ``LeafPassOutcome(summary=None,
+           auth_failure=True)`` so :meth:`compact_full_sweep` flips
+           :attr:`CompactionResult.auth_failure` and breaks phase-2
+           cleanly. Mirrors the phase-1 contract in
+           :meth:`_run_leaf_pass`.
 
         Args:
             conversation_id: The conversation being compacted.
             hard_trigger: Whether the caller is a hard-trigger sweep
-                (loosens condensed-pass fanout thresholds).
+                (loosens condensed-pass fanout thresholds via
+                :meth:`_resolve_condensed_min_fanout_hard`).
             summarize: The summarize callback passed down from
                 :meth:`compact_full_sweep`.
             summary_model: Optional model override for this pass.
@@ -2927,5 +3862,31 @@ class CompactionEngine:
             phase-1 contract so ``compact_full_sweep`` propagates the
             sweep-level auth flag identically across both phases.
         """
-        del conversation_id, hard_trigger, summarize, summary_model
-        return LeafPassOutcome(summary=None, auth_failure=False)
+        candidate = self._select_shallowest_condensation_candidate(
+            conversation_id,
+            hard_trigger=hard_trigger,
+        )
+        if candidate is None:
+            # TS lines 721-723: no eligible chunk — clean "nothing to
+            # do" termination. ``auth_failure=False`` because no LLM
+            # call was attempted.
+            return LeafPassOutcome(summary=None, auth_failure=False)
+        try:
+            result = self._condensed_pass(
+                conversation_id=conversation_id,
+                summary_items=candidate.chunk.items,
+                target_depth=candidate.target_depth,
+                summarize=summarize,
+                summary_model=summary_model,
+            )
+        except LcmProviderAuthError:
+            # TS lines 733-735: ``hadAuthFailure = true`` — translate
+            # to outcome-discriminated ``auth_failure=True`` so the
+            # phase-2 loop breaks cleanly AND
+            # :attr:`CompactionResult.auth_failure` gets flipped at
+            # the sweep level. Phase-1 parity.
+            return LeafPassOutcome(summary=None, auth_failure=True)
+        # Voluntary summarizer skip (empty / unsalvageable source)
+        # surfaces as ``result is None``. Same as "no candidate" —
+        # clean termination with ``auth_failure=False``.
+        return LeafPassOutcome(summary=result, auth_failure=False)

@@ -153,6 +153,31 @@ class _StubSummaryStore:
     def get_summary(self, summary_id: str) -> _StubSummaryRecord | None:
         return self.summaries.get(summary_id)
 
+    def get_distinct_depths_in_context(
+        self,
+        conversation_id: int,
+        *,
+        max_ordinal_exclusive: int | None = None,
+    ) -> list[int]:
+        # Leaf-pass tests don't exercise condensation; phase-2 reaches
+        # the depth picker via the production ``_run_condensed_pass``
+        # but never qualifies for a candidate (no summary rows have
+        # been written in these scenarios). Returning the empty list
+        # short-circuits the depth picker to ``None``.
+        del conversation_id, max_ordinal_exclusive
+        return []
+
+    def link_summary_to_parents(
+        self,
+        summary_id: str,
+        parent_summary_ids: list[str],
+    ) -> None:
+        # 04-03 condensed-pass DAG link; leaf-pass scenarios never
+        # exercise this path but the structural Protocol requires the
+        # method to exist on the stub.
+        if self.transaction_depth > 0:
+            self.in_transaction_calls.append("link_summary_to_parents")
+
     @contextmanager
     def with_transaction(self) -> Iterator[None]:
         self.transaction_depth += 1
