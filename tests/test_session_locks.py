@@ -431,3 +431,220 @@ def test_registry_empty_on_construction() -> None:
     assert len(registry) == 0
     assert registry.pending_count() == 0
     assert "anything" not in registry
+
+
+# ---------------------------------------------------------------------------
+# Sync surface (issue 03-02) — mirrors the async surface for the
+# Hermes hook path post-PR #34.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_basic_acquire_release() -> None:
+    """Sync ``with``; assert no exception, no leak, record present after."""
+    registry = SessionLockRegistry()
+    with registry.acquire_sync("s1"):
+        assert registry.pending_count_sync() == 1
+    # On exit, refcount drops to 0 but the record remains until prune.
+    assert registry.pending_count_sync() == 1
+
+
+def test_sync_sequential_acquire_same_session_reuses_lock() -> None:
+    """Two sequential acquires on same session_id: no leak, single record."""
+    registry = SessionLockRegistry()
+    with registry.acquire_sync("s1"):
+        pass
+    with registry.acquire_sync("s1"):
+        pass
+    assert registry.pending_count_sync() == 1
+
+
+def test_sync_serialization_same_session() -> None:
+    """Concurrent threads on the same session_id serialize FIFO.
+
+    Spawns N=50 threads all acquiring the same session_id. The
+    in-critical-section counter must never see > 1 concurrent holder.
+    Without the lock the increment+sleep+decrement window would race;
+    with the lock all 50 increments are seen sequentially.
+    """
+    import threading
+    import time as time_mod
+
+    registry = SessionLockRegistry()
+    in_critical = 0
+    max_seen = 0
+    lock = threading.Lock()  # protects the test-side counters
+
+    def worker() -> None:
+        nonlocal in_critical, max_seen
+        with registry.acquire_sync("s1"):
+            with lock:
+                in_critical += 1
+                if in_critical > max_seen:
+                    max_seen = in_critical
+            time_mod.sleep(0.001)
+            with lock:
+                in_critical -= 1
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert max_seen == 1, f"saw {max_seen} concurrent holders, expected 1"
+
+
+def test_sync_distinct_sessions_parallelize() -> None:
+    """Distinct session_ids run in parallel, not serialized.
+
+    The N threads each grab a distinct session_id, then block on a
+    shared barrier. If the locks WERE shared across sessions, the
+    threads would queue and the barrier would deadlock — so the
+    presence of N concurrent holders at the barrier proves
+    parallelism.
+    """
+    import threading
+
+    registry = SessionLockRegistry()
+    n = 8
+    barrier = threading.Barrier(n, timeout=3.0)
+    errors: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            with registry.acquire_sync(f"s-{i}"):
+                # All N threads must reach the barrier simultaneously.
+                # If we were serialized, only one would arrive at a time
+                # and the barrier would time out.
+                barrier.wait()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"barrier failed (locks NOT parallelizing across sessions): {errors}"
+
+
+def test_sync_prune_drops_idle_records() -> None:
+    """An explicit prune_sync drops every record with refcount==0."""
+    registry = SessionLockRegistry()
+    for i in range(5):
+        with registry.acquire_sync(f"s{i}"):
+            pass
+    assert registry.pending_count_sync() == 5
+    removed = registry.prune_sync()
+    assert removed == 5
+    assert registry.pending_count_sync() == 0
+
+
+def test_sync_high_water_mark_triggers_auto_prune() -> None:
+    """Crossing the high-water mark fires an opportunistic prune sweep."""
+    registry = SessionLockRegistry(high_water_mark=3)
+    for i in range(3):
+        with registry.acquire_sync(f"s{i}"):
+            pass
+    assert registry.pending_count_sync() == 3
+    # The 4th acquire grows to 4 (> mark), and its release fires prune.
+    with registry.acquire_sync("s3"):
+        assert registry.pending_count_sync() == 4
+    # All 4 were idle on release — prune dropped them all.
+    assert registry.pending_count_sync() == 0
+
+
+def test_sync_exception_in_body_decrements_refcount() -> None:
+    """Refcount returns to 0 even when the ``with`` body raises."""
+    registry = SessionLockRegistry()
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with registry.acquire_sync("s1"):
+            raise _Boom("kaboom")
+    # Refcount made it back to 0 — explicit prune drops the record.
+    removed = registry.prune_sync()
+    assert removed == 1
+    assert registry.pending_count_sync() == 0
+
+
+def test_sync_and_async_surfaces_are_independent() -> None:
+    """Sync and async records are stored in disjoint dicts.
+
+    A session held via :meth:`acquire_sync` does NOT show up in the
+    async dict (and vice versa). The two surfaces serve different
+    concurrency models — sharing record state would defeat the
+    purpose.
+    """
+    registry = SessionLockRegistry()
+    with registry.acquire_sync("sync-only"):
+        # The async dict is empty; only the sync dict has the record.
+        assert "sync-only" not in registry  # __contains__ reads async dict
+        assert registry.pending_count() == 0
+        assert registry.pending_count_sync() == 1
+
+
+def test_sync_no_reentrancy_deadlock() -> None:
+    """threading.Lock is not reentrant — re-acquire on same thread blocks.
+
+    The test uses a sentinel + timer; the inner acquire must NOT
+    complete. The timer expiry confirms the inner acquire is blocked.
+    """
+    import threading
+    import time as time_mod
+
+    registry = SessionLockRegistry()
+    inner_completed = threading.Event()
+
+    def worker() -> None:
+        with registry.acquire_sync("s1"):
+            # Try to re-acquire the same session_id from the same
+            # thread. ``threading.Lock`` (NOT RLock) blocks here.
+            # ``timeout=0.1`` so the test doesn't hang.
+            acquired = registry._sync_records["s1"].lock.acquire(timeout=0.1)
+            try:
+                if acquired:
+                    inner_completed.set()
+            finally:
+                if acquired:
+                    registry._sync_records["s1"].lock.release()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=1.0)
+    assert not inner_completed.is_set(), (
+        "threading.Lock unexpectedly allowed re-entry; spec requires "
+        "non-reentrant behavior (parity with the async asyncio.Lock surface)"
+    )
+
+
+def test_sync_distinct_high_water_mark_per_surface() -> None:
+    """Sync prune does NOT touch async records (and vice versa).
+
+    Cross-surface prunes would silently drop records still being held
+    by the other surface. The high-water mark and prune logic operate
+    on the surface-local dict only.
+    """
+    registry = SessionLockRegistry(high_water_mark=2)
+    # Populate the async dict with 5 idle records. Since this is a sync
+    # test we use _acquire_record + _release_record directly via run().
+    import asyncio as asyncio_mod
+
+    async def fill_async() -> None:
+        for i in range(5):
+            async with registry.acquire(f"async-{i}"):
+                pass
+
+    asyncio_mod.run(fill_async())
+    # Async dict has either 5 or fewer records depending on
+    # high-water auto-prune; either way the sync dict is empty.
+    assert registry.pending_count_sync() == 0
+    # Trigger a sync prune; it must not touch the async dict.
+    async_count_before = registry.pending_count()
+    registry.prune_sync()
+    assert registry.pending_count() == async_count_before, (
+        "prune_sync mutated the async dict — surfaces must be independent"
+    )
