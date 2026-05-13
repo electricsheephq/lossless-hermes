@@ -413,7 +413,9 @@ These bugs were caught during the LCM v4.1 review loops. The Python port MUST re
 
 ## Open decisions
 
-### ADR-?: Tier-to-model mapping policy
+### ADR-031: Tier-to-model mapping policy
+
+**Status:** RESOLVED → [ADR-031](../adr/031-synthesis-tier-model-routing.md) (Accepted 2026-05-14, issue 07-10).
 
 **Question:** Should the Python port replicate the TS "all tiers default to `LCM_SUMMARY_MODEL` env var" policy, or seed an opinionated haiku/sonnet/opus ladder via `model_recommendation`?
 
@@ -422,7 +424,7 @@ These bugs were caught during the LCM v4.1 review loops. The Python port MUST re
 - **B.** Seed the ladder. Pros: better out-of-box. Cons: requires operator to learn the override surface to change it; couples the port to Anthropic model names baked in seed text.
 - **C.** Hybrid — keep TS's env var as the global default, but seed `model_recommendation` for `yearly + best_of_n_judge` only (where best-of-N is expensive enough that downgrading to a smaller model is a clear win).
 
-**Recommendation:** Probably C, but defer until benchmarking spike runs on real Hermes traffic.
+**Decision (ADR-031, 2026-05-14):** Option A. The Python port matches TS exactly for v0.1 — single `LCM_SUMMARY_MODEL` env var with `"gpt-5.4-mini"` fallback; all `model_recommendation` rows NULL in `seed_prompts.py`. Per-prompt operator override remains via `register_prompt(model_recommendation=...)`. The opinionated B/C ladder is deferred until Epic 09 eval data exists; the deferral marker is `lossless_hermes.synthesis.tier_routing.TIER_LADDER_DEFERRED`. See ADR-031 for the full rationale + the path to flip to B/C in a future ADR.
 
 ### ADR-?: Prompt versioning storage — table vs. git-tracked files
 
