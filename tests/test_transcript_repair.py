@@ -564,3 +564,523 @@ def test_interleaved_user_message_is_re_emitted_after_tool_result() -> None:
     # All three messages survive; their order is assistant -> toolResult -> user.
     roles_in_order = [m.get("role") for m in result.messages if isinstance(m, Mapping)]
     assert roles_in_order == ["assistant", "toolResult", "user"]
+
+
+# ---------------------------------------------------------------------------
+# Issue 03-07b additions — assembler-flow scenarios
+# ---------------------------------------------------------------------------
+#
+# These tests exercise ``sanitize_tool_use_result_pairing`` from the
+# perspective of its assembler.ts:1301 call site. The function is the
+# FINAL repair pass after the budget walk + ``filter_non_fresh_assistant_tool_calls``
+# (03-07a) have run, so its inputs look like:
+#
+#   * Cross-message tool_use ↔ tool_result pairs (Anthropic shape)
+#   * Survivors of the orphan-strip pass that need synthetic pairing
+#   * Mixed user/assistant/toolResult sequences shaped by budget walk
+#
+# Verbatim TS shape per ADR-029: orphan tool_use blocks are NOT stripped
+# here — they get a synthetic placeholder toolResult (the strip path
+# lives in 03-07a). Tests below assert the synthesize-not-strip
+# semantics so a future executor doesn't accidentally drift toward
+# strip-based behavior.
+
+
+def test_assembler_flow_cross_message_pair_both_kept() -> None:
+    """Cross-message pair: tool_use in msg N, tool_result in msg N+1 → both kept.
+
+    The canonical assembler-output shape: assistant emits a tool_use
+    block, the next message is a separate ``toolResult`` carrying
+    ``toolCallId``. Output content equal to input content; the only
+    structural change is that the user message after the toolResult
+    gets re-emitted via the ``remainder`` accumulator (TS
+    ``moved=true`` path).
+
+    The TS short-circuit returns the input identity ONLY when
+    ``changed_or_moved`` stays False. With the assistant-span sub-loop
+    consuming both the toolResult AND the trailing user, ``moved``
+    flips True even though the message order is identical to the
+    input. Test pins the structural-equality semantics: ``sanitized
+    != input`` reference, ``sanitized == input`` content.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "search please"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tu_cross", "name": "search"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "tu_cross",
+            "content": [{"type": "text", "text": "found 3 results"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "thanks"}]},
+    ]
+
+    sanitized = sanitize_tool_use_result_pairing(messages)
+    # The ``moved`` flag flips True because the span sub-loop
+    # vacuumed both the toolResult and the trailing user. The output
+    # is a fresh list but its content equals the input.
+    assert list(sanitized) == list(messages)
+    # No drops, no synthetics — the wrapper sees a structural diff of 0.
+    result = repair_transcript(messages)
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+    assert result.repaired_count == 0
+
+
+def test_assembler_flow_cross_message_pair_missing_result_synthesizes() -> None:
+    """Cross-message pair: tool_use in msg N, tool_result missing → synthetic inserted.
+
+    Verbatim TS behavior at ``transcript-repair.ts:283-289``: an orphan
+    tool_use gets a synthetic placeholder ``toolResult`` (marker string
+    ``[lossless-claw] missing tool result …``). It is NOT stripped — the
+    strip path is the separate 03-07a function on the assembler. Test
+    pins the synthesize-not-strip semantics for future executors.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "search please"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tu_no_result", "name": "search"}],
+        },
+        # No toolResult for tu_no_result; next message is a fresh user turn.
+        {"role": "user", "content": [{"type": "text", "text": "another question"}]},
+    ]
+
+    result = repair_transcript(messages)
+    assert result.synthesized_count == 1, "orphan tool_use → synthetic placeholder"
+    assert result.dropped_count == 0
+    # Output order: user, assistant, synthetic toolResult, user
+    roles = [m.get("role") for m in result.messages if isinstance(m, Mapping)]
+    assert roles == ["user", "assistant", "toolResult", "user"]
+    # The synthetic placeholder carries the deterministic marker.
+    synthetic = result.messages[2]
+    assert synthetic.get("isError") is True
+    assert synthetic.get("toolCallId") == "tu_no_result"
+    assert synthetic.get("toolName") == "search"
+
+
+def test_assembler_flow_orphan_tool_result_with_preserved_user_text() -> None:
+    """Orphan tool_result dropped — surrounding user/assistant text preserved.
+
+    Common in assembler output: an evicted assistant turn left a
+    dangling tool_result whose tool_use is no longer in the selected
+    window. The sanitize pass drops it but the surrounding text-bearing
+    messages must survive unchanged.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "user before orphan"}]},
+        {
+            "role": "toolResult",
+            "toolCallId": "tu_evicted",
+            "content": [{"type": "text", "text": "result from evicted tool_use"}],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "assistant after orphan"}]},
+    ]
+
+    result = repair_transcript(messages)
+    assert result.dropped_count == 1
+    assert result.synthesized_count == 0
+    roles_in_order = [m.get("role") for m in result.messages if isinstance(m, Mapping)]
+    assert roles_in_order == ["user", "assistant"]
+    # Text content of the surviving messages is unchanged.
+    surviving_texts = [
+        m["content"][0]["text"]
+        for m in result.messages
+        if isinstance(m, Mapping) and isinstance(m.get("content"), list)
+    ]
+    assert surviving_texts == ["user before orphan", "assistant after orphan"]
+
+
+def test_assembler_flow_single_assistant_message_no_change() -> None:
+    """Single text-only assistant message → identity preserved.
+
+    Smallest valid input: one assistant message with text content only.
+    No tool calls, no tool results, nothing to repair.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+    ]
+    sanitized = sanitize_tool_use_result_pairing(messages)
+    assert sanitized is messages
+
+    result = repair_transcript(messages)
+    assert result.messages is messages
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+    assert result.repaired_count == 0
+
+
+def test_assembler_flow_all_empty_content_messages_pass_through() -> None:
+    """All-empty-content messages pass through unchanged.
+
+    The sanitize pass does NOT enforce non-empty content — that lives
+    in the assembler's "clean empty assistant turns" step at TS 1283-1293
+    (Step 13 of 03-08), which runs BEFORE this function. Sanitize sees
+    a clean message list and treats empty-content turns as non-tool
+    messages with nothing to repair.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "user", "content": []},
+        {"role": "assistant", "content": []},
+        {"role": "user", "content": []},
+    ]
+    sanitized = sanitize_tool_use_result_pairing(messages)
+    assert sanitized is messages
+
+
+def test_assembler_flow_multi_call_assistant_partial_orphan_synthesizes() -> None:
+    """Multi-call assistant turn: some calls paired, others orphaned.
+
+    An assistant message with two tool_use blocks where only one has a
+    matching toolResult. The matched call's result is preserved; the
+    orphan call gets a synthetic placeholder. Verbatim TS behavior at
+    ``transcript-repair.ts:278-290`` — the for-each-call loop inserts
+    synthetics inline at the assistant turn's span end.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_matched", "name": "search"},
+                {"type": "tool_use", "id": "tu_orphan", "name": "fetch"},
+            ],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "tu_matched",
+            "content": [{"type": "text", "text": "search result"}],
+        },
+        # No toolResult for tu_orphan.
+        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+    ]
+
+    result = repair_transcript(messages)
+    assert result.synthesized_count == 1, "the orphan call gets one synthetic"
+    # Order: assistant, real toolResult (tu_matched), synthetic (tu_orphan), user.
+    out = list(result.messages)
+    assert len(out) == 4
+    assert out[0].get("role") == "assistant"
+    assert out[1].get("role") == "toolResult"
+    assert out[1].get("toolCallId") == "tu_matched"
+    assert out[2].get("role") == "toolResult"
+    assert out[2].get("toolCallId") == "tu_orphan"
+    assert out[2].get("isError") is True
+    assert out[3].get("role") == "user"
+
+
+def test_assembler_flow_long_conversation_with_multiple_spans() -> None:
+    """Multi-span integration: pairs, orphans, dupes interleaved.
+
+    A realistic post-budget-walk transcript:
+      * Span 1: matched pair (keep)
+      * Span 2: orphan tool_use (synthesize)
+      * Floating orphan tool_result between spans (drop)
+      * Span 3: matched pair (keep)
+    """
+    messages: list[Mapping[str, Any]] = [
+        # Span 1: matched
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "id_a", "name": "search"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "id_a",
+            "content": [{"type": "text", "text": "result a"}],
+        },
+        # Span 2: orphan tool_use
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "id_b_orphan", "name": "fetch"}],
+        },
+        # Orphan tool_result between spans (no preceding tool_use for id_c)
+        {
+            "role": "toolResult",
+            "toolCallId": "id_c_floating",
+            "content": [{"type": "text", "text": "nobody asked"}],
+        },
+        # Span 3: matched
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "id_d", "name": "search"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "id_d",
+            "content": [{"type": "text", "text": "result d"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    assert result.synthesized_count == 1, "id_b_orphan synthetic placeholder"
+    assert result.dropped_count == 1, "id_c_floating orphan dropped"
+
+    # Resulting order: assistant(a), tr(a), assistant(b), synthetic(b), assistant(d), tr(d).
+    out = list(result.messages)
+    roles = [m.get("role") for m in out if isinstance(m, Mapping)]
+    assert roles == [
+        "assistant",
+        "toolResult",
+        "assistant",
+        "toolResult",
+        "assistant",
+        "toolResult",
+    ]
+    # And every toolResult points to an id that appears in a preceding assistant turn.
+    tool_result_ids = [
+        m.get("toolCallId") for m in out if isinstance(m, Mapping) and m.get("role") == "toolResult"
+    ]
+    assert tool_result_ids == ["id_a", "id_b_orphan", "id_d"]
+
+
+def test_assembler_flow_invariant_every_tool_result_has_preceding_tool_use() -> None:
+    """Assembler acceptance criterion: final output has no unpaired tool_result.
+
+    Per the 03-07b spec §"Critical invariant": every tool_result in
+    the sanitize output must have a preceding matching tool_use in
+    the same output. This integration assertion walks the output and
+    checks the invariant on a fuzzy-shaped fixture.
+    """
+    messages: list[Mapping[str, Any]] = [
+        # Orphan tool_result at the front (nothing precedes it)
+        {
+            "role": "toolResult",
+            "toolCallId": "leading_orphan",
+            "content": [{"type": "text", "text": "no preceding tool_use"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "matched_one", "name": "tool"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "matched_one",
+            "content": [{"type": "text", "text": "result"}],
+        },
+        # Trailing orphan (assistant turn already closed)
+        {
+            "role": "toolResult",
+            "toolCallId": "trailing_orphan",
+            "content": [{"type": "text", "text": "stray"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+
+    # Walk the output: every toolResult must have a tool_use with the
+    # same id at an earlier index. (Synthetic placeholders count too —
+    # they ride alongside the assistant turn that owns their id.)
+    out = list(result.messages)
+    seen_tool_use_ids: set[str] = set()
+    for msg in out:
+        if not isinstance(msg, Mapping):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, Mapping):
+                        continue
+                    block_id = block.get("id") or block.get("call_id")
+                    if isinstance(block_id, str):
+                        seen_tool_use_ids.add(block_id)
+        elif role == "toolResult":
+            tr_id = msg.get("toolCallId") or msg.get("toolUseId")
+            assert tr_id in seen_tool_use_ids, (
+                f"toolResult with id={tr_id!r} has no preceding matching tool_use — "
+                f"invariant violation in sanitize output"
+            )
+
+    # And the structural counts match what we expect.
+    assert result.dropped_count == 2, "both leading and trailing orphans dropped"
+    assert result.synthesized_count == 0, "matched_one has a real toolResult; no synthetic"
+
+
+def test_assembler_flow_synthetic_marker_is_byte_identical_to_ts_source() -> None:
+    """Synthetic placeholder marker string must match TS source byte-for-byte.
+
+    Per the 03-07b spec §"Acceptance criteria": "Synthesized tool_use
+    blocks (when generated to pair a lone tool_result) carry a
+    synthetic-marker comment in the TS source — preserve the marker
+    (used by debug diagnostics)."
+
+    The marker is checked at ``transcript-repair.ts:154``. Downstream
+    consumers grep for the ``[lossless-claw]`` prefix; if this drifts
+    in the Python port, the diagnostics break silently.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tu_marker", "name": "noop"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    assert result.synthesized_count == 1
+    synthetic = result.messages[1]
+    content = synthetic.get("content")
+    assert isinstance(content, list) and len(content) == 1
+    text_block = content[0]
+    assert isinstance(text_block, Mapping)
+    assert text_block.get("text") == (
+        "[lossless-claw] missing tool result in session history; "
+        "inserted synthetic error result for transcript repair."
+    ), "synthetic marker must be byte-identical to transcript-repair.ts:154"
+    assert text_block.get("type") == "text"
+    assert synthetic.get("isError") is True
+
+
+def test_assembler_flow_anthropic_tool_use_kebab_case_variant() -> None:
+    """``tool-use`` kebab-case is one of the six provider variants.
+
+    The :data:`TOOL_CALL_TYPES` set (transcript-repair.ts:30) covers
+    six block-type strings. This test pins behavior for the
+    ``tool-use`` (kebab) variant; sister tests above cover ``tool_use``
+    (snake) and ``function_call``. Cross-provider parity is critical
+    because the assembler does NOT normalize block types — it passes
+    them through as the upstream message store stored them.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool-use", "id": "tu_kebab", "name": "search"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "tu_kebab",
+            "content": [{"type": "text", "text": "kebab works"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    # No change needed — matched pair.
+    assert result.messages is messages
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+
+
+def test_assembler_flow_function_call_camelcase_variant() -> None:
+    """``functionCall`` (camelCase) provider variant — OpenAI Chat shape."""
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "functionCall",
+                    "id": "fc_camel",
+                    "name": "search",
+                    "arguments": "{}",
+                },
+            ],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "fc_camel",
+            "content": [{"type": "text", "text": "camel works"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    assert result.messages is messages
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+
+
+def test_assembler_flow_toolcall_legacy_variant() -> None:
+    """``toolCall`` legacy (OpenClaw) variant pairs correctly with toolResult."""
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": "tc_legacy", "name": "search"}],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "tc_legacy",
+            "content": [{"type": "text", "text": "legacy works"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    assert result.messages is messages
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+
+
+def test_assembler_flow_three_consecutive_assistant_turns_no_tool_use() -> None:
+    """Three back-to-back assistant turns with text-only content.
+
+    Tests the loop's handling of consecutive assistants — each
+    advances the outer index without triggering the span-vacuum
+    sub-loop because ``tool_calls`` is empty. Output must equal
+    input (identity preserved).
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "assistant", "content": [{"type": "text", "text": "first"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "second"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "third"}]},
+    ]
+
+    sanitized = sanitize_tool_use_result_pairing(messages)
+    assert sanitized is messages
+
+    result = repair_transcript(messages)
+    assert result.messages is messages
+
+
+def test_assembler_flow_assistant_with_text_and_tool_use_then_result() -> None:
+    """Assistant turn with mixed text + tool_use content blocks.
+
+    Realistic Anthropic assistant shape: one ``text`` block followed
+    by one ``tool_use`` block. The matching toolResult comes next.
+    No repair triggered; output identity-preserved.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me search for that."},
+                {"type": "tool_use", "id": "tu_mixed", "name": "search"},
+            ],
+        },
+        {
+            "role": "toolResult",
+            "toolCallId": "tu_mixed",
+            "content": [{"type": "text", "text": "found"}],
+        },
+    ]
+
+    result = repair_transcript(messages)
+    assert result.messages is messages
+    assert result.dropped_count == 0
+    assert result.synthesized_count == 0
+    assert result.repaired_count == 0
+
+
+def test_assembler_flow_orphan_tool_use_aborted_skips_synthesis() -> None:
+    """An aborted assistant turn's orphan tool_use does NOT trigger synthesis.
+
+    Cross-references ``test_aborted_assistant_message_skips_synthetic_tool_result_creation``
+    above but in the assembler-flow context: a budget-walked transcript
+    may include partial/aborted assistant turns. The TS guard at
+    ``transcript-repair.ts:216-222`` prevents creating synthetic
+    placeholders for them — the assistant turn passes through as-is,
+    no synthetic appended.
+    """
+    messages: list[Mapping[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "before"}]},
+        {
+            "role": "assistant",
+            "stopReason": "aborted",
+            "content": [{"type": "tool_use", "id": "tu_aborted_orphan", "name": "compute"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "after"}]},
+    ]
+
+    result = repair_transcript(messages)
+    assert result.synthesized_count == 0
+    # Identity preserved — no synthetic was inserted because of the guard.
+    assert result.messages is messages
