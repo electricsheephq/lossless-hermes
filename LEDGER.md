@@ -8,22 +8,23 @@
 
 | Metric | Estimated | Actual | Variance |
 |---|---:|---:|---:|
-| Total agent-hours | 610–830 | 0 | — |
-| Total cost USD | $40K–$60K | $0 | — |
-| Total issues merged | 122 | 0 | — |
-| Total PRs opened | 122+ | 0 | — |
+| Total agent-hours | 610–830 | ~1 (W0 dry-run) | — |
+| Total cost USD | $40K–$60K | ~$15 (est, W0 + W0e dry-run) | — |
+| Total issues merged | 122 | 1 | — |
+| Total PRs opened | 122+ | 1 | — |
 
 ## Per-wave
 
 | Wave | Started | Closed | Issues | Est tokens | Actual tokens | Est cost USD | Actual cost USD | $/issue | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| W0 | 2026-05-13 | — | 5 spikes | ~500K | TBD | $20–40 | TBD | n/a | scaffolding + spikes; not real issue work |
+| W0 | 2026-05-13 | 2026-05-13 | 5 spikes + dry-run on 00-01 | ~500K | ~480K (est) | $20–40 | ~$15 (est) | n/a | 0a/0b/0c/0d/0e all green; upstream PR #24949 filed; PR #1 merged |
+| W1 | 2026-05-13 | — | 7 (00-02..00-08) | ~1.4M | — | $50–80 | — | ~$10 (est) | Epic 00 remaining issues, parallel fan-out after 00-01 |
 
-## Per-issue (auto-populated by `scripts/refresh_status.py`)
+## Per-issue
 
-| Issue | Wave | PR | Status | Tokens | Cost USD | Agent-hours |
-|---|---|---|---|---:|---:|---:|
-| _(none merged yet)_ | | | | | | |
+| Issue | Wave | PR | Status | Tokens (Executor) | Tokens (Reviewer) | Notes |
+|---|---|---|---|---:|---:|---|
+| 00-01 | W0 (dry-run) | [#1](https://github.com/electricsheephq/lossless-hermes/pull/1) | ✅ merged 2026-05-13T10:38:48Z | ~103K | ~101K | 22 deps installed, 3 atomic commits, 15/15 AC ticked, 97% confidence APPROVE |
 
 ---
 
