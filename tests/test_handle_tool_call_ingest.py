@@ -332,40 +332,50 @@ def test_tool_only_followed_by_successful_turn_no_double_ingest(
 # ---------------------------------------------------------------------------
 
 
-def test_missing_messages_kwarg_is_no_op(engine: LCMEngine) -> None:
+def test_missing_messages_kwarg_is_no_op(tmp_home: Path) -> None:
     """No ``messages`` kwarg → prelude is a no-op; dispatch raises as before.
 
     Spec AC (from issue orchestration): "Missing ``messages`` kwarg:
     handle_tool_call still works (no-op ingest)."
 
-    NOTE: this test does NOT need ``on_session_start`` — the prelude
-    short-circuits BEFORE touching stores when ``messages`` is missing.
-    But the fixture still runs ``on_session_start`` for consistency
-    with the rest of the file.
+    The prelude short-circuits BEFORE touching stores when ``messages``
+    is missing, so this test does NOT call ``on_session_start`` — it
+    runs on any Python build regardless of sqlite-vec availability.
     """
-    _invoke(engine, "lcm_grep", {}, session_id="sess-A")
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    with pytest.raises(NotImplementedError):
+        eng.handle_tool_call("lcm_grep", {}, session_id="sess-A")
     # No ingest happened.
-    assert "sess-A" not in engine._last_seen_message_idx
+    assert "sess-A" not in eng._last_seen_message_idx
 
 
-def test_none_messages_kwarg_is_no_op(engine: LCMEngine) -> None:
-    """``messages=None`` → prelude is a no-op."""
-    _invoke(engine, "lcm_grep", {}, messages=None, session_id="sess-A")
-    assert "sess-A" not in engine._last_seen_message_idx
+def test_none_messages_kwarg_is_no_op(tmp_home: Path) -> None:
+    """``messages=None`` → prelude is a no-op.
+
+    No DB open — the prelude short-circuits before any store access.
+    Runs on every Python build (including the macOS CI lane without
+    ``enable_load_extension``).
+    """
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    with pytest.raises(NotImplementedError):
+        eng.handle_tool_call("lcm_grep", {}, messages=None, session_id="sess-A")
+    assert "sess-A" not in eng._last_seen_message_idx
 
 
-def test_empty_messages_kwarg_is_no_op(engine: LCMEngine) -> None:
+def test_empty_messages_kwarg_is_no_op(tmp_home: Path) -> None:
     """``messages=[]`` is also falsy → prelude is a no-op.
 
     The prelude gate is ``if messages and session_id:``; an empty list
     is falsy in Python so the prelude short-circuits without acquiring
-    the lock or touching stores.
+    the lock or touching stores. No DB open required.
     """
-    _invoke(engine, "lcm_grep", {}, messages=[], session_id="sess-A")
-    assert "sess-A" not in engine._last_seen_message_idx
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    with pytest.raises(NotImplementedError):
+        eng.handle_tool_call("lcm_grep", {}, messages=[], session_id="sess-A")
+    assert "sess-A" not in eng._last_seen_message_idx
 
 
-def test_missing_session_id_and_sender_id_is_no_op(engine: LCMEngine) -> None:
+def test_missing_session_id_and_sender_id_is_no_op(tmp_home: Path) -> None:
     """No session_id AND no sender_id → prelude is a no-op.
 
     Spec AC (from issue orchestration): "Missing ``session_id`` AND
@@ -374,36 +384,44 @@ def test_missing_session_id_and_sender_id_is_no_op(engine: LCMEngine) -> None:
     This is the Hermes-today shape per ``run_agent.py:11249``: only
     ``messages=messages`` is passed. The forward-compat
     ``session_id``/``sender_id`` chain returns ``None``, and the
-    prelude short-circuits.
+    prelude short-circuits. The pre-prelude branch happens BEFORE any
+    DB access, so the test does not need ``on_session_start``.
     """
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     messages = [{"role": "user", "content": "no session id"}]
-    _invoke(engine, "lcm_grep", {}, messages=messages)
-    # Nothing landed anywhere (no session_id → no conversation).
-    assert engine._conversation_store.list_active_conversations() == []
+    with pytest.raises(NotImplementedError):
+        eng.handle_tool_call("lcm_grep", {}, messages=messages)
+    # No state mutated — the prelude short-circuited.
+    assert eng._last_seen_message_idx == {}
 
 
-def test_empty_session_id_short_circuits(engine: LCMEngine) -> None:
+def test_empty_session_id_short_circuits(tmp_home: Path) -> None:
     """``session_id=""`` (empty string) is falsy → prelude is a no-op.
 
     Defensive: the spec override uses ``or`` which treats ``""`` as
     falsy; sender_id is not set so the chain returns falsy and the
-    prelude skips.
+    prelude skips. No DB open required (the prelude short-circuits
+    before any lock/store access).
     """
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     messages = [{"role": "user", "content": "empty session"}]
-    _invoke(engine, "lcm_grep", {}, messages=messages, session_id="")
-    assert engine._conversation_store.list_active_conversations() == []
+    with pytest.raises(NotImplementedError):
+        eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="")
+    assert eng._last_seen_message_idx == {}
 
 
-def test_no_kwargs_at_all_is_no_op(engine: LCMEngine) -> None:
+def test_no_kwargs_at_all_is_no_op(tmp_home: Path) -> None:
     """Existing 02-01 test shape — ``handle_tool_call("lcm_grep", {})`` — still raises.
 
     Regression: the existing
     ``tests/test_engine_noop.py::test_handle_tool_call_raises_with_epic_pointer``
     contract is preserved. The prelude is a no-op when ``messages`` is
     absent, and the existing :class:`NotImplementedError` still raises.
+    No DB open required.
     """
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     with pytest.raises(NotImplementedError, match=r"Epic 06"):
-        engine.handle_tool_call("lcm_grep", {})
+        eng.handle_tool_call("lcm_grep", {})
 
 
 # ---------------------------------------------------------------------------
