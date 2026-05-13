@@ -10,8 +10,11 @@ Modules in this package:
   filled in alongside each subsystem PR).
 * :mod:`lossless_hermes.db.connection` — single sanctioned SQLite connection
   factory (ports ``lossless-claw/src/db/connection.ts``). Issue #01-01.
-* (planned) ``features.py`` — FTS5/trigram capability probe (issue #01-03).
-* (planned) ``migration.py`` — full schema ladder (issues #01-04+).
+* :mod:`lossless_hermes.db.features` — FTS5/trigram/vec0 capability probes
+  (issue #01-03).
+* :mod:`lossless_hermes.db.migration` — full schema ladder (issue #01-04
+  lands the core 12 tables + 20 indexes; #01-05/#01-06/#01-15 add the
+  FTS5/v4.1/backfill sections).
 
 See:
 
