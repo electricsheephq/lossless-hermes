@@ -773,7 +773,12 @@ class TestExperimentalWarningRateLimiting:
 
     def test_first_call_emits(self, caplog: pytest.LogCaptureFixture) -> None:
         engine = LCMEngine()
-        engine._last_experimental_warn_ts = 0.0  # ensure cooldown not active
+        # Cooldown predicate: `time.monotonic() - _last_warn_ts < cooldown`.
+        # `monotonic()` is process-uptime; on a fresh CI runner uptime can be
+        # < 60s and `now - 0.0 < 60.0` is True (incorrectly suppressing).
+        # Use a negative sentinel so the difference is always >> cooldown.
+        # (Fix-forward from PR #59 closure — flaked on ubuntu-latest py3.12/3.13.)
+        engine._last_experimental_warn_ts = -(_EXPERIMENTAL_WARN_COOLDOWN_S + 1.0)
         with caplog.at_level(logging.WARNING, logger="lossless_hermes.engine.assemble"):
             emitted = engine._emit_experimental_warning_if_due()
         assert emitted is True
@@ -781,7 +786,7 @@ class TestExperimentalWarningRateLimiting:
 
     def test_second_call_within_cooldown_suppressed(self, caplog: pytest.LogCaptureFixture) -> None:
         engine = LCMEngine()
-        engine._last_experimental_warn_ts = 0.0
+        engine._last_experimental_warn_ts = -(_EXPERIMENTAL_WARN_COOLDOWN_S + 1.0)
         # First emits.
         engine._emit_experimental_warning_if_due()
         # Second within cooldown is suppressed.
@@ -791,7 +796,7 @@ class TestExperimentalWarningRateLimiting:
 
     def test_call_after_cooldown_emits_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
         engine = LCMEngine()
-        engine._last_experimental_warn_ts = 0.0
+        engine._last_experimental_warn_ts = -(_EXPERIMENTAL_WARN_COOLDOWN_S + 1.0)
         # First emit advances the timestamp to ~now.
         first_now = engine._last_experimental_warn_ts
         engine._emit_experimental_warning_if_due()
