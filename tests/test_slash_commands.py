@@ -192,7 +192,9 @@ def test_unknown_cmd_returns_unknown_message() -> None:
         ("backup", "Epic 08"),
         ("rotate", "Epic 08"),
         ("eval", "Epic 09"),
-        ("import-openclaw", "Epic 08"),
+        # Note: ``import-openclaw`` was previously stubbed; issue 08-15
+        # wired the real body in ``lossless_hermes.cli.import_openclaw``.
+        # The dedicated tests live in ``tests/cli/test_import_openclaw.py``.
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
