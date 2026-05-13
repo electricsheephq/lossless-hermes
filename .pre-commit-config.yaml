@@ -31,7 +31,16 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Byte-identical TS-template fixtures intentionally preserve
+        # the JS template-literal output (which includes a 6-space
+        # blank line when the optional `first_in` subquery is absent).
+        # See tests/fixtures/entity_shared_*.txt + issue 07-01.
+        exclude: '^tests/fixtures/entity_shared_.*\.txt$'
       - id: end-of-file-fixer
+        # Same fixtures must NOT receive a trailing-newline injection —
+        # the JS template literal returns the agg CTE without a final
+        # newline, and parity with that output is the test's whole point.
+        exclude: '^tests/fixtures/entity_shared_.*\.txt$'
       - id: check-yaml
         # `check-yaml` does not validate workflow YAML semantics (that's
         # `actionlint`'s job, deferred); it only checks parse cleanliness.

@@ -1,0 +1,11 @@
+, entity_agg AS (
+    SELECT
+      vm.entity_id,
+      COUNT(*) AS occ_count,
+      MIN(vm.mentioned_at) AS first_at,
+      MAX(vm.mentioned_at) AS last_at,
+      
+      json_group_array(DISTINCT vm.surface_form) AS visible_surfaces
+     FROM visible_mentions vm
+    GROUP BY vm.entity_id
+  )
