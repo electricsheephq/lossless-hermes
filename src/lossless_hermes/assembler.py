@@ -7,10 +7,15 @@ assembler: it hydrates ordered :class:`ContextItemRecord` rows into
 plus DB metadata, plain text rendering, and an :func:`estimate_tokens`
 budget figure.
 
-### Issue 03-04 scope
+### Issue 03-04 + 03-05 scope
 
 This file covers ``resolveItems`` (TS 1374-1466) plus every helper the
-function transitively depends on:
+function transitively depends on, AND the fresh-tail boundary
+calculation (``resolveFreshTailOrdinal``, TS 983-1032). The budget
+walk (03-06), orphan stripping (03-07), and orchestration (03-08)
+land in subsequent issues.
+
+Helpers covered by 03-04:
 
 * :func:`parse_json` — tolerant JSON parser (TS 188-197).
 * :func:`get_original_role` / :func:`get_part_metadata` — decode the
@@ -33,6 +38,14 @@ function transitively depends on:
 * :class:`ContextAssembler._resolve_message_item` /
   :meth:`._resolve_summary_item` / :meth:`.resolve_items` —
   high-level hydration entry points (TS 1342-1468).
+
+Helpers covered by 03-05:
+
+* :func:`resolve_fresh_tail_ordinal` — walks raw-message items
+  newest→oldest, protecting up to ``fresh_tail_count`` (and
+  optionally ``fresh_tail_max_tokens``) before declaring the
+  boundary. Returns :data:`EMPTY_FRESH_TAIL_ORDINAL` when no
+  protection applies.
 
 ### #628 stub-tier deferral (ADR-030)
 
@@ -76,6 +89,7 @@ invariant explicitly.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Sequence
@@ -109,7 +123,158 @@ __all__ = [
     "pick_tool_name",
     "pick_tool_is_error",
     "format_summary_content",
+    "resolve_fresh_tail_ordinal",
+    "EMPTY_FRESH_TAIL_ORDINAL",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Fresh-tail boundary computation (TS 983-1032)
+# ---------------------------------------------------------------------------
+
+
+# Sentinel for "no fresh tail" — the TS source returns ``Infinity`` (a
+# ``number`` in JS); Python's downstream stores accept ``int`` ordinals
+# only, so we use ``sys.maxsize`` which (a) is an int, (b) always exceeds
+# any real ordinal value emitted by ``context_items.ordinal`` (SQLite
+# INTEGER, max 2**63-1), and (c) makes the splitter predicates
+# ``ordinal < EMPTY_FRESH_TAIL_ORDINAL`` and ``ordinal >= EMPTY_FRESH_TAIL_ORDINAL``
+# behave identically to TS ``ordinal < Infinity`` / ``ordinal >= Infinity``.
+#
+# Behavioral contract: when this value is returned, the fresh tail is
+# empty and *every* resolved item is evictable. Downstream splitters
+# already use the ``ordinal >= boundary`` predicate, so this drops in
+# without further work in 03-06 / 03-08.
+EMPTY_FRESH_TAIL_ORDINAL = sys.maxsize
+
+
+def resolve_fresh_tail_ordinal(
+    resolved: Sequence[ResolvedItem],
+    fresh_tail_count: int,
+    fresh_tail_max_tokens: int | None = None,
+) -> int:
+    """Compute the boundary ordinal separating the fresh tail from evictable.
+
+    Mirrors TS ``resolveFreshTailOrdinal`` (``assembler.ts`` 983-1032).
+    Walks raw-message items in ``resolved`` from newest to oldest,
+    protecting up to ``fresh_tail_count`` messages (and stopping early
+    if adding the next message would push the protected total past
+    ``fresh_tail_max_tokens``). The newest message is **always
+    protected**, even if it alone exceeds the cap — the user's current
+    turn must never be evicted.
+
+    The returned ordinal is the **smallest ordinal in the fresh tail**.
+    Downstream code uses:
+
+    * ``item.ordinal >= boundary`` → membership in the fresh tail (kept).
+    * ``item.ordinal < boundary``  → evictable prefix (subject to budget).
+
+    ### Edge cases (matches TS verbatim)
+
+    * **No raw messages** (empty input, or all-summaries): return
+      :data:`EMPTY_FRESH_TAIL_ORDINAL`. Every resolved item is
+      classified as evictable; the fresh tail is empty.
+    * **``fresh_tail_count <= 0``** (or non-finite): return
+      :data:`EMPTY_FRESH_TAIL_ORDINAL`. Mirrors TS line 988
+      (``if (!Number.isFinite(freshTailCount) || freshTailCount <= 0)
+      return Infinity;``). This contradicts the issue spec AC bullet
+      "fresh_tail_count = 0 still keeps the newest" — the spec author
+      was wrong about TS behavior; ``test/lcm-integration.test.ts``
+      exercises ``freshTailCount: 0`` configurations that depend on the
+      no-protection path (lines 1510, 1567, 1628, 1688, 1761). Ports
+      MUST match TS, not the spec prose, per the project's
+      "TS source is canonical" principle.
+    * **``fresh_tail_max_tokens`` smaller than the newest message**:
+      the newest is still protected (``protectedCount > 0`` guard at
+      TS line 1019 means the token-cap check is skipped on the first
+      iteration).
+    * **``fresh_tail_count`` larger than the message count**: every
+      raw message is protected; the boundary is the ordinal of the
+      oldest raw message.
+    * **Summaries between raw messages**: they are *skipped* during the
+      newest-to-oldest walk (only ``is_message=True`` items count
+      against ``fresh_tail_count``), but they end up *included* in the
+      fresh-tail slice if their ordinal happens to be ``>=`` the
+      boundary, because the splitter uses ``ordinal >= boundary``
+      rather than ``is_message AND ordinal >= boundary``. The 03-08
+      integration test validates this end-to-end.
+
+    ### Implementation notes
+
+    The TS source uses a numeric-cast token-cap (``Math.floor`` on a
+    float-typed input); Python types ``fresh_tail_max_tokens`` as
+    ``int | None`` so the floor is implicit. We still guard against
+    negative values (TS ``freshTailMaxTokens >= 0`` check at line
+    1000) — a negative cap collapses to "no cap" behavior, matching
+    TS.
+
+    Args:
+        resolved: Hydrated context items in ordinal order
+            (i.e. oldest first). Only items with ``is_message=True``
+            count toward the protection budget; summaries are skipped.
+        fresh_tail_count: Maximum number of raw messages to protect
+            from eviction. Default callers should pass ``8`` (see
+            :class:`AssembleInput` defaults — TS ``AssembleContextInput``
+            line 128).
+        fresh_tail_max_tokens: Optional cap on protected-tail tokens.
+            When ``None``, only ``fresh_tail_count`` gates the walk.
+            Negative or non-finite values collapse to "no cap" per TS
+            line 1000.
+
+    Returns:
+        The ordinal of the oldest message that fits the protection
+        window, or :data:`EMPTY_FRESH_TAIL_ORDINAL` when no message
+        qualifies (empty input, all-summaries, or
+        ``fresh_tail_count <= 0``). The returned value is always
+        usable in ``item.ordinal >= boundary`` / ``< boundary``
+        comparisons.
+    """
+    # TS: if (!Number.isFinite(freshTailCount) || freshTailCount <= 0)
+    #         return Infinity;
+    # Python ints can't be NaN/Inf, but we still guard against negative or
+    # zero counts — they should disable the fresh-tail entirely.
+    if fresh_tail_count <= 0:
+        return EMPTY_FRESH_TAIL_ORDINAL
+
+    raw_messages = [item for item in resolved if item.is_message]
+    if not raw_messages:
+        # TS line 994: empty raw-message set → no fresh tail.
+        return EMPTY_FRESH_TAIL_ORDINAL
+
+    # TS line 997-1002: a finite, non-negative ``freshTailMaxTokens`` is
+    # the active cap; anything else collapses to ``undefined`` (no cap).
+    # ``int | None`` makes the finite/integer check trivial in Python.
+    token_cap: int | None = (
+        fresh_tail_max_tokens
+        if fresh_tail_max_tokens is not None and fresh_tail_max_tokens >= 0
+        else None
+    )
+
+    protected_count = 0
+    protected_tokens = 0
+    tail_start_ordinal: int = EMPTY_FRESH_TAIL_ORDINAL
+
+    # Walk newest → oldest (reverse the message list).
+    for item in reversed(raw_messages):
+        if protected_count >= fresh_tail_count:
+            break
+
+        # TS lines 1018-1024: the newest item is always kept regardless
+        # of the token cap (``protectedCount > 0`` gate). Subsequent
+        # items respect the cap.
+        would_exceed_budget = (
+            protected_count > 0
+            and token_cap is not None
+            and protected_tokens + item.tokens > token_cap
+        )
+        if would_exceed_budget:
+            break
+
+        tail_start_ordinal = item.ordinal
+        protected_count += 1
+        protected_tokens += item.tokens
+
+    return tail_start_ordinal
 
 
 # ---------------------------------------------------------------------------
@@ -934,10 +1099,10 @@ class ContextAssembler:
     """Hydrate context_items into ResolvedItems for budget-walk + sanitize.
 
     Mirrors TS ``ContextAssembler`` (assembler.ts 1084-1469). v0.1.0 of
-    this Python port ships only the hydration surface (:meth:`resolve_items`
-    + the two ``_resolve_*`` helpers). The remaining steps
-    (fresh-tail boundary, budget walk, orphan stripping, sanitize) land
-    in 03-05..03-08.
+    this Python port ships the hydration surface (:meth:`resolve_items`
+    + the two ``_resolve_*`` helpers) and the fresh-tail boundary
+    (:func:`resolve_fresh_tail_ordinal`, module-level). The remaining
+    steps (budget walk, orphan stripping, sanitize) land in 03-06..03-08.
 
     Args:
         conversation_store: Source of :class:`MessageRecord` /
