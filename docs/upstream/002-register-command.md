@@ -1,12 +1,15 @@
 ---
 patch_id: 002
 adr: 015
-status: drafted
+status: drafted-verified-still-needed
 pr_url: null
-last_checked: 2026-05-13
-fallback: Ship lossless-hermes as an entry-point plugin (NOT directory-mode); full PluginContext is wired by that path
+last_checked: 2026-05-14
+fallback: Ship lossless-hermes as an entry-point plugin (NOT directory-mode); full PluginContext is wired by that path. Our ADR-001 already chose this.
 blocks_issues: []
+verification: 2026-05-14 — Confirmed Hermes mainline (HEAD 1e01b25) `_EngineCollector` at `plugins/context_engine/__init__.py:198-219` has 4 no-op stubs (`register_tool`, `register_hook`, `register_cli_command`, `register_memory_provider`) and is MISSING `register_command` entirely — directory-mode plugins calling `ctx.register_command(...)` would AttributeError, NOT silent no-op. Worse failure mode than originally documented.
 ---
+
+> 📝 **STATUS: still needed upstream.** Verification on 2026-05-14 against Hermes HEAD `1e01b25` confirms `_EngineCollector` still has 4 silent no-op stubs and is MISSING `register_command` (would crash with AttributeError). Doesn't block lossless-hermes because we use the entry-point distribution model per ADR-001 (full `PluginContext`, not `_EngineCollector`). Worth filing as a quality-of-life upstream PR for directory-mode plugin authors; not urgent for v0.1.0.
 
 # Upstream patch 002 — `_EngineCollector.register_command` forwarding
 

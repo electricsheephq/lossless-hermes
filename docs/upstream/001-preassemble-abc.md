@@ -1,14 +1,15 @@
 ---
 patch_id: 001
 adr: 010
-status: filed
+status: superseded-by-7464
 pr_url: https://github.com/NousResearch/hermes-agent/pull/24949
-last_checked: 2026-05-13
-fallback: ADR-010 Option A — force should_compress=True every turn (experimental, breaks session lineage; gated by config flag `experimental.always_on_via_compress`)
-blocks_issues:
-  - 03-09
-  - 03-10
+last_checked: 2026-05-14
+fallback: N/A — upstream PR #7464 (merged 2026-04-11) made `compress(messages, current_tokens) -> list` the substitution seam; preflight at run_agent.py:11965-12016 calls it pre-API. Our `should_compress` returns True every turn (already wired at engine/compact.py:184) and `compress` returns the assembled list. No "fallback" — this IS the path.
+blocks_issues: []
+verification: docs/upstream/001a-preassemble-vs-7464-investigation.md
 ---
+
+> ⚠️ **STATUS: superseded.** PR #7464 (merged 2026-04-11) provides the substitution seam this patch was specified to add. See [`001a-preassemble-vs-7464-investigation.md`](./001a-preassemble-vs-7464-investigation.md) for the verification trail and [issue #60](https://github.com/electricsheephq/lossless-hermes/issues/60) for the cleanup work (ADR-031 supersession + dead-code removal in `engine/assemble.py`). PR #24949 should be closed-as-obsolete on the upstream repo.
 
 # Upstream patch 001 — `ContextEngine.preassemble()`
 

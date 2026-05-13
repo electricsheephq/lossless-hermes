@@ -1,12 +1,15 @@
 ---
 patch_id: 003
 adr: 015
-status: drafted
+status: drafted-verified-optional-cleanup
 pr_url: null
-last_checked: 2026-05-13
-fallback: ADR-009 Option B — diff-on-each-turn against conversation_history from post_llm_call hook (works today; slightly higher latency than per-append)
+last_checked: 2026-05-14
+fallback: ADR-009 Option B — diff-on-each-turn against conversation_history from post_llm_call hook (works today; slightly higher latency than per-append). SHIPPED in PR #42 / #44 (issues 03-02, 03-03).
 blocks_issues: []
+verification: 2026-05-14 — Confirmed Hermes HEAD `1e01b25` `ContextEngine` ABC at `agent/context_engine.py` has no `ingest()` method. ~10+ `messages.append(...)` call sites still exist in `run_agent.py` (lines 10620, 10999, 11037, 11418, 11446, 11473, 11487, 11625, 11668, more). Patch is still relevant but **no longer needed for lossless-hermes v0.1.0** — Option B (diff-on-each-turn) ships and works.
 ---
+
+> 📝 **STATUS: optional cleanup, low priority.** Verification on 2026-05-14: no `ingest()` ABC method upstream, but ADR-009 Option B (diff-on-each-turn) is already shipped in issues 03-02 / 03-03 and works. Filing this upstream is a nice-to-have that would let LCM drop the diff-tracking state machine; not blocking v0.1.0 in any form.
 
 # Upstream patch 003 — `ContextEngine.ingest()` ABC method + run_agent call sites
 

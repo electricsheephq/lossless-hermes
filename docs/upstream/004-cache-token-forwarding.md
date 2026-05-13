@@ -1,12 +1,15 @@
 ---
 patch_id: 004
 adr: 015
-status: drafted
+status: drafted-verified-still-needed
 pr_url: null
-last_checked: 2026-05-13
+last_checked: 2026-05-14
 fallback: LCM's cache-aware compaction degrades gracefully — `cacheContextUnknownLogged` path disables deferral when cache state is unknown
 blocks_issues: []
+verification: 2026-05-14 — Confirmed Hermes HEAD `1e01b25` builds `usage_dict` at `run_agent.py` containing only `prompt_tokens`, `completion_tokens`, `total_tokens` before calling `self.context_compressor.update_from_response(usage_dict)`. Cache fields (`cache_read_tokens`, `cache_write_tokens`, `cached_tokens`) ARE collected — `agent/insights.py:46-69` tracks them, Gemini adapter at `gemini_native_adapter.py:520` captures `cachedContentTokenCount` — but they're dropped before reaching the context engine. ~5 LOC upstream PR to forward 2 extra keys.
 ---
+
+> 📝 **STATUS: still relevant upstream.** Verification on 2026-05-14: cache fields exist in Hermes's telemetry path (`agent/insights.py`, provider adapters) but are dropped when `usage_dict` is constructed for `update_from_response`. LCM's cache-aware compaction falls back to "unknown" state and disables deferral. The optimization is off but the system is correct. Worth a 5-LOC upstream PR to enable; not blocking v0.1.0.
 
 # Upstream patch 004 — cache-token forwarding in `update_from_response(usage)`
 
