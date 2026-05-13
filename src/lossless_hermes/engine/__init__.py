@@ -80,6 +80,17 @@ from lossless_hermes.store.compaction_telemetry import CompactionTelemetryStore
 from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
 
+from lossless_hermes.plugin.needs_compact_gate import (
+    TOKEN_GATE_TOOLS,
+    run_with_token_gate,
+)
+from lossless_hermes.plugin.token_state import (
+    get_runtime_context as _token_state_get_runtime_context,
+)
+from lossless_hermes.plugin.token_state import (
+    record_llm_output as _token_state_record_llm_output,
+)
+
 from .assemble import _AssembleMixin
 from .circuit_breaker import CircuitBreaker
 from .compact import _CompactMixin
@@ -709,6 +720,29 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
             self.last_cache_read_tokens = 0
             self.last_cache_write_tokens = 0
 
+        # --- Issue 06-03 token-state cache anchor -----------------------
+        # Feed the per-session token-state cache so the
+        # ``run_with_token_gate`` middleware can read fresh
+        # ``current_token_count`` + ``token_budget`` on the next tool
+        # dispatch. ``record_llm_output`` accepts the same ``usage``
+        # dict; it pulls ``input + cacheRead + cacheWrite`` (the LCM
+        # composition — output tokens are the LLM's response, not
+        # context) and stamps it under the current session-key. Empty
+        # session-key is a no-op — by design, the cache is keyed by
+        # cross-conversation identity that Hermes plumbs through
+        # ``kwargs["session_key"]`` when present.
+        if self.current_session_id:
+            # token_budget on the cache snapshot is the engine's
+            # ``context_length`` (set by the engine's existing flow when
+            # a model identifier resolves); pass ``None`` when 0 to
+            # signal "unknown budget" -> gate bypasses cleanly.
+            budget = self.context_length if self.context_length > 0 else None
+            _token_state_record_llm_output(
+                session_key=self.current_session_id,
+                usage=usage,
+                token_budget=budget,
+            )
+
     # ABC §Tools (defaults are fine; explicit overrides for 02-01 clarity) ---
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -725,8 +759,31 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         """
         return []
 
+    def get_runtime_context(self, session_key: Optional[str] = None) -> Dict[str, Any]:
+        """Read the cached token-state snapshot for ``session_key``.
+
+        The :func:`run_with_token_gate` middleware consumes the dict's
+        ``current_token_count`` + ``token_budget`` keys to decide whether
+        to refuse a tool dispatch for context-overflow. Both must be
+        present and well-formed for the gate to fire; missing telemetry
+        = bypass.
+
+        Args:
+            session_key: Cross-conversation identity. Defaults to
+                :attr:`current_session_id` when ``None`` — matches the
+                fallback in :meth:`handle_tool_call`.
+
+        Returns:
+            A dict with optional ``current_token_count``, ``token_budget``,
+            ``last_update_at``, ``last_update_source`` keys. Empty dict
+            when no anchor exists (the gate's no-cache bypass path).
+        """
+        return _token_state_get_runtime_context(
+            session_key if session_key is not None else self.current_session_id
+        )
+
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        """Dispatch an LCM tool — with a belt-and-suspenders ingest prelude.
+        """Dispatch an LCM tool with ingest prelude + token-gate middleware.
 
         **Issue 03-03 (ADR-009 §Decision "Option C"):** before any
         per-tool dispatch this method reads ``kwargs.get("messages")``
@@ -741,6 +798,18 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         per-session sync lock re-reads the cursor and sees no new
         messages.
 
+        **Issue 06-03 token-gate middleware (Wave-12 F5):** after the
+        ingest prelude and BEFORE the per-tool dispatch, the
+        :func:`run_with_token_gate` wrapper consults
+        :func:`get_runtime_context` and refuses the call when the
+        projected post-dispatch context ratio exceeds the refusal
+        threshold. The wrap is applied based on
+        :data:`needs_compact_gate.TOKEN_GATE_TOOLS` membership AT
+        INVOCATION TIME — not at registration time. A decorator
+        approach would freeze the membership / state at plugin init,
+        defeating the purpose; the wrap-at-dispatch pattern lets the
+        gate see the LATEST runtime context every time.
+
         Session-id resolution: Hermes today passes only
         ``messages=messages`` at ``run_agent.py:11249`` (no
         ``session_id`` / ``sender_id`` in the kwargs). The
@@ -752,15 +821,13 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         spec AC "Missing ``session_id`` AND ``sender_id``: no-op
         ingest".
 
-        Tool dispatch itself: at 02-01 / 03-03 there are no LCM tools
-        registered (:meth:`get_tool_schemas` returns ``[]``), so reaching
-        the dispatch step implies a programmer error or test
-        invocation. The body raises :class:`NotImplementedError` for
-        any tool ``name``; real tool handling lands in Epic 06 (the
-        8 LCM tools: ``lcm_grep`` / ``lcm_describe`` / ``lcm_expand`` /
-        ``lcm_compact`` / ``lcm_synthesize_around`` /
-        ``lcm_get_entity`` / ``lcm_search_entities`` /
-        ``lcm_conversation_scope``).
+        Tool dispatch itself: at 03-03 / 06-03 there are no LCM tools
+        registered (:meth:`get_tool_schemas` returns ``[]``), so the
+        inner :meth:`_dispatch_tool_call` raises :class:`NotImplementedError`
+        for any tool ``name`` — real tool handling lands in 06-07..06-14.
+        The middleware wrap remains intact: the gate runs first, and if
+        the dispatch raises, the wrapper taps an error-shaped payload
+        into the token-state cache before re-raising (Wave-12 W2A1 P1).
 
         **Sync, not async.** Hermes's ``run_agent.py:11249`` calls this
         method synchronously inside the tool-dispatch loop. The
@@ -773,23 +840,28 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         /03-03-ingest-from-handle-tool-call.md`` §"Sync override".
 
         Args:
-            name: Tool name being dispatched. At 03-03 this is one of
+            name: Tool name being dispatched. At 06-03 this is one of
                 the future LCM tool names (Epic 06 binds them); the
                 router only routes through this method for LCM-owned
                 tool names (per ``docs/reference/hermes-hooks.md`` line
                 182).
-            args: Tool arguments. Ignored by the 03-03 ingest prelude.
+            args: Tool arguments. Consumed by both the gate's per-tool
+                estimator and the inner dispatch.
             **kwargs: May include ``messages`` (Hermes today, per
-                ``run_agent.py:11249``) and forward-compat
-                ``session_id`` / ``sender_id``. All read defensively;
-                missing keys default to no-op.
+                ``run_agent.py:11249``), forward-compat ``session_id`` /
+                ``sender_id``, and forward-compat ``session_key``. All
+                read defensively; missing keys default to no-op.
+
+        Returns:
+            A JSON-encoded string. Either the gate's refusal payload
+            (when the projected ratio exceeds the threshold) or the
+            tool's own output.
 
         Raises:
-            NotImplementedError: Always (at 03-03; Epic 06 fills in
-                the real dispatch). The ingest prelude is best-effort
-                and never raises — it logs + returns silently per
-                :meth:`_ingest_from_handle_tool_call`'s observer-only
-                contract.
+            NotImplementedError: When the inner dispatch is reached
+                (06-07..06-14 land the real bodies). The middleware
+                tap fires BEFORE the re-raise so the error-message
+                token cost is still accounted for.
         """
         # --- Issue 03-03 ingest prelude (ADR-009 Option C) ---------------
         # Pulled defensively from kwargs so the prelude can NEVER raise
@@ -813,11 +885,60 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
             # acquires the per-session sync lock for the diff window.
             self._ingest_from_handle_tool_call(session_id, messages)
 
-        # --- Existing per-tool dispatch ---------------------------------
-        # No LCM tools at 02-01 / 03-03 — Epic 06 fills in the real
-        # dispatch ladder. The override raises for ANY name so a stray
-        # dispatch surfaces loudly (rather than silently returning a
-        # JSON error string per the ABC default). The error message
-        # names both the attempted tool and the epic that lands the
-        # real handler.
+        # --- Issue 06-03 token-gate middleware (Wave-12 F5) ---------------
+        # LCM Wave-12 F5 (2026-04-30): runWithTokenGate is middleware-not-decorator
+        # so the gate state is computed at invocation time, not at
+        # registration time. A decorator-time computation would freeze
+        # the gate state to whatever was true at plugin-init, defeating
+        # the purpose. See ADR-029 §"Known Wave-N fixes" Wave-12 row.
+        # Original: lossless-claw/src/plugin/needs-compact-gate.ts.
+        session_key = kwargs.get("session_key") or session_id or self.current_session_id
+        runtime_ctx = _token_state_get_runtime_context(session_key)
+        if name in TOKEN_GATE_TOOLS:
+            return run_with_token_gate(
+                tool_name=name,
+                tool_params=args,
+                session_key=session_key,
+                current_token_count=runtime_ctx.get("current_token_count"),
+                token_budget=runtime_ctx.get("token_budget"),
+                inner=lambda: self._dispatch_tool_call(name, args, **kwargs),
+            )
+
+        # --- Tools NOT in TOKEN_GATE_TOOLS: bypass middleware ------------
+        # ``lcm_expand`` and ``lcm_compact`` are exempt from the gate
+        # (lcm_expand has its own grant ledger; lcm_compact emits a
+        # ~150-token status response). Their handlers still land in
+        # Epic 06 but they're not gate-wrapped.
+        return self._dispatch_tool_call(name, args, **kwargs)
+
+    def _dispatch_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
+        """Inner dispatch — routes ``name`` to its handler.
+
+        At 06-03 there are no LCM tools registered (06-02's
+        ``TOOL_DISPATCH`` table lands separately, and per-tool handlers
+        land in 06-07..06-14). The body raises :class:`NotImplementedError`
+        for any tool ``name`` so a stray dispatch surfaces loudly
+        instead of silently returning a JSON error string. Once 06-02
+        and the per-tool issues land, this body becomes the standard
+        ``TOOL_DISPATCH.get(name, ...)(args, **kwargs)`` ladder.
+
+        Factored out of :meth:`handle_tool_call` so the gate middleware
+        in :func:`run_with_token_gate` can wrap a single thunk. Tests
+        for the middleware can subclass :class:`LCMEngine` and override
+        this method to return a known string — exercising the
+        gate/dispatch/tap chain without depending on real handler
+        bodies.
+
+        Args:
+            name: The tool name.
+            args: The tool args.
+            **kwargs: Forwarded from :meth:`handle_tool_call`.
+
+        Returns:
+            The tool's JSON-encoded result string.
+
+        Raises:
+            NotImplementedError: Always — Epic 06's per-tool issues
+                replace this with real dispatch.
+        """
         raise NotImplementedError(f"handle_tool_call({name!r}, ...): tools land in Epic 06")
