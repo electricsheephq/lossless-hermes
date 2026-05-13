@@ -1,13 +1,23 @@
-"""Tests for the ``/lcm`` slash command dispatcher (issue 02-10).
+"""Tests for the ``/lcm`` slash command dispatcher.
 
-Covers the dispatcher seam: subcommand routing, ``status`` body, ``help``
-body, "not yet implemented" stubs for the 17 Epic-08/09 subcommands,
-unknown-subcommand error, and the ``register()`` wiring that calls
-``ctx.register_command("lcm", dispatcher.handle, ...)``.
+Originally written for issue 02-10 (Epic-02 stub dispatcher). Updated for
+issue 08-01 (full 17-subcommand router) — see ``epics/08-cli-ops/08-01-
+slash-command-router.md``. Per ADR-013 the handler signature is
+``(raw_args: str) -> str``; tests exercise the dispatcher directly
+without any owner-context — Hermes's upstream gate is out of scope here.
 
-Per ADR-013 the handler signature is ``(raw_args: str) -> str``; tests
-exercise the dispatcher directly without any owner-context — Hermes's
-upstream gate is out of scope here.
+Covers:
+
+* Subcommand routing (status, help, unknown).
+* ``status`` body (port from Epic-02; lives in
+  ``lossless_hermes.commands.status``).
+* ``help`` body — markdown table of all 17 subcommands with ``(admin)``
+  markers.
+* "Not yet implemented" stubs for the 15 Epic-08/09 subcommands not yet
+  wired.
+* Argument parsing (shlex quoting, unbalanced quotes, etc.).
+* ``register()`` wiring — registers both ``/lcm`` and ``/lossless`` per
+  the alias requirement from plugin-glue.md line 446.
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ import pytest
 
 from lossless_hermes.plugin.commands import (
     _SUBCOMMAND_INVENTORY,
+    _SUBCOMMANDS,
     LcmCommandDispatcher,
 )
 
@@ -97,60 +108,65 @@ def test_whitespace_only_args_aliases_status() -> None:
 
 
 def test_help_subcommand_returns_markdown_table() -> None:
-    """`/lcm help` returns a markdown table of all 19 subcommands."""
+    """`/lcm help` returns a markdown table of all 17 subcommands."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("help")
-    # Markdown table header
-    assert "| Subcommand | Target | Description |" in out
-    assert "| --- | --- | --- |" in out
-    # The two Epic-02 entries
+    # Markdown table header (issue 08-01 dropped the Target column —
+    # destructiveness is conveyed by the (admin) marker instead).
+    assert "| Subcommand | Description |" in out
+    assert "| --- | --- |" in out
+    # The two always-on entries
     assert "/lcm status" in out
     assert "/lcm help" in out
     # A few Epic-08 entries
     assert "/lcm purge" in out
     assert "/lcm doctor" in out
     assert "/lcm worker tick" in out
-    assert "/lcm db-backup" in out
     # Epic-09 entries
     assert "/lcm eval" in out
+    # (admin) marker on owner-gated rows
+    assert "(admin)" in out
     # Owner-gating note references ADR-013
     assert "ADR-013" in out
 
 
-def test_help_lists_all_19_subcommands() -> None:
-    """Every entry in `_SUBCOMMAND_INVENTORY` shows up in /lcm help."""
+def test_help_lists_all_17_subcommands() -> None:
+    """Every entry in `_SUBCOMMANDS` shows up in /lcm help."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("help")
-    for name, _, _ in _SUBCOMMAND_INVENTORY:
+    for name, _handler, _gated, _desc in _SUBCOMMANDS:
         assert f"/lcm {name}" in out, f"missing inventory entry {name!r} in /lcm help output"
 
 
-def test_unknown_subcommand_returns_not_yet_implemented() -> None:
-    """Every non-{status,help} subcommand returns 'not yet implemented (Epic 08)'.
+def test_subcommand_inventory_has_17_entries() -> None:
+    """The router inventory matches the spec — exactly 17 logical subcommands."""
+    assert len(_SUBCOMMANDS) == 17, (
+        f"expected 17 entries per plugin-glue.md /lcm slash commands inventory; "
+        f"got {len(_SUBCOMMANDS)}"
+    )
 
-    Per the Epic 02-10 scope, the dispatcher unifies the "known stub"
-    and "unknown" paths — Epic 08 splits them when it adds the real
-    bodies. At 02-10 both `purge` (inventory) and `nonsense` (not in
-    inventory) report the same message: "not yet implemented (Epic 08)".
+
+def test_unknown_subcommand_returns_unknown_message() -> None:
+    """Truly unknown subcommands return the unknown-subcommand message.
+
+    Per issue 08-01 the router distinguishes "known but not implemented"
+    (returns Epic-NN stub) from "unknown subcommand" (returns help
+    pointer). The "nonsense" / "unknown_cmd" inputs are not in
+    :data:`_SUBCOMMANDS` so they hit the unknown branch.
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("nonsense")
-    assert "not yet implemented" in out
-    assert "Epic 08" in out
-    assert "/lcm nonsense" in out
+    assert "unknown subcommand" in out
+    assert "nonsense" in out
+    assert "/lcm help" in out
 
 
-def test_unknown_cmd_returns_not_yet_implemented() -> None:
-    """The user-facing `unknown_cmd` example from the issue spec works.
-
-    Per the Epic 02-10 spec: "/lcm unknown_cmd returns the 'not yet
-    implemented' message".
-    """
+def test_unknown_cmd_returns_unknown_message() -> None:
+    """The user-facing `unknown_cmd` example from the issue spec works."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("unknown_cmd")
-    assert "not yet implemented" in out
-    assert "Epic 08" in out
-    assert "/lcm unknown_cmd" in out
+    assert "unknown subcommand" in out
+    assert "unknown_cmd" in out
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +182,8 @@ def test_unknown_cmd_returns_not_yet_implemented() -> None:
         ("doctor", "Epic 08"),
         ("backup", "Epic 08"),
         ("rotate", "Epic 08"),
-        ("reconcile-session-keys", "Epic 08"),
-        ("db-backup", "Epic 08"),
-        ("db-info", "Epic 08"),
-        ("prompts", "Epic 08"),
         ("eval", "Epic 09"),
-        ("eval-run", "Epic 09"),
+        ("import-openclaw", "Epic 08"),
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
@@ -183,29 +195,42 @@ def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_
     assert f"/lcm {subcommand}" in out
 
 
-def test_nested_subcommand_returns_not_yet_implemented() -> None:
-    """`/lcm doctor apply` routes via 'doctor' first token to the stub.
+def test_nested_subcommand_routes_to_nested_handler() -> None:
+    """`/lcm doctor apply` routes to ``doctor:run_apply`` not ``doctor:run_scan``.
 
-    At 02-10 the dispatcher does first-token routing only — nested
-    subcommands collapse to their parent for the "not yet implemented"
-    message. Epic 08 will implement inner-token dispatch inside each
-    subcommand body.
+    Issue 08-01 implements longest-prefix matching so multi-token
+    subcommands route to dedicated handler functions. The
+    ``doctor apply`` stub's "not yet implemented" message echoes the
+    full canonical path.
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("doctor apply")
     assert "not yet implemented" in out
-    assert "Epic 08" in out
-    # The dispatcher echoes back the parent token "doctor"
-    assert "/lcm doctor" in out
+    assert "/lcm doctor apply" in out
 
 
-def test_worker_tick_returns_not_yet_implemented() -> None:
-    """`/lcm worker tick embedding-backfill` routes via 'worker' parent."""
+def test_worker_tick_routes_to_tick_handler() -> None:
+    """`/lcm worker tick embedding-backfill` routes to ``worker:run_tick_backfill``."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("worker tick embedding-backfill")
     assert "not yet implemented" in out
-    assert "Epic 08" in out
-    assert "/lcm worker" in out
+    assert "/lcm worker tick embedding-backfill" in out
+
+
+def test_doctor_clean_apply_routes_to_cleaners_apply() -> None:
+    """`/lcm doctor clean apply` resolves the 3-token canonical path."""
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("doctor clean apply")
+    assert "not yet implemented" in out
+    assert "/lcm doctor clean apply" in out
+
+
+def test_doctor_clean_routes_to_cleaners_scan() -> None:
+    """`/lcm doctor clean` (no `apply`) resolves to the read-only listing handler."""
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("doctor clean")
+    assert "not yet implemented" in out
+    assert "/lcm doctor clean" in out
 
 
 # ---------------------------------------------------------------------------
@@ -317,21 +342,25 @@ def test_unbalanced_quotes_returns_parse_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_handler_exception_caught_by_dispatcher() -> None:
+def test_handler_exception_caught_by_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
     """A handler raising mid-flight returns `/lcm <sub> failed: ...` — no crash.
 
-    We monkey-patch the status handler to raise and assert the dispatcher
-    converts the exception into a user-visible failure message. This is
-    the robustness contract — a buggy subcommand body must not crash
-    the chat session.
+    We monkey-patch the status handler module's ``run`` to raise and
+    assert the dispatcher converts the exception into a user-visible
+    failure message. This is the robustness contract — a buggy
+    subcommand body must not crash the chat session.
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
 
-    def _broken_handler(_sub_args: str) -> str:
+    def _broken_handler(_parsed: Any) -> str:
         raise RuntimeError("intentional test failure")
 
-    # Override the exact-handler table so 'status' raises.
-    dispatcher._exact_handlers = lambda: {"status": _broken_handler}  # type: ignore[method-assign]
+    # Patch the status module's run() so the lazy import resolves to a
+    # broken handler. This mirrors the real failure path — the
+    # dispatcher catches exceptions raised inside handler module code.
+    import lossless_hermes.commands.status as status_mod
+
+    monkeypatch.setattr(status_mod, "run", _broken_handler)
 
     out = dispatcher.handle("status")
     assert "/lcm status failed" in out
@@ -343,12 +372,13 @@ def test_handler_exception_caught_by_dispatcher() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_register_wires_lcm_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``register(ctx)`` calls ``ctx.register_command("lcm", dispatcher.handle, …)``.
+def test_register_wires_lcm_and_lossless_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``register(ctx)`` registers BOTH ``/lcm`` and ``/lossless``.
 
-    Mirrors the acceptance criterion from the issue spec: the slash
-    command MUST be registered exactly once with the ``lcm`` name and
-    a callable handler.
+    Per issue 08-01 spec line 49 + plugin-glue.md line 446: Hermes's
+    ``register_command`` doesn't accept aliases natively, so the second
+    registration is the documented workaround. Both names point at the
+    same dispatcher closure.
     """
     import lossless_hermes
     import lossless_hermes.hermes_bridge as bridge
@@ -363,15 +393,20 @@ def test_register_wires_lcm_command(monkeypatch: pytest.MonkeyPatch) -> None:
 
     lossless_hermes.register(ctx)
 
-    ctx.register_command.assert_called_once()
-    call = ctx.register_command.call_args
-    # First positional: the command name
-    assert call.args[0] == "lcm"
-    # Second positional: the bound handler
-    handler = call.args[1]
-    assert callable(handler)
-    # kwargs: args_hint and (optionally) description
-    assert call.kwargs.get("args_hint") == "<subcommand>"
+    # Two registrations: /lcm and /lossless, in order.
+    assert ctx.register_command.call_count == 2
+    call_args_list = ctx.register_command.call_args_list
+    names = [call.args[0] for call in call_args_list]
+    assert names == ["lcm", "lossless"]
+    # Both registrations get the same handler closure (same bound method
+    # on the same dispatcher instance).
+    handler_lcm = call_args_list[0].args[1]
+    handler_lossless = call_args_list[1].args[1]
+    assert handler_lcm == handler_lossless
+    assert callable(handler_lcm)
+    # kwargs: args_hint
+    assert call_args_list[0].kwargs.get("args_hint") == "<subcommand>"
+    assert call_args_list[1].kwargs.get("args_hint") == "<subcommand>"
 
 
 def test_register_wires_dispatcher_with_engine(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,7 +428,8 @@ def test_register_wires_dispatcher_with_engine(monkeypatch: pytest.MonkeyPatch) 
 
     lossless_hermes.register(ctx)
 
-    handler = ctx.register_command.call_args.args[1]
+    # Pull the /lcm handler (first registered).
+    handler = ctx.register_command.call_args_list[0].args[1]
     # Calling the registered handler returns a real status block — the
     # dispatcher was constructed with the engine instance.
     out = handler("status")

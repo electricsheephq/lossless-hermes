@@ -373,15 +373,25 @@ def test_register_context_engine_still_called_at_02_07(
 def test_register_command_for_lcm_still_called_at_02_07(
     hermes_available: None,
 ) -> None:
-    """02-07 must not regress 02-10: ``register_command`` for ``/lcm`` is
-    still called exactly once with the dispatcher handler."""
+    """02-07 must not regress 02-10/08-01: ``register_command`` for ``/lcm``
+    is still called.
+
+    Issue 08-01 changes the call count from 1 → 2 (``/lcm`` + ``/lossless``
+    alias per plugin-glue.md line 446). This test enforces that the
+    canonical ``/lcm`` registration is still present at index 0.
+    """
     ctx = _make_stub_ctx()
     register(ctx)
-    ctx.register_command.assert_called_once()
-    call = ctx.register_command.call_args
-    assert call.args[0] == "lcm"
-    assert callable(call.args[1])
-    assert call.kwargs.get("args_hint") == "<subcommand>"
+    # Issue 08-01: two registrations (/lcm + /lossless). The canonical
+    # /lcm name MUST be the first registration.
+    assert ctx.register_command.call_count == 2
+    first_call = ctx.register_command.call_args_list[0]
+    assert first_call.args[0] == "lcm"
+    assert callable(first_call.args[1])
+    assert first_call.kwargs.get("args_hint") == "<subcommand>"
+    # Sanity: the second registration is /lossless.
+    second_call = ctx.register_command.call_args_list[1]
+    assert second_call.args[0] == "lossless"
 
 
 # ---------------------------------------------------------------------------

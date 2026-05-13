@@ -159,22 +159,95 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_end", engine._on_session_end_hook)
     ctx.register_hook("subagent_stop", engine._on_subagent_stop)
 
-    # Slash command registration (issue 02-10). The dispatcher seam is
-    # live; subcommand bodies for purge / doctor / health / worker / eval
-    # / backup / rotate / prompts / db-backup / db-info / reconcile-
-    # session-keys all land in Epic 08. Per ADR-013, owner-gating is
-    # upstream of the handler — the dispatcher receives only ``raw_args``.
+    # Slash command registration (issue 08-01 ships the router with the
+    # full 17-subcommand dispatch table; issues 08-02..08-15 fill in the
+    # handler bodies). Per ADR-013, owner-gating is upstream of the
+    # handler — the dispatcher receives only ``raw_args``.
+    #
+    # We register two slash command names that point at the same handler
+    # closure (``dispatcher.handle``):
+    #
+    # * ``/lcm``       — the more-typed name, used in operator docs.
+    # * ``/lossless``  — alias matching OpenClaw's primary surface name
+    #                    (``nativeNames.default: "lossless"`` in the TS).
+    #
+    # Per plugin-glue.md line 446 Hermes's ``register_command`` doesn't
+    # accept aliases natively, so the second registration is the documented
+    # workaround. Both names appear in ``hermes plugins list`` and the
+    # Telegram menu unless ``gateway/telegram_bot.py:telegram_bot_commands``
+    # is patched to hide one — out of scope for this issue.
     from lossless_hermes.plugin import LcmCommandDispatcher
 
     dispatcher = LcmCommandDispatcher(engine)
-    ctx.register_command(
-        "lcm",
-        dispatcher.handle,
-        description="LCM subsystem control (status, help, …)",
-        args_hint="<subcommand>",
-    )
+    for command_name in ("lcm", "lossless"):
+        ctx.register_command(
+            command_name,
+            dispatcher.handle,
+            description="LCM subsystem control (status, help, …)",
+            args_hint="<subcommand>",
+        )
+
+    # Per ADR-013 §Consequences + plugin-glue.md §"Remaining 5% risk" #4:
+    # if running in gateway mode and the operator hasn't set
+    # ``allow_admin_from`` for any platform, destructive /lcm subcommands
+    # are exposed to every allowed user. Emit a single WARNING-level
+    # banner so the misconfiguration is operator-visible.
+    _maybe_warn_unguarded_destructive_commands()
 
     _log.info(
-        "lossless-hermes plugin loaded (engine=%s, hooks=4, /lcm registered)",
+        "lossless-hermes plugin loaded (engine=%s, hooks=4, /lcm + /lossless registered)",
         engine.name,
     )
+
+
+def _maybe_warn_unguarded_destructive_commands() -> None:
+    """Emit a startup WARNING if gateway mode + no ``allow_admin_from``.
+
+    Per ADR-013 §Consequences and plugin-glue.md §"Remaining 5% risk"
+    item #4: a misconfigured ``allow_admin_from`` (empty / unset) leaves
+    destructive /lcm subcommands open to any DM-allowed user. The warning
+    is the operator-noticeable signal.
+
+    The check inspects the loaded gateway config (if any). When the
+    config is absent (CLI-only mode), this is a no-op — CLI is implicitly
+    single-user-owner per ADR-013 §Consequences.
+
+    Implementation note: Hermes's ``cfg_get`` reads the *plugin* config;
+    gateway config lives in a separate file (``gateway/run.py:944
+    _load_gateway_config``). We attempt the lookup but tolerate failure
+    so this never blocks plugin load.
+    """
+    try:
+        from gateway.config import load_gateway_config  # type: ignore[import-not-found]
+    except ImportError:
+        # CLI-only Hermes install — no gateway code on path. Safe default:
+        # don't warn (CLI doesn't expose multi-user surface).
+        return
+
+    try:
+        gateway_config = load_gateway_config()
+    except Exception:  # noqa: BLE001 — defensive against unloadable config
+        return
+
+    platforms = getattr(gateway_config, "platforms", None) or {}
+    if not platforms:
+        # No platforms configured → no multi-user exposure. Skip warning.
+        return
+
+    unguarded = []
+    for platform_name, pcfg in platforms.items():
+        extra = getattr(pcfg, "extra", None) or {}
+        if not isinstance(extra, dict):
+            continue
+        if not extra.get("allow_admin_from") and not extra.get("group_allow_admin_from"):
+            unguarded.append(platform_name)
+
+    if unguarded:
+        _log.warning(
+            "[lcm] WARNING: destructive /lcm subcommands (purge, doctor apply, "
+            "doctor clean, reconcile-session-keys, worker tick, eval, "
+            "import-openclaw) are exposed to all users on platforms %s — "
+            "set allow_admin_from in ~/.hermes/config.yaml to restrict. "
+            "See ADR-013 §Consequences.",
+            unguarded,
+        )
