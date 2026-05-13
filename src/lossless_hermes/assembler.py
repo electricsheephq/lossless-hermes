@@ -91,10 +91,12 @@ invariant explicitly.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -110,6 +112,7 @@ from lossless_hermes.store.summary import (
     SummaryRecord,
     SummaryStore,
 )
+from lossless_hermes.transcript_repair import sanitize_tool_use_result_pairing
 
 __all__ = [
     "ResolvedItem",
@@ -141,7 +144,19 @@ __all__ = [
     "extract_tool_call_id_from_block",
     "extract_tool_result_id_from_message",
     "filter_non_fresh_assistant_tool_calls",
+    # 03-08 orchestration surface.
+    "AssembleInput",
+    "AssembleResult",
+    "AssembleStats",
+    "AssembleDebug",
+    "AssemblyOverflowDiagnostics",
+    "AssemblyDuplicateCluster",
+    "AssemblyOverflowContributor",
+    "DuplicateClusterKind",
 ]
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # Tokens used by the BM25-lite selection mode label. Matches the
@@ -1325,6 +1340,268 @@ class ContextAssembler:
             summary=summary,
         )
 
+    def assemble(self, inp: AssembleInput) -> AssembleResult:
+        """Build a token-budgeted message list ready for the provider.
+
+        Top-level orchestrator that chains the Epic 03 assembler stages:
+
+        1. Read context items (``summary_store.get_context_items``).
+        2. Resolve into :class:`ResolvedItem` (:meth:`resolve_items`).
+        3. Compute fresh-tail boundary
+           (:func:`resolve_fresh_tail_ordinal`).
+        4. Compute orphan-stripping ordinal (caller override or
+           fresh-tail).
+        5. Index all tool-result ordinals by id.
+        6. Split evictable / fresh tail at the boundary.
+        7. **#628 stub-tier** (deferred per ADR-030): warn-and-skip.
+        8. Token-budget walk (:func:`budget_walk`).
+        9. Append fresh tail → ``selected``.
+        10. Build overflow diagnostics
+            (:func:`_build_overflow_diagnostics`).
+        11. Filter non-fresh assistant tool-calls
+            (:func:`filter_non_fresh_assistant_tool_calls`).
+        12. Normalize assistant content (string → array, drop blank
+            blocks).
+        13. Clean empty assistant turns (drop empty / blank /
+            thinking-only).
+        14. Pre-sanitize hashing for debug (SHA-256 of evictable,
+            fresh_tail, combined).
+        15. Sanitize tool-use ↔ tool-result pairing
+            (:func:`sanitize_tool_use_result_pairing`).
+        16. Return :class:`AssembleResult`.
+
+        Mirrors TS ``ContextAssembler.assemble`` (``assembler.ts``
+        1102-1332).
+
+        ### #628 stub-tier deferral
+
+        When :attr:`AssembleInput.stub_large_tool_payloads` is ``True``,
+        the orchestration logs a ``warning`` per ADR-030 and runs the
+        remainder of the pipeline unchanged. The actual stub
+        substitution lands in v0.2.0.
+
+        ### Empty conversation short-circuit
+
+        TS line 1109-1115: when ``get_context_items`` returns an empty
+        list, the method returns an empty :class:`AssembleResult` with
+        zero counts. The caller's safe-fallback path handles
+        downstream behavior (e.g. returning the live messages instead).
+
+        ### Debug envelope
+
+        :attr:`AssembleResult.debug` is populated only when
+        :attr:`AssembleInput.capture_debug` is ``True``. The TS source
+        always emits the debug envelope; the Python port gates it
+        because the three SHA-256 passes (TS 1295-1300) are non-trivial
+        on long conversations and the engine-side hot path doesn't
+        need them every turn.
+
+        ### estimated_tokens calculation
+
+        Mirrors TS ``estimatedTokens = evictableTokens + tailTokens``
+        (line 1235). The post-budget-walk total — does NOT account for
+        any block / message drops applied by stages 11-13 (those passes
+        only remove content and never inflate the token count, so the
+        figure is an upper bound on what the provider actually sees).
+
+        Args:
+            inp: :class:`AssembleInput` carrying conversation id,
+                budget, and selection knobs.
+
+        Returns:
+            Populated :class:`AssembleResult`. The ``messages`` field
+            is post-sanitize ready for the provider; ``estimated_tokens``
+            is the budget-walk total; ``stats`` is over the
+            pre-selection resolved set; ``debug`` is populated when
+            requested.
+        """
+        # Step 1 — context items (TS 1107).
+        context_items = self._summary_store.get_context_items(inp.conversation_id)
+        if len(context_items) == 0:
+            # TS 1109-1115 — empty short-circuit. The caller's safe-fallback
+            # path takes over downstream.
+            return AssembleResult(
+                messages=[],
+                estimated_tokens=0,
+                stats=AssembleStats(
+                    raw_message_count=0,
+                    summary_count=0,
+                    total_context_items=0,
+                ),
+                debug=None,
+            )
+
+        # Step 2 — resolve (TS 1118).
+        resolved = self.resolve_items(context_items)
+
+        # Stats over the full pre-selection set (TS 1121-1129).
+        raw_message_count = 0
+        summary_count = 0
+        for item in resolved:
+            if item.is_message:
+                raw_message_count += 1
+            else:
+                summary_count += 1
+        stats = AssembleStats(
+            raw_message_count=raw_message_count,
+            summary_count=summary_count,
+            total_context_items=len(resolved),
+        )
+
+        # Step 3 — fresh-tail boundary (TS 1132-1136).
+        fresh_tail_ordinal = resolve_fresh_tail_ordinal(
+            resolved,
+            inp.fresh_tail_count,
+            inp.fresh_tail_max_tokens,
+        )
+
+        # Step 4 — orphan-stripping ordinal (TS 1137-1142). When the caller
+        # provides a stable ordinal (e.g. from
+        # ``LCMEngine._stable_orphan_stripping_ordinals_by_conversation``),
+        # use it; otherwise fall back to the fresh-tail boundary. The TS
+        # source allows any non-negative finite number; the Python port
+        # accepts non-negative ints (``None`` → fallback).
+        if inp.orphan_stripping_ordinal is not None and inp.orphan_stripping_ordinal >= 0:
+            orphan_stripping_ordinal = inp.orphan_stripping_ordinal
+        else:
+            orphan_stripping_ordinal = fresh_tail_ordinal
+
+        # Step 5 — index all tool-result ordinals by id (TS 1143-1155).
+        # Build the map over the *resolved* set so the orphan-strip pass
+        # has visibility into whether any version of a tool-result
+        # surfaced anywhere in the conversation, even if it didn't make
+        # the budget-walk cut.
+        all_tool_result_ordinals_by_id: dict[str, list[int]] = {}
+        for item in resolved:
+            tr_id = extract_tool_result_id_from_message(item.message)
+            if tr_id is None:
+                continue
+            all_tool_result_ordinals_by_id.setdefault(tr_id, []).append(item.ordinal)
+
+        # Step 6 — split (TS 1156-1158).
+        evictable = [item for item in resolved if item.ordinal < fresh_tail_ordinal]
+        fresh_tail = [item for item in resolved if item.ordinal >= fresh_tail_ordinal]
+
+        # Step 7 — #628 stub-tier (deferred per ADR-030).
+        # Per spec AC: "logs a warning and runs the rest of the pipeline
+        # normally with no stub substitution". v0.2.0 will replace this
+        # branch with the real ``apply_stub_substitution(evictable)``
+        # call. The TS source-of-truth for v0.2.0 lives on lossless-claw
+        # main @ 13780e9.
+        if inp.stub_large_tool_payloads:
+            _LOG.warning(
+                "stub-tier deferred to v0.2.0 per ADR-030 — running pipeline without substitution"
+            )
+
+        # Step 8 — token-budget walk (TS 1160-1230). Returns
+        # ``(kept_evictable, mode)``. ``budget_walk`` already encodes the
+        # three selection modes; we only need to capture the mode for the
+        # debug envelope.
+        kept_evictable, selection_mode = budget_walk(
+            evictable,
+            fresh_tail,
+            inp.token_budget,
+            inp.prompt,
+            inp.prompt_aware_eviction,
+        )
+        evictable_kept_tokens = sum(item.tokens for item in kept_evictable)
+        tail_tokens = sum(item.tokens for item in fresh_tail)
+
+        # Step 9 — append fresh tail (TS 1233).
+        selected: list[ResolvedItem] = [*kept_evictable, *fresh_tail]
+
+        # estimatedTokens = evictableTokens + tailTokens (TS 1235).
+        estimated_tokens = evictable_kept_tokens + tail_tokens
+
+        # Step 10 — overflow diagnostics (TS 1236, only when debug is on).
+        overflow_diagnostics: AssemblyOverflowDiagnostics | None = None
+        if inp.capture_debug:
+            overflow_diagnostics = _build_overflow_diagnostics(
+                resolved,
+                selected,
+                inp.token_budget,
+            )
+
+        # Step 11 — filter non-fresh assistant tool-calls (TS 1244-1248).
+        fresh_tail_ordinals_set = {item.ordinal for item in fresh_tail}
+        filtered = filter_non_fresh_assistant_tool_calls(
+            selected,
+            fresh_tail_ordinals_set,
+            orphan_stripping_ordinal,
+            all_tool_result_ordinals_by_id,
+        )
+
+        # Steps 12 + 13 — normalize content + clean empty/thinking-only
+        # assistant turns (TS 1250-1293).
+        cleaned_entries, _normalized_entries = _normalize_and_clean_assistant_content(
+            filtered.entries,
+        )
+
+        # ``cleaned`` is the projected message list (TS 1294).
+        cleaned: list[Mapping[str, Any]] = [entry.message for entry in cleaned_entries]
+
+        # Step 14 — pre-sanitize hashing (TS 1295-1300). Compute the
+        # three SHA-256 prefixes only when the debug envelope was
+        # requested — the hashing cost is non-trivial on long
+        # conversations and most assemble() calls don't need it.
+        pre_sanitize_evictable_messages: list[Mapping[str, Any]] = []
+        pre_sanitize_fresh_tail_messages: list[Mapping[str, Any]] = []
+        if inp.capture_debug:
+            for entry in cleaned_entries:
+                if entry.segment == "evictable":
+                    pre_sanitize_evictable_messages.append(entry.message)
+                else:
+                    pre_sanitize_fresh_tail_messages.append(entry.message)
+
+        # Step 15 — sanitize tool-use ↔ tool-result pairing (TS 1301).
+        # ``sanitize_tool_use_result_pairing`` returns the original
+        # sequence when no repair was needed (identity preserved) — we
+        # materialise to a list either way so callers can mutate the
+        # result without affecting the cleaned cache.
+        repaired_seq = sanitize_tool_use_result_pairing(cleaned)
+        repaired: list[dict[str, Any]] = [
+            dict(m) if isinstance(m, Mapping) else m for m in repaired_seq
+        ]
+
+        # Step 16 — return (TS 1302-1331).
+        debug: AssembleDebug | None = None
+        if inp.capture_debug:
+            # The overflow_diagnostics field is guaranteed non-None when
+            # capture_debug is True (built above).
+            assert overflow_diagnostics is not None  # for ty narrowing
+            remaining_budget = max(0, inp.token_budget - tail_tokens)
+            evictable_total_tokens = sum(item.tokens for item in evictable)
+            debug = AssembleDebug(
+                fresh_tail_ordinal=fresh_tail_ordinal,
+                orphan_stripping_ordinal=orphan_stripping_ordinal,
+                base_fresh_tail_count=len(fresh_tail),
+                fresh_tail_count=len(fresh_tail),
+                tail_tokens=tail_tokens,
+                remaining_budget=remaining_budget,
+                evictable_total_tokens=evictable_total_tokens,
+                selection_mode=selection_mode,
+                # v0.2.0 #628 stub-tier counters — always 0 / [] in v0.1.0
+                # per ADR-030.
+                promoted_tool_result_count=0,
+                promoted_ordinals=[],
+                removed_tool_use_block_count=filtered.removed_tool_use_block_count,
+                touched_assistant_message_count=filtered.touched_assistant_message_count,
+                pre_sanitize_evictable_count=len(pre_sanitize_evictable_messages),
+                pre_sanitize_fresh_tail_count=len(pre_sanitize_fresh_tail_messages),
+                pre_sanitize_evictable_hash=_hash_messages(pre_sanitize_evictable_messages),
+                pre_sanitize_fresh_tail_hash=_hash_messages(pre_sanitize_fresh_tail_messages),
+                pre_sanitize_messages_hash=_hash_messages(cleaned),
+                final_messages_hash=_hash_messages(repaired),
+                overflow_diagnostics=overflow_diagnostics,
+            )
+
+        return AssembleResult(
+            messages=repaired,
+            estimated_tokens=estimated_tokens,
+            stats=stats,
+            debug=debug,
+        )
+
 
 # ---------------------------------------------------------------------------
 # BM25-lite relevance scorer (TS 1037-1080)
@@ -2304,3 +2581,734 @@ def filter_non_fresh_assistant_tool_calls(
         removed_tool_use_block_count=removed_tool_use_block_count,
         touched_assistant_message_count=touched_assistant_message_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestration — assemble() public API (TS 1102-1332)
+# ---------------------------------------------------------------------------
+
+
+# Duplicate-cluster kind labels — mirror TS union literal at
+# ``assembler.ts`` line 48 (``AssemblyDuplicateCluster.kind``). The string
+# values are part of the debug envelope serialization and are observed by
+# downstream tooling, so porting verbatim preserves wire compatibility.
+DuplicateClusterKind = Literal["message-ref", "summary-ref", "message-content"]
+
+
+# Blocks that count as "model-internal reasoning" and will be stripped by
+# the provider layer before being sent to the API. If an assistant message
+# contains ONLY these block types, it is treated as empty (TS line 92-93).
+# Bedrock / Anthropic reject messages that present an empty content array,
+# so the empty-assistant cleanup pass drops them.
+_THINKING_LIKE_TYPES: Final[frozenset[str]] = frozenset({
+    "thinking",
+    "redacted_thinking",
+    "reasoning",
+})
+
+
+def _is_blank_text_block(block: Any) -> bool:
+    """Return ``True`` if ``block`` is a ``{type:"text", text:""}`` shape.
+
+    Mirrors TS ``isBlankTextBlock`` (``assembler.ts`` 107-114). The
+    whitespace-only check uses ``str.strip()`` for parity with TS
+    ``text.trim()``. Non-text blocks (``tool_use``, ``thinking``, etc.)
+    always return ``False`` — they are not "blank text" even when their
+    text-like fields are empty.
+
+    Args:
+        block: Anything; non-Mapping inputs return ``False``.
+
+    Returns:
+        ``True`` only when ``block`` is a dict with ``type == "text"`` and
+        ``text`` is a string that is empty or whitespace-only.
+    """
+    if not isinstance(block, Mapping):
+        return False
+    if block.get("type") != "text":
+        return False
+    text = block.get("text")
+    if not isinstance(text, str):
+        return False
+    return text.strip() == ""
+
+
+def _is_blank_content(content: Sequence[Any]) -> bool:
+    """Return ``True`` if every block in ``content`` is a blank text block.
+
+    Mirrors TS ``isBlankContent`` (``assembler.ts`` 121-124). Bedrock
+    rejects assistant messages whose content array is, e.g.,
+    ``[{type:"text", text:""}]`` with "The text field in the
+    ContentBlock object at messages.N.content.0 is blank", so this
+    predicate exists to filter those out before they hit the provider.
+
+    Empty arrays return ``False`` — the empty-content branch in
+    :meth:`ContextAssembler.assemble` checks ``len(content) == 0``
+    separately. Mirrors TS line 122 ``if (content.length === 0) return
+    false``.
+    """
+    if len(content) == 0:
+        return False
+    return all(_is_blank_text_block(block) for block in content)
+
+
+def _is_thinking_only_content(content: Sequence[Any]) -> bool:
+    """Return ``True`` if every block in ``content`` is a thinking/reasoning block.
+
+    Mirrors TS ``isThinkingOnlyContent`` (``assembler.ts`` 97-105).
+    Anthropic-side and Bedrock-side reasoning blocks are stripped by
+    the provider layer before being sent to the API; if an assistant
+    message's content is ONLY reasoning, the post-strip content is
+    empty, which the providers then reject.
+
+    Empty arrays return ``False`` — mirrors TS line 98 ``if
+    (content.length === 0) return false``. Combined with
+    :func:`_is_blank_content` and the explicit ``len(content) == 0``
+    check, the empty-assistant cleanup covers all three failure modes.
+    """
+    if len(content) == 0:
+        return False
+    return all(
+        isinstance(block, Mapping) and block.get("type") in _THINKING_LIKE_TYPES
+        for block in content
+    )
+
+
+def _hash_messages(messages: Sequence[Mapping[str, Any]]) -> str:
+    """SHA-256 prefix of ``messages`` serialised as JSON.
+
+    Mirrors TS ``hashMessages`` (``assembler.ts`` 780-782):
+
+    .. code-block:: typescript
+
+        createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16)
+
+    The 16-character truncation is load-bearing for cache-stability
+    debug pairing: the engine-side prefix-stability snapshot reads
+    these hashes to detect inter-turn drift, and stretching to the full
+    64 chars would inflate every debug envelope by ~150 bytes per turn
+    for no gain (the cardinality is bounded by the number of distinct
+    assemble() outputs over the lifetime of a conversation, which the
+    16-hex-character space comfortably covers).
+
+    ``json.dumps`` defaults to insertion-order preservation (Python 3.7+
+    dict iteration order), with no extra whitespace — matching TS
+    ``JSON.stringify`` byte-for-byte for the cases we hash here
+    (runtime message dicts have well-defined key orderings).
+
+    Args:
+        messages: A sequence of runtime message dicts.
+
+    Returns:
+        Lowercase hex string of length 16.
+    """
+    # ``separators=(",", ":")`` matches JS ``JSON.stringify`` (no spaces
+    # after commas/colons). The TS source uses the default
+    # ``JSON.stringify(messages)`` which produces exactly that form.
+    # ``sort_keys=False`` preserves insertion order (Python 3.7+ dict
+    # iteration), parity with JS object iteration order.
+    serialized = json.dumps(messages, separators=(",", ":"), sort_keys=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _hash_text(text: str) -> str:
+    """SHA-256 prefix of ``text``.
+
+    Mirrors TS ``hashText`` (``assembler.ts`` 784-786). Used as the key
+    for :func:`_build_message_content_duplicate_clusters` (clusters
+    items whose ``text`` field hashes to the same value). 16 chars is
+    enough cardinality to avoid collisions across a single
+    conversation's history.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Overflow-diagnostics dataclasses (TS 16-78 interfaces)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class AssemblyOverflowContributor:
+    """Top-N token contributor for the overflow-diagnostics envelope.
+
+    Mirrors TS ``interface AssemblyOverflowContributor`` (``assembler.ts``
+    15-34). The shape is part of the public debug surface — downstream
+    operators consume it to identify which items are pushing the
+    context over budget.
+
+    Attributes:
+        ordinal: Position of the item in the persisted conversation
+            window (``context_items.ordinal``).
+        tokens: :func:`estimate_tokens` figure for the emitted item.
+        selected: Whether the item survived the budget walk.
+        message_id: Raw-message primary key (only set when the item is
+            a message).
+        seq: Raw-message conversation-sequence (only set when the item
+            is a message).
+        role: Raw-message role (only set when the item is a message).
+        summary_id: Summary primary key (only set when the item is a
+            summary).
+        summary_kind: ``"leaf"`` / ``"condensed"`` (only set when the
+            item is a summary).
+        summary_depth: 0 / 1+ (only set when the item is a summary).
+    """
+
+    ordinal: int
+    tokens: int
+    selected: bool
+    message_id: int | None = None
+    seq: int | None = None
+    role: str | None = None
+    summary_id: str | None = None
+    summary_kind: str | None = None
+    summary_depth: int | None = None
+
+
+@dataclass(slots=True)
+class AssemblyDuplicateCluster:
+    """A group of items that share a duplicate-detection key.
+
+    Mirrors TS ``interface AssemblyDuplicateCluster`` (``assembler.ts``
+    36-49). The duplicate-cluster diagnostics call out duplicates by
+    reference (same ``messageId`` / ``summaryId`` appearing multiple
+    times) and by content hash (same SHA-256 of plain-text rendering).
+
+    Attributes:
+        key: Cluster key — either ``"message:<id>"`` /
+            ``"summary:<id>"`` for refs or a 16-char SHA-256 prefix
+            for content.
+        kind: Discriminator: ``"message-ref"``, ``"summary-ref"``, or
+            ``"message-content"``.
+        count: Number of items in the cluster (always ``>= 2``).
+        tokens: Sum of ``item.tokens`` across the cluster.
+        ordinals: Up to first 8 ordinals of cluster members.
+        seqs: Up to first 8 ``seq`` values when items are messages.
+            ``None`` when no member has a ``seq``.
+    """
+
+    key: str
+    kind: DuplicateClusterKind
+    count: int
+    tokens: int
+    ordinals: list[int]
+    seqs: list[int] | None = None
+
+
+@dataclass(slots=True)
+class AssemblyOverflowDiagnostics:
+    """Per-assemble overflow-diagnostics envelope.
+
+    Mirrors TS ``interface AssemblyOverflowDiagnostics`` (``assembler.ts``
+    51-78). Returned as part of :class:`AssembleDebug.overflow_diagnostics`
+    when debug telemetry is requested.
+
+    Attributes:
+        token_budget: Budget used by this assembly pass.
+        total_context_tokens: ``sum(item.tokens for item in resolved)``.
+        raw_message_tokens: Token sum across raw-message items only.
+        summary_tokens: Token sum across summary items only.
+        raw_message_count: Number of resolved raw messages
+            (pre-selection).
+        summary_count: Number of resolved summaries (pre-selection).
+        total_context_items: ``len(resolved)``.
+        selected_raw_message_count: Number of raw-message items kept
+            after budget walk.
+        selected_summary_count: Number of summary items kept after
+            budget walk.
+        duplicate_ref_clusters: Reference-key clusters (e.g., same
+            messageId resolved twice).
+        duplicate_message_clusters: Content-hash clusters (same text
+            payload across distinct messageIds).
+        top_message_contributors: Up to 5 largest raw-message
+            contributors.
+        top_summary_contributors: Up to 5 largest summary
+            contributors.
+    """
+
+    token_budget: int
+    total_context_tokens: int
+    raw_message_tokens: int
+    summary_tokens: int
+    raw_message_count: int
+    summary_count: int
+    total_context_items: int
+    selected_raw_message_count: int
+    selected_summary_count: int
+    duplicate_ref_clusters: list[AssemblyDuplicateCluster]
+    duplicate_message_clusters: list[AssemblyDuplicateCluster]
+    top_message_contributors: list[AssemblyOverflowContributor]
+    top_summary_contributors: list[AssemblyOverflowContributor]
+
+
+def _top_contributors(
+    items: Sequence[ResolvedItem],
+    selected_ordinals: set[int],
+    is_message: bool,
+) -> list[AssemblyOverflowContributor]:
+    """Pick the top-5 token contributors of the given kind.
+
+    Mirrors TS ``topContributors`` (``assembler.ts`` 877-902).
+
+    1. Filter items by ``is_message`` flag.
+    2. Sort by ``(-tokens, ordinal)`` — largest token-cost first, ties
+       broken by smaller ordinal (older wins on tie).
+    3. Slice to first 5.
+    4. Project to :class:`AssemblyOverflowContributor` with the
+       per-kind optional fields set (messageId/seq/role for raw
+       messages; summaryId/summaryKind/summaryDepth for summaries).
+
+    Args:
+        items: All resolved items (pre-selection).
+        selected_ordinals: Set of ordinals that survived the budget
+            walk. Used to mark each contributor's ``selected`` flag.
+        is_message: When ``True``, project raw-message items; when
+            ``False``, project summary items.
+
+    Returns:
+        Up to 5 :class:`AssemblyOverflowContributor` instances.
+    """
+    # Filter, sort, slice. The TS sort comparator is
+    # ``b.tokens - a.tokens || a.ordinal - b.ordinal`` (TS line 885) —
+    # tokens descending, ordinal ascending. Python translates to
+    # ``key=lambda i: (-i.tokens, i.ordinal)`` with default ascending sort.
+    kind_items = [item for item in items if item.is_message is is_message]
+    kind_items.sort(key=lambda i: (-i.tokens, i.ordinal))
+    selected_subset = kind_items[:5]
+
+    contributors: list[AssemblyOverflowContributor] = []
+    for item in selected_subset:
+        contributor = AssemblyOverflowContributor(
+            ordinal=item.ordinal,
+            tokens=item.tokens,
+            selected=item.ordinal in selected_ordinals,
+        )
+        # Per-kind optional fields — mirror TS spread (assembler.ts
+        # 891-900). The TS source uses conditional spreads
+        # (``...(item.messageId != null ? { messageId: item.messageId } : {})``);
+        # the Python translation sets the field only when present.
+        if item.message_id is not None:
+            contributor.message_id = item.message_id
+        if item.seq is not None:
+            contributor.seq = item.seq
+        if item.source_role is not None:
+            contributor.role = item.source_role
+        if item.summary is not None:
+            contributor.summary_id = item.summary.summary_id
+            contributor.summary_kind = item.summary.kind
+            contributor.summary_depth = item.summary.depth
+        contributors.append(contributor)
+
+    return contributors
+
+
+def _build_ref_duplicate_clusters(
+    items: Sequence[ResolvedItem],
+) -> list[AssemblyDuplicateCluster]:
+    """Build duplicate-reference clusters keyed by messageId/summaryId.
+
+    Mirrors TS ``buildRefDuplicateClusters`` (``assembler.ts`` 904-920).
+    Items missing a usable key (e.g. an items malformed enough that
+    both ``message_id`` and ``summary`` are absent) are skipped silently.
+
+    Args:
+        items: All resolved items (pre-selection).
+
+    Returns:
+        Sorted list of clusters with ``count >= 2``. Empty when no
+        reference duplicates exist.
+    """
+    clusters: dict[str, list[ResolvedItem]] = {}
+    for item in items:
+        key: str | None
+        if item.is_message:
+            key = f"message:{item.message_id}" if item.message_id is not None else None
+        else:
+            key = f"summary:{item.summary.summary_id}" if item.summary is not None else None
+        if key is None:
+            continue
+        clusters.setdefault(key, []).append(item)
+
+    def _kind_for_key(key: str) -> DuplicateClusterKind:
+        return "message-ref" if key.startswith("message:") else "summary-ref"
+
+    return _format_duplicate_clusters(clusters, _kind_for_key)
+
+
+def _build_message_content_duplicate_clusters(
+    items: Sequence[ResolvedItem],
+) -> list[AssemblyDuplicateCluster]:
+    """Build duplicate-content clusters keyed by SHA-256 of ``item.text``.
+
+    Mirrors TS ``buildMessageContentDuplicateClusters`` (``assembler.ts``
+    922-934). Only raw-message items with non-empty text qualify —
+    summaries are excluded (their text is the un-wrapped summary content,
+    which by construction is unique across the DAG).
+
+    Args:
+        items: All resolved items (pre-selection).
+
+    Returns:
+        Sorted list of clusters with ``count >= 2`` where every cluster
+        member is a raw message.
+    """
+    clusters: dict[str, list[ResolvedItem]] = {}
+    for item in items:
+        if not item.is_message or len(item.text) == 0:
+            continue
+        clusters.setdefault(_hash_text(item.text), []).append(item)
+
+    return _format_duplicate_clusters(clusters, lambda _k: "message-content")
+
+
+def _format_duplicate_clusters(
+    clusters: Mapping[str, list[ResolvedItem]],
+    kind_for_key: Any,  # Callable[[str], DuplicateClusterKind]
+) -> list[AssemblyDuplicateCluster]:
+    """Project a cluster map to sorted, capped :class:`AssemblyDuplicateCluster`.
+
+    Mirrors TS ``formatDuplicateClusters`` (``assembler.ts`` 936-954).
+    Filters singletons (TS uses ``filter(([, items]) => items.length >
+    1)``), aggregates tokens/ordinals/seqs, sorts by ``(-tokens,
+    -count, key)`` for stable diagnostic ordering, and caps the result
+    at 5 entries.
+
+    The per-cluster ``ordinals`` and ``seqs`` lists are capped at 8
+    entries each (TS line 947, 949). The seq cap is conditional —
+    omitted entirely when no cluster member has a ``seq``.
+
+    Args:
+        clusters: Map from key → cluster members.
+        kind_for_key: Callable that produces a
+            :data:`DuplicateClusterKind` label for each key.
+
+    Returns:
+        Up to 5 :class:`AssemblyDuplicateCluster` records.
+    """
+    formatted: list[AssemblyDuplicateCluster] = []
+    for key, cluster_items in clusters.items():
+        if len(cluster_items) <= 1:
+            continue
+        # Tokens accumulator + per-cluster ordinal/seq capture. The TS
+        # source does this in one list-comprehension chain
+        # (``items.reduce(...) ... items.map(...)``); Python's explicit
+        # loops are equivalent and slightly easier to debug.
+        tokens = sum(item.tokens for item in cluster_items)
+        ordinals = [item.ordinal for item in cluster_items[:8]]
+        has_any_seq = any(item.seq is not None for item in cluster_items)
+        seqs: list[int] | None
+        if has_any_seq:
+            seqs = [item.seq for item in cluster_items if item.seq is not None][:8]
+        else:
+            seqs = None
+        formatted.append(
+            AssemblyDuplicateCluster(
+                key=key,
+                kind=kind_for_key(key),
+                count=len(cluster_items),
+                tokens=tokens,
+                ordinals=ordinals,
+                seqs=seqs,
+            )
+        )
+
+    # Sort by (tokens desc, count desc, key asc). The TS source uses
+    # ``b.tokens - a.tokens || b.count - a.count || a.key.localeCompare(b.key)``
+    # which translates to ``key=(-tokens, -count, key)`` with default
+    # ascending sort.
+    formatted.sort(key=lambda c: (-c.tokens, -c.count, c.key))
+    return formatted[:5]
+
+
+def _build_overflow_diagnostics(
+    resolved: Sequence[ResolvedItem],
+    selected: Sequence[ResolvedItem],
+    token_budget: int,
+) -> AssemblyOverflowDiagnostics:
+    """Assemble the per-assemble overflow-diagnostics envelope.
+
+    Mirrors TS ``buildOverflowDiagnostics`` (``assembler.ts`` 956-981).
+    Aggregates token totals, duplicate clusters, and top-N contributors
+    for the debug-stream consumers.
+
+    Args:
+        resolved: All resolved items (pre-selection).
+        selected: Items that survived the budget walk.
+        token_budget: The budget used by this assemble pass.
+
+    Returns:
+        Populated :class:`AssemblyOverflowDiagnostics`.
+    """
+    selected_ordinals = {item.ordinal for item in selected}
+    raw_message_items = [item for item in resolved if item.is_message]
+    summary_items = [item for item in resolved if not item.is_message]
+    return AssemblyOverflowDiagnostics(
+        token_budget=token_budget,
+        total_context_tokens=sum(item.tokens for item in resolved),
+        raw_message_tokens=sum(item.tokens for item in raw_message_items),
+        summary_tokens=sum(item.tokens for item in summary_items),
+        raw_message_count=len(raw_message_items),
+        summary_count=len(summary_items),
+        total_context_items=len(resolved),
+        selected_raw_message_count=sum(1 for item in selected if item.is_message),
+        selected_summary_count=sum(1 for item in selected if not item.is_message),
+        duplicate_ref_clusters=_build_ref_duplicate_clusters(resolved),
+        duplicate_message_clusters=_build_message_content_duplicate_clusters(resolved),
+        top_message_contributors=_top_contributors(resolved, selected_ordinals, True),
+        top_summary_contributors=_top_contributors(resolved, selected_ordinals, False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# AssembleInput / AssembleResult / AssembleStats / AssembleDebug
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class AssembleInput:
+    """Inputs to :meth:`ContextAssembler.assemble`.
+
+    Mirrors TS ``interface AssembleContextInput`` (``assembler.ts``
+    128-141). All fields except ``conversation_id`` and ``token_budget``
+    carry defaults so callers can pass a minimal struct.
+
+    Attributes:
+        conversation_id: Scope for :meth:`SummaryStore.get_context_items`.
+        token_budget: Total budget for this assembly pass. Fresh tail
+            may exceed the budget; the eviction loop only enforces the
+            remaining budget after the tail.
+        fresh_tail_count: Maximum number of raw messages to protect
+            from eviction. Default 8 (TS line 132).
+        fresh_tail_max_tokens: Optional token cap on the protected
+            tail. The newest message is always preserved even if it
+            alone exceeds this cap.
+        prompt: Optional user query for BM25-lite-scored selection.
+            ``None`` / whitespace falls back to chronological mode.
+        prompt_aware_eviction: When ``False``, forces chronological
+            mode even when a searchable prompt is present. Default
+            ``True``.
+        orphan_stripping_ordinal: Stable boundary for orphan
+            tool-use stripping during hot-cache turns. Defaults to
+            the fresh-tail ordinal at assemble time when ``None``
+            (cold-cache fallback). Engine-side callers pin this
+            across turns via
+            ``LCMEngine._stable_orphan_stripping_ordinals_by_conversation``.
+        stub_large_tool_payloads: v0.2.0 #628 stub-tier toggle. In
+            v0.1.0 this is **a no-op + warning** per ADR-030.
+        capture_debug: Whether to populate :attr:`AssembleResult.debug`.
+            Off by default to avoid the SHA-256 hashing cost on every
+            assemble call.
+    """
+
+    conversation_id: int
+    token_budget: int
+    fresh_tail_count: int = 8
+    fresh_tail_max_tokens: int | None = None
+    prompt: str | None = None
+    prompt_aware_eviction: bool = True
+    orphan_stripping_ordinal: int | None = None
+    # Deferred per ADR-030; accepted for forward-compat but treated as
+    # no-op + warning. Tests assert the warning path doesn't raise.
+    stub_large_tool_payloads: bool = False
+    # Off-by-default debug capture — populating ``AssembleResult.debug``
+    # requires three SHA-256 passes on the assembled message list (TS
+    # 1295-1300) which are non-trivial on long conversations. Engine-side
+    # callers flip this on when surfacing diagnostics, off in steady-state.
+    capture_debug: bool = False
+
+
+@dataclass(slots=True)
+class AssembleStats:
+    """Stats envelope on :class:`AssembleResult`.
+
+    Mirrors TS ``AssembleContextResult.stats`` (``assembler.ts``
+    149-153). Counters are over the **pre-selection** resolved set so
+    callers can spot when the budget walk dropped a lot of items.
+    """
+
+    raw_message_count: int
+    summary_count: int
+    total_context_items: int
+
+
+@dataclass(slots=True)
+class AssembleDebug:
+    """Optional debug envelope on :class:`AssembleResult`.
+
+    Mirrors TS ``AssembleContextResult.debug`` (``assembler.ts``
+    154-176). Populated only when :attr:`AssembleInput.capture_debug`
+    is ``True``. The three SHA-256 hashes are load-bearing for the
+    engine-side prefix-stability snapshot — comparing
+    ``pre_sanitize_messages_hash`` across consecutive assemble() calls
+    detects inter-turn drift.
+
+    Attributes:
+        fresh_tail_ordinal: Smallest ordinal in the protected tail
+            (:data:`EMPTY_FRESH_TAIL_ORDINAL` when no tail).
+        orphan_stripping_ordinal: Resolved ordinal used by
+            :func:`filter_non_fresh_assistant_tool_calls` (either the
+            caller's override or the fresh-tail ordinal).
+        base_fresh_tail_count: Tail size before any filter passes
+            (always equal to ``fresh_tail_count`` in v0.1.0; the
+            ``baseFreshTail``-vs-``freshTail`` distinction was for the
+            #628 stub-tier path which is deferred per ADR-030).
+        fresh_tail_count: Final tail size.
+        tail_tokens: ``sum(item.tokens for item in fresh_tail)``.
+        remaining_budget: ``max(0, token_budget - tail_tokens)``.
+        evictable_total_tokens: ``sum(item.tokens for item in evictable)``.
+        selection_mode: Which budget-walk branch executed.
+        promoted_tool_result_count: v0.2.0 #628 stub-tier counter.
+            Always ``0`` in v0.1.0 (ADR-030).
+        promoted_ordinals: v0.2.0 #628 stub-tier list. Always ``[]``
+            in v0.1.0.
+        removed_tool_use_block_count: Per-message counter from
+            :func:`filter_non_fresh_assistant_tool_calls`.
+        touched_assistant_message_count: Per-message counter from
+            :func:`filter_non_fresh_assistant_tool_calls`.
+        pre_sanitize_evictable_count: Size of the evictable bucket
+            after orphan-stripping + content-normalization, before
+            :func:`sanitize_tool_use_result_pairing`.
+        pre_sanitize_fresh_tail_count: Size of the fresh-tail bucket
+            at the same point.
+        pre_sanitize_evictable_hash: SHA-256(16-char) of the
+            pre-sanitize evictable messages, JSON-serialised.
+        pre_sanitize_fresh_tail_hash: SHA-256(16-char) of the
+            pre-sanitize fresh-tail messages.
+        pre_sanitize_messages_hash: SHA-256(16-char) of the
+            pre-sanitize combined messages.
+        final_messages_hash: SHA-256(16-char) of the post-sanitize
+            final messages.
+        overflow_diagnostics: Token/duplicate diagnostics envelope.
+    """
+
+    fresh_tail_ordinal: int
+    orphan_stripping_ordinal: int
+    base_fresh_tail_count: int
+    fresh_tail_count: int
+    tail_tokens: int
+    remaining_budget: int
+    evictable_total_tokens: int
+    selection_mode: SelectionMode
+    promoted_tool_result_count: int
+    promoted_ordinals: list[int]
+    removed_tool_use_block_count: int
+    touched_assistant_message_count: int
+    pre_sanitize_evictable_count: int
+    pre_sanitize_fresh_tail_count: int
+    pre_sanitize_evictable_hash: str
+    pre_sanitize_fresh_tail_hash: str
+    pre_sanitize_messages_hash: str
+    final_messages_hash: str
+    overflow_diagnostics: AssemblyOverflowDiagnostics
+
+
+@dataclass(slots=True)
+class AssembleResult:
+    """Output of :meth:`ContextAssembler.assemble`.
+
+    Mirrors TS ``interface AssembleContextResult`` (``assembler.ts``
+    143-176).
+
+    Attributes:
+        messages: Final, sanitize-pass-clean message list ready for
+            the provider. Empty list when the conversation has no
+            context items.
+        estimated_tokens: ``evictable_kept_tokens + fresh_tail_tokens``.
+            The post-budget-walk total (NOT including any drift from
+            content normalization or tool-call stripping — those passes
+            do not add tokens; they only drop blocks/messages).
+        stats: Pre-selection :class:`AssembleStats` envelope.
+        debug: Optional :class:`AssembleDebug` envelope when the input
+            requested it via :attr:`AssembleInput.capture_debug`.
+    """
+
+    messages: list[dict[str, Any]]
+    estimated_tokens: int
+    stats: AssembleStats
+    debug: AssembleDebug | None = None
+
+
+# ---------------------------------------------------------------------------
+# ContextAssembler.assemble — top-level orchestration
+# ---------------------------------------------------------------------------
+
+
+def _normalize_and_clean_assistant_content(
+    entries: Sequence[FilteredEntry],
+) -> tuple[list[FilteredEntry], list[FilteredEntry]]:
+    """Normalize assistant content and drop empty/thinking-only turns.
+
+    Implements TS ``assembler.ts`` 1250-1293 in one pass: the two-stage
+    cleanup runs as a single normalization pass over the entries list
+    (string-content → ``[{type:"text"}]`` array + blank-text-block
+    filter) followed by a drop-empty-assistants pass.
+
+    Splits behavior across two stages purely to keep the docstring
+    short — the actual code is one filter + one map.
+
+    Returns:
+        Pair ``(cleaned_entries, normalized_entries)``. The second
+        item is the post-normalization-before-cleanup list (used by
+        callers that want to count how many turns the cleanup pass
+        dropped).
+    """
+    # Stage 1: normalize content (TS 1250-1274). Each entry's message
+    # is rebuilt only when the content needed reshaping — otherwise the
+    # original entry passes through with no allocation.
+    normalized: list[FilteredEntry] = []
+    for entry in entries:
+        msg = entry.message
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+            # String-content assistant → wrap in a single text block.
+            # Some providers (OpenAI Chat) emit content as a plain
+            # string; Anthropic expects an array. Round-tripping through
+            # the array form is byte-compatible for both.
+            normalized.append(
+                FilteredEntry(
+                    message={
+                        **msg,
+                        "content": [{"type": "text", "text": msg["content"]}],
+                    },
+                    segment=entry.segment,
+                )
+            )
+            continue
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            content_list = msg["content"]
+            filtered_blocks = [block for block in content_list if not _is_blank_text_block(block)]
+            if len(filtered_blocks) != len(content_list):
+                # Some blank text blocks were stripped — rebuild.
+                normalized.append(
+                    FilteredEntry(
+                        message={**msg, "content": filtered_blocks},
+                        segment=entry.segment,
+                    )
+                )
+                continue
+        normalized.append(entry)
+
+    # Stage 2: drop empty / blank / thinking-only assistant turns
+    # (TS 1283-1293). Bedrock + Anthropic reject these. The cleanup
+    # is identity-preserving for non-assistant entries.
+    cleaned: list[FilteredEntry] = []
+    for entry in normalized:
+        msg = entry.message
+        if msg.get("role") != "assistant":
+            cleaned.append(entry)
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            # Empty / thinking-only / blank-only → drop.
+            if (
+                len(content) == 0
+                or _is_thinking_only_content(content)
+                or _is_blank_content(content)
+            ):
+                continue
+        else:
+            # String content: drop when None / empty / whitespace-only.
+            if not isinstance(content, str) or content.strip() == "":
+                continue
+        cleaned.append(entry)
+
+    return cleaned, normalized
