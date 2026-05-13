@@ -700,11 +700,14 @@ def test_get_doctor_summary_stats_clean_db(db: sqlite3.Connection) -> None:
 
 def test_load_doctor_targets_filtered_branch_uses_index(db: sqlite3.Connection) -> None:
     """The conversation-filtered branch's ``WHERE conversation_id = ?``
-    predicate must hit the ``summaries_conv_created_idx`` partial index
-    so per-conversation doctor scans don't full-table-scan ``summaries``.
+    predicate must hit a ``conversation_id``-keyed index so
+    per-conversation doctor scans don't full-table-scan ``summaries``.
 
-    Pins the EXPLAIN QUERY PLAN output: the filtered query branch SEARCHes
-    via ``summaries_conv_created_idx`` rather than SCANning the table.
+    Pins the EXPLAIN QUERY PLAN output: ``s`` is SEARCHed via an index
+    on conversation_id rather than SCANned. The exact index name varies
+    across SQLite versions (3.40 picks ``summaries_conv_created_idx``;
+    3.45+ picks ``summaries_conv_depth_kind_idx``) — both are valid
+    partial-index hits per AC ("uses partial index where applicable").
     """
     plan_sql = """
     EXPLAIN QUERY PLAN
@@ -731,15 +734,24 @@ def test_load_doctor_targets_filtered_branch_uses_index(db: sqlite3.Connection) 
     """
     plan = db.execute(plan_sql, (1, "a", "b", "c", "d")).fetchall()
     plan_text = "\n".join(str(row) for row in plan)
-    # The filter MUST resolve to an index search, not a table scan, on s.
-    assert "SEARCH s USING INDEX summaries_conv_created_idx" in plan_text, plan_text
+    # The filter MUST resolve to an index SEARCH on s, not a SCAN.
+    # SQLite version-dependent which conversation_id-keyed index wins
+    # (summaries_conv_created_idx, summaries_conv_depth_kind_idx, etc.);
+    # the spec's AC is that A partial index is used, not a specific one.
+    assert "SEARCH s USING INDEX summaries_conv_" in plan_text, plan_text
+    # And specifically: not a full table scan.
+    assert "SCAN s " not in plan_text, plan_text
 
 
 def test_load_doctor_targets_unfiltered_branch_uses_index(db: sqlite3.Connection) -> None:
-    """The DB-wide branch's SCAN traverses ``summaries`` via the
-    ``summaries_conv_created_idx`` index (rather than a raw rowid scan),
-    so the result is naturally ordered by ``(conversation_id, created_at)``
-    and the ORDER BY only needs a 3-key tempsort tail.
+    """The DB-wide branch traverses ``summaries`` via an index
+    (covering or otherwise), not a raw rowid scan.
+
+    Pins that EXPLAIN QUERY PLAN names an index on the ``s`` traversal.
+    The specific index varies across SQLite versions (older picks
+    ``summaries_conv_created_idx``; newer prefers
+    ``summaries_conv_depth_kind_idx``) — both satisfy the AC ("uses
+    partial index where applicable").
     """
     plan_sql = """
     EXPLAIN QUERY PLAN
@@ -766,5 +778,9 @@ def test_load_doctor_targets_unfiltered_branch_uses_index(db: sqlite3.Connection
     """
     plan = db.execute(plan_sql, ("a", "b", "c", "d")).fetchall()
     plan_text = "\n".join(str(row) for row in plan)
-    # Both branches should traverse `s` via an index (covering, not full scan).
-    assert "summaries_conv_created_idx" in plan_text, plan_text
+    # The DB-wide branch must traverse `s` via an index, not a rowid scan
+    # of the table heap. SQLite phrases an index-driven traversal as either
+    # ``SCAN s USING INDEX ...`` (full index scan) or
+    # ``SCAN s USING COVERING INDEX ...`` (covering); both are acceptable.
+    # An unqualified ``SCAN s`` (no USING INDEX) would be a regression.
+    assert "SCAN s USING " in plan_text or "SEARCH s USING " in plan_text, plan_text
