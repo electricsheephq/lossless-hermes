@@ -191,9 +191,44 @@ def _insert_cache_row(
     cache_id: str,
     leaf_summary_id: str,
 ) -> None:
+    # Seed a prompt-registry row (FK target). Idempotent INSERT OR IGNORE so
+    # repeated calls in a single test don't trip the UNIQUE constraint.
     conn.execute(
-        "INSERT INTO lcm_synthesis_cache (cache_id, content) VALUES (?, ?)",
-        (cache_id, "cached content"),
+        """
+        INSERT OR IGNORE INTO lcm_prompt_registry
+          (prompt_id, memory_type, pass_kind, version, template, active)
+        VALUES (?, ?, ?, ?, ?, 1)
+        """,
+        ("prompt_test", "episodic-leaf", "single", 1, "test template"),
+    )
+    # All NOT-NULL columns must be supplied. Wave-10 hardening added
+    # session_key + tier_label + prompt_id; #01-04's lighter cache schema
+    # was widened in #01-06 — see ADR-029 entry "Wave-10".
+    conn.execute(
+        """
+        INSERT INTO lcm_synthesis_cache (
+          cache_id, session_key, range_start, range_end, leaf_fingerprint,
+          content, model_used, prompt_id, tier_label,
+          source_leaf_ids, source_token_count, output_token_count,
+          actual_range_covered, leaf_count_synthesized
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cache_id,
+            "test_session",  # session_key
+            "2026-05-13T00:00:00Z",  # range_start
+            "2026-05-13T23:59:59Z",  # range_end
+            "deadbeef" * 4,  # leaf_fingerprint
+            "cached content",  # content
+            "test-model",  # model_used
+            "prompt_test",  # prompt_id (FK)
+            "custom",  # tier_label
+            "[]",  # source_leaf_ids
+            100,  # source_token_count
+            50,  # output_token_count
+            "2026-05-13T00:00:00Z/2026-05-13T23:59:59Z",  # actual_range_covered
+            1,  # leaf_count_synthesized
+        ),
     )
     conn.execute(
         "INSERT INTO lcm_cache_leaf_refs (cache_id, leaf_summary_id) VALUES (?, ?)",
