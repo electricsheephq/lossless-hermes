@@ -22,6 +22,7 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -43,8 +44,8 @@ def _make_engine(
     *,
     db_open: bool = False,
     name: str = "lcm",
-    status: dict[str, Any] | None = None,
     has_conversation_store: bool = False,
+    current_session_id: str | None = None,
 ) -> Any:
     """Build a minimal stub :class:`LCMEngine` for dispatcher tests.
 
@@ -56,24 +57,26 @@ def _make_engine(
     Args:
         db_open: When ``True``, sets ``_db`` to a sentinel object so the
             "db: open" branch is exercised. Default ``False`` matches the
-            pre-``on_session_start`` state.
+            pre-``on_session_start`` state. NOTE: this is a sentinel
+            object, not a real connection — status's DB-query path will
+            raise if any test actually exercises it; tests that need a
+            live DB use the dedicated ``test_status.py`` suite.
         name: The engine name string. Defaults to ``"lcm"``.
-        status: Override the ``get_status()`` return value. Defaults to
-            the standard ABC dict with zeros.
         has_conversation_store: When ``True``, attaches a Mock store so
             the "conversation_store: ready" branch is exercised.
+        current_session_id: Per issue 08-02, the field that replaces
+            the TS ``ctx.sessionId``. Default ``None`` matches the
+            pre-on_session_start state — status omits the per-
+            conversation block in this case.
     """
     engine = MagicMock()
     engine.name = name
     engine._db = object() if db_open else None
     engine._conversation_store = MagicMock() if has_conversation_store else None
-    engine.get_status.return_value = status or {
-        "last_prompt_tokens": 0,
-        "threshold_tokens": 0,
-        "context_length": 0,
-        "usage_percent": 0,
-        "compression_count": 0,
-    }
+    engine.current_session_id = current_session_id
+    engine.config = SimpleNamespace(database_path="")
+    engine._maintenance_store = None
+    engine._telemetry_store = None
     return engine
 
 
@@ -83,28 +86,34 @@ def _make_engine(
 
 
 def test_status_subcommand_returns_status_block() -> None:
-    """`/lcm status` returns a status block containing engine name and 'ok'."""
+    """`/lcm status` returns the issue 08-02 status block.
+
+    Updated for issue 08-02 (full status body). The Epic-02 minimal
+    body (``[lcm] status\n  engine: lcm\n  ...  ok``) was replaced
+    with the markdown-formatted multi-section output per
+    ``docs/porting-guides/plugin-glue.md`` line 425.
+    """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("status")
-    assert "[lcm] status" in out
-    assert "engine: lcm" in out
-    assert "ok" in out
+    # Header line — package name + version.
+    assert "Lossless Hermes v" in out
+    # Plugin section is always rendered.
+    assert "**Plugin**" in out
 
 
 def test_empty_args_aliases_status() -> None:
     """Bare `/lcm` (no args) routes to status per Epic 02 spec."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("")
-    # Same body as /lcm status
-    assert "[lcm] status" in out
-    assert "ok" in out
+    # Same body as /lcm status — Plugin section is the always-on marker.
+    assert "**Plugin**" in out
 
 
 def test_whitespace_only_args_aliases_status() -> None:
     """Pure-whitespace `raw_args` (e.g. `/lcm  `) also aliases to status."""
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("   ")
-    assert "[lcm] status" in out
+    assert "**Plugin**" in out
 
 
 def test_help_subcommand_returns_markdown_table() -> None:
@@ -235,63 +244,27 @@ def test_doctor_clean_routes_to_cleaners_scan() -> None:
 
 # ---------------------------------------------------------------------------
 # Status — engine state surfacing
+#
+# Note: the rich status-body assertions (counts, suppression, compression
+# ratio, maintenance section gating) live in ``tests/commands/test_status.py``
+# which uses a real in-memory migrated DB. These dispatcher-level tests
+# only confirm that the routing reaches the right module and that the
+# pre-DB-open branch renders the expected hint.
 # ---------------------------------------------------------------------------
 
 
-def test_status_includes_token_state_from_get_status() -> None:
-    """status reads engine.get_status() and surfaces the standard fields."""
-    engine = _make_engine(
-        status={
-            "last_prompt_tokens": 1234,
-            "threshold_tokens": 96000,
-            "context_length": 128000,
-            "usage_percent": 1.0,
-            "compression_count": 3,
-        }
-    )
-    dispatcher = LcmCommandDispatcher(engine)
-    out = dispatcher.handle("status")
-    assert "1234" in out
-    assert "96000" in out
-    assert "128000" in out
-    assert "compression_count: 3" in out
-
-
 def test_status_reports_db_not_opened_pre_session_start() -> None:
-    """Without on_session_start the DB is None; status says so."""
+    """Without on_session_start the DB is None; status renders the hint section.
+
+    Per issue 08-02 status body, the ``_db is None`` branch renders a
+    ``**Status**`` section with ``db: not yet opened`` and a hint to
+    trigger ``on_session_start``.
+    """
     engine = _make_engine(db_open=False)
     dispatcher = LcmCommandDispatcher(engine)
     out = dispatcher.handle("status")
-    assert "not opened" in out
-
-
-def test_status_reports_db_open_post_session_start() -> None:
-    """When _db is set, status says 'open'."""
-    engine = _make_engine(db_open=True)
-    dispatcher = LcmCommandDispatcher(engine)
-    out = dispatcher.handle("status")
-    assert "db: open" in out
-
-
-def test_status_reports_conversation_store_ready() -> None:
-    """When _conversation_store is set, status surfaces 'ready'."""
-    engine = _make_engine(has_conversation_store=True)
-    dispatcher = LcmCommandDispatcher(engine)
-    out = dispatcher.handle("status")
-    assert "conversation_store: ready" in out
-
-
-def test_status_handles_get_status_exception() -> None:
-    """If engine.get_status() raises, status still returns a useful block."""
-    engine = _make_engine()
-    engine.get_status.side_effect = RuntimeError("boom")
-    dispatcher = LcmCommandDispatcher(engine)
-    # Should NOT propagate; should return a degraded but well-formed block.
-    out = dispatcher.handle("status")
-    assert "[lcm] status" in out
-    assert "engine: lcm" in out
-    # Token fields default to 0 in the degraded path.
-    assert "last_prompt_tokens: 0" in out
+    assert "**Status**" in out
+    assert "not yet opened" in out
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +282,8 @@ def test_args_passed_to_handler() -> None:
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("status --verbose")
-    assert "[lcm] status" in out
-    assert "ok" in out
+    # Issue 08-02 status block: Plugin section is the always-on marker.
+    assert "**Plugin**" in out
 
 
 def test_shlex_quoting_preserves_quoted_args() -> None:
@@ -431,7 +404,8 @@ def test_register_wires_dispatcher_with_engine(monkeypatch: pytest.MonkeyPatch) 
     # Pull the /lcm handler (first registered).
     handler = ctx.register_command.call_args_list[0].args[1]
     # Calling the registered handler returns a real status block — the
-    # dispatcher was constructed with the engine instance.
+    # dispatcher was constructed with the engine instance. Issue 08-02's
+    # output format: markdown header + Plugin section.
     out = handler("status")
-    assert "[lcm] status" in out
-    assert "engine: lcm" in out
+    assert "Lossless Hermes v" in out
+    assert "**Plugin**" in out

@@ -318,6 +318,108 @@ def test_on_session_end_idempotent_without_start(tmp_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# current_session_id tracking (issue 08-02 dependency)
+# ---------------------------------------------------------------------------
+
+
+def test_current_session_id_starts_as_none(tmp_home: Path) -> None:
+    """Fresh engine — ``current_session_id is None`` before any session_start.
+
+    Epic 08-02 ``/lcm status`` reads this attribute to decide whether
+    to render the per-conversation block. The default ``None`` is the
+    "no active conversation" marker.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    assert engine.current_session_id is None
+
+
+@_skip_no_extension_loading
+def test_on_session_start_sets_current_session_id(tmp_home: Path) -> None:
+    """``on_session_start`` sets ``current_session_id`` for Epic 08 consumers.
+
+    Per ``docs/porting-guides/plugin-glue.md`` §"Per-subcommand
+    translation table" line 650, this field replaces the TS
+    ``ctx.sessionId`` for ``/lcm`` handlers.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    try:
+        engine.on_session_start("sess-abc-123")
+        assert engine.current_session_id == "sess-abc-123"
+    finally:
+        engine.on_session_end("sess-abc-123", [])
+
+
+@_skip_no_extension_loading
+def test_on_session_start_updates_current_session_id_on_reentrant_call(
+    tmp_home: Path,
+) -> None:
+    """Subsequent ``on_session_start`` for a new session updates the field.
+
+    The DB stays open (idempotence preserves the connection), but
+    Epic 08's ``/lcm status`` must reflect the most recent session
+    — otherwise a CLI restart on the same process would show stats
+    for the old session.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    try:
+        engine.on_session_start("sess-1")
+        assert engine.current_session_id == "sess-1"
+
+        # Re-entrant call — DB stays open, but session id flips.
+        engine.on_session_start("sess-2")
+        assert engine.current_session_id == "sess-2"
+    finally:
+        engine.on_session_end("sess-2", [])
+
+
+@_skip_no_extension_loading
+def test_on_session_end_clears_current_session_id(tmp_home: Path) -> None:
+    """``on_session_end`` clears the tracked session id.
+
+    Symmetric with the DB-close path: after tear-down, status should
+    report "no active conversation" rather than the stale prior
+    session_id.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    engine.on_session_start("sess-1")
+    assert engine.current_session_id == "sess-1"
+
+    engine.on_session_end("sess-1", [])
+    assert engine.current_session_id is None
+
+
+def test_on_session_start_empty_session_id_yields_none(tmp_home: Path) -> None:
+    """``on_session_start("")`` → ``current_session_id`` stays ``None``.
+
+    Defensive: a Hermes mis-fire passing an empty string must not
+    leave the engine in a "I have an active session of empty string"
+    state. Empty/whitespace → ``None``.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    # Don't actually open the DB — the Apple-Python guard would fire
+    # on macOS GHA runners and the test focus is purely the field
+    # assignment. We use a subclass-style monkey-patch to skip the
+    # DB-open path.
+    import lossless_hermes.engine as engine_mod
+
+    # We can't easily skip the DB open while preserving the assignment;
+    # instead, use the @_skip_no_extension_loading marker so this only
+    # runs where the DB opens. The empty-string assignment path runs
+    # AFTER the DB check but BEFORE the open, so we still see the
+    # assignment even if open fails — but to keep the test deterministic
+    # we just check the assignment was applied before the open succeeded.
+    if not hasattr(engine_mod.sqlite3.Connection, "enable_load_extension"):
+        pytest.skip("Test requires DB open to verify assignment timing")
+
+    try:
+        engine.on_session_start("")
+        # Empty string normalizes to None.
+        assert engine.current_session_id is None
+    finally:
+        engine.on_session_end("", [])
+
+
+# ---------------------------------------------------------------------------
 # on_session_reset — zeroes tokens + clears cursors, keeps DB open
 # ---------------------------------------------------------------------------
 

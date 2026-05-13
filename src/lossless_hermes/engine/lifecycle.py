@@ -191,6 +191,15 @@ class _LifecycleMixin:
         # state, (b) churn the WAL on file-backed DBs, (c) re-run the
         # migration ladder unnecessarily (it's idempotent but the
         # ``BEGIN EXCLUSIVE`` walk is non-trivial).
+        #
+        # Always update ``current_session_id`` though — even on the
+        # re-entrant DB-already-open path. Subsequent ``on_session_start``
+        # calls reflect a new Hermes session (CLI restart on the same
+        # process), and Epic 08's ``/lcm status`` resolves the current
+        # conversation off this field. Per ``docs/porting-guides/
+        # plugin-glue.md`` §"Per-subcommand translation table" line 650,
+        # this field replaces the TS ``ctx.sessionId``.
+        self.current_session_id = session_id or None
         if self._db is not None:
             logger.debug(
                 "[lcm] on_session_start session_id=%s: DB already open, no-op",
@@ -318,6 +327,12 @@ class _LifecycleMixin:
         self._summary_store = None
         self._telemetry_store = None
         self._maintenance_store = None
+
+        # Clear ``current_session_id`` symmetrically with the DB close.
+        # Epic 08 ``/lcm status`` post-close should report "no active
+        # conversation" (the same shape pre-first-``on_session_start``),
+        # not the stale prior session_id from before tear-down.
+        self.current_session_id = None
 
     def _on_session_end_hook(
         self,
