@@ -40,7 +40,6 @@ See:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Callable
 from unittest.mock import MagicMock
@@ -195,17 +194,18 @@ def test_post_llm_call_accepts_documented_kwargs(hermes_available: None) -> None
     register(ctx)
     hook = _hooks_registered(ctx)["post_llm_call"]
 
-    async def _exercise() -> Any:
-        return await hook(
-            session_id="sess-1",
-            user_message="hello",
-            assistant_response="hi there",
-            conversation_history=[{"role": "user", "content": "hello"}],
-            model="claude-haiku",
-            platform="anthropic",
-        )
+    # Sync call: Hermes's ``invoke_hook`` does ``ret = cb(**kwargs)``
+    # without ``await`` (``hermes_cli/plugins.py:1218-1232``). Calling
+    # the hook directly mirrors how Hermes will invoke it.
+    result = hook(
+        session_id="sess-1",
+        user_message="hello",
+        assistant_response="hi there",
+        conversation_history=[{"role": "user", "content": "hello"}],
+        model="claude-haiku",
+        platform="anthropic",
+    )
 
-    result = asyncio.run(_exercise())
     # Observer-only hook — return is ignored by Hermes, but we still
     # confirm no exception fired and the return is ``None`` (no-op stub).
     assert result is None
@@ -220,20 +220,17 @@ def test_post_llm_call_tolerates_extra_kwargs(hermes_available: None) -> None:
     register(ctx)
     hook = _hooks_registered(ctx)["post_llm_call"]
 
-    async def _exercise() -> Any:
-        return await hook(
-            session_id="sess-1",
-            user_message="hello",
-            assistant_response="hi",
-            conversation_history=[],
-            model="claude-haiku",
-            platform="anthropic",
-            # Future-only kwargs that 02-07 must tolerate
-            future_field_added_in_hermes_v999="ignored",
-            another_thing=42,
-        )
-
-    result = asyncio.run(_exercise())
+    result = hook(
+        session_id="sess-1",
+        user_message="hello",
+        assistant_response="hi",
+        conversation_history=[],
+        model="claude-haiku",
+        platform="anthropic",
+        # Future-only kwargs that 02-07 must tolerate
+        future_field_added_in_hermes_v999="ignored",
+        another_thing=42,
+    )
     assert result is None
 
 
@@ -249,18 +246,15 @@ def test_pre_llm_call_accepts_documented_kwargs(hermes_available: None) -> None:
     register(ctx)
     hook = _hooks_registered(ctx)["pre_llm_call"]
 
-    async def _exercise() -> Any:
-        return await hook(
-            session_id="sess-1",
-            user_message="hello",
-            conversation_history=[],
-            is_first_turn=True,
-            model="claude-haiku",
-            platform="anthropic",
-            sender_id="",
-        )
-
-    result = asyncio.run(_exercise())
+    result = hook(
+        session_id="sess-1",
+        user_message="hello",
+        conversation_history=[],
+        is_first_turn=True,
+        model="claude-haiku",
+        platform="anthropic",
+        sender_id="",
+    )
     # No-op at 02-07 — per ``hermes_cli/plugins.py:1218-1232`` a ``None``
     # return is a valid observer-only result that leaves the user
     # message unchanged.

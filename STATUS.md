@@ -6,13 +6,13 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W3 ready to dispatch (Epic 02 Engine Skeleton)** |
-| **Current milestone** | M1 ✅, M2 ✅ achieved (DB layer feature-complete); M3 next (engine round-trips messages) |
-| **Last merged PR** | [#24](https://github.com/electricsheephq/lossless-hermes/pull/24) `[01-15] 3 versioned backfills — closes Wave 2 / Epic 01` (merged 2026-05-13T13:43Z) |
-| **Last commit on main** | `61c6548` |
-| **Total PRs merged today** | **25** (1 Wave 0 dry-run + 8 Wave 1 + 2 chores + 13 Wave 2 + 1 prune-fix chore) |
-| **Total tests** | 907 passing, 1 skipped |
-| **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. Strict `--verify` has cosmetic pragma-formatting diff only (tuple vs JSON output); follow-up to align extract_python_schema.py output format with extract_lcm_schema.ts. |
+| **Current wave** | **W4 ready to dispatch (Epic 03 Ingest+Assembly + Epic 05 Embeddings parallel)** |
+| **Current milestone** | M1 ✅, M2 ✅, M3 ✅ (engine round-trips through Hermes hooks + slash commands + lifecycle); M4 next (per-turn ingest + assembly live) |
+| **Last merged PR** | [#33](https://github.com/electricsheephq/lossless-hermes/pull/33) `[02-02][02-06] engine state fields + compress refinement — CLOSES WAVE 3` |
+| **Last commit on main** | `a81b5f5` |
+| **Total PRs merged today** | **35** (Wave 0–3 + chores) |
+| **Total tests** | 1101 passing, 2 skipped (live-gated) |
+| **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
@@ -63,8 +63,8 @@
 |---|---|---|---|
 | M0 | Phase 1 doc set complete | ✅ done | Commit 18e9e03 |
 | M1 | Plugin loads as no-op | ✅ done | Wave 1 closed 2026-05-13T11:32Z; 9 PRs in 54 min |
-| M2 | DB layer feature-complete | ✅ done | Wave 2 closed 2026-05-13T13:43Z; 13 PRs + 1 chore in ~2 hours; 907 tests pass; schema-diff subset 92/92 |
-| M3 | Engine round-trips messages | ⏳ pending | Wave 3 |
+| M2 | DB layer feature-complete | ✅ done | Wave 2 closed 2026-05-13T13:43Z; 13 PRs + 1 chore; 907 tests; schema-diff subset 92/92 |
+| M3 | Engine round-trips messages | ✅ done | Wave 3 closed 2026-05-13; 9 PRs covering 10 issues + 2 fix-forwards; 1101 tests; LCMEngine wired through Hermes ABC + 4 plugin hooks + /lcm slash command |
 | M4 | Per-turn ingest + assembly live | ⏳ pending | Wave 4 |
 | M5 | Compaction working | ⏳ pending | Wave 5 |
 | M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 5 |
