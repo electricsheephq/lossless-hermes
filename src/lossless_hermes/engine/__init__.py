@@ -80,11 +80,12 @@ from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
 
 from .assemble import _AssembleMixin
+from .circuit_breaker import CircuitBreaker
 from .compact import _CompactMixin
 from .ingest import _IngestMixin
 from .lifecycle import _LifecycleMixin
 
-__all__ = ["APPLE_SYSTEM_PYTHON_MSG", "LCMEngine"]
+__all__ = ["APPLE_SYSTEM_PYTHON_MSG", "CircuitBreaker", "LCMEngine"]
 
 logger = logging.getLogger("lossless_hermes.engine")
 
@@ -261,10 +262,12 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # 02-08 may extend this with refcount + cleanup pass.
         self._session_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-        # Circuit-breaker scaffold — body lands in 02-09. Keyed by
-        # session/provider scope; values are CircuitBreakerState records
-        # whose Python type lands with the body.
-        self._circuit_breakers: Dict[str, Any] = {}
+        # Circuit-breaker state-machine (02-09). Keyed by session /
+        # provider scope (Epic 04 chooses the key policy; the scaffold
+        # is opaque). Values are :class:`CircuitBreaker` dataclasses.
+        # Use :meth:`_get_or_create_circuit_breaker` to fetch with the
+        # right config defaults applied.
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
 
         # ``last_seen_message_idx`` for diff-based ingest (Epic 03).
         # Keyed by session_id; value is the index of the last message
@@ -290,6 +293,45 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
     # ``compress`` and ``should_compress`` bodies live in :class:`_CompactMixin`
     # (compact.py). At 02-01 those are no-op passthroughs matching 00-06;
     # Epic 04 fills in the real compaction algorithm.
+
+    # Circuit-breaker helper (02-09) ----------------------------------------
+
+    def _get_or_create_circuit_breaker(self, key: str) -> CircuitBreaker:
+        """Fetch the breaker for ``key``, creating it with config defaults.
+
+        This is the only blessed entry point for Epic 04 callers (the
+        summarize.py compaction path will catch ``LcmProviderAuthError``
+        and call ``breaker.record_failure()`` on the result). Direct
+        ``self._circuit_breakers[key]`` access is permitted but loses
+        the config-driven threshold/cooldown setup.
+
+        The breaker is configured from ``self.config``:
+
+        * ``threshold = self.config.circuit_breaker_threshold`` (default 5)
+        * ``cooldown_s = self.config.circuit_breaker_cooldown_ms / 1000``
+          (default 1800.0s = 30 min)
+
+        Subsequent calls with the same ``key`` return the same instance
+        (no re-config). Different keys get independent breakers.
+
+        Maps to engine.ts:getCircuitBreakerState (line 1963).
+
+        Args:
+            key: Opaque breaker key. Epic 04's policy choice (likely
+                ``f"{provider}/{model}"`` or
+                ``f"{session_id}:{provider}/{model}"``).
+
+        Returns:
+            The :class:`CircuitBreaker` for ``key``.
+        """
+        breaker = self._circuit_breakers.get(key)
+        if breaker is None:
+            breaker = CircuitBreaker(
+                threshold=self.config.circuit_breaker_threshold,
+                cooldown_s=self.config.circuit_breaker_cooldown_ms / 1000.0,
+            )
+            self._circuit_breakers[key] = breaker
+        return breaker
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         """Record token usage from an API response.
