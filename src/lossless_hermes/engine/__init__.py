@@ -65,10 +65,8 @@ See:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +81,7 @@ from .assemble import _AssembleMixin
 from .compact import _CompactMixin
 from .ingest import _IngestMixin
 from .lifecycle import _LifecycleMixin
+from .session_locks import SessionLockRegistry
 
 __all__ = ["APPLE_SYSTEM_PYTHON_MSG", "LCMEngine"]
 
@@ -253,13 +252,14 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self._maintenance_store: Optional[CompactionMaintenanceStore] = None
 
         # Per-session asyncio locks — see ADR-018 §"Per-session queue".
-        # ``defaultdict`` so callers can ``async with self._session_locks
-        # [session_id]:`` without explicit setdefault. Note that
-        # ``defaultdict(asyncio.Lock)`` here constructs the lock lazily,
-        # in whatever event-loop happens to be running at first access —
-        # acceptable because the same loop services every turn.
-        # 02-08 may extend this with refcount + cleanup pass.
-        self._session_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Issue 02-08 replaces the issue 02-01 ``defaultdict(asyncio.Lock)``
+        # placeholder with a :class:`SessionLockRegistry` that adds a
+        # refcount + lazy prune pass so the lock dict cannot grow
+        # without bound on a long-running gateway (ADR-018 §"Open
+        # questions" line 96–97). Critical sections in Epic 03 (ingest)
+        # / Epic 04 (compact) acquire via
+        # ``async with self._session_locks.acquire(session_id): ...``.
+        self._session_locks: SessionLockRegistry = SessionLockRegistry()
 
         # Circuit-breaker scaffold — body lands in 02-09. Keyed by
         # session/provider scope; values are CircuitBreakerState records
@@ -286,6 +286,21 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self.context_length: int = 0
         self.compression_count: int = 0
 
+        # ------------------------------------------------------------------
+        # Cache-aware token state (ADR-015 patch #4)
+        # ------------------------------------------------------------------
+        # Hermes today doesn't always forward cache_read/write to
+        # ``update_from_response``. When the patch lands upstream (or a
+        # provider returns Anthropic-native usage with cache fields), these
+        # capture the values for the cache-aware deferral gate (Epic 04).
+        # ``cache_aware`` flips to ``True`` once we observe at least one
+        # cache field; downstream policy can then trust the read/write
+        # counters. Until then the gate degrades to the conservative
+        # always-compact-when-over-threshold policy.
+        self.last_cache_read_tokens: int = 0
+        self.last_cache_write_tokens: int = 0
+        self.cache_aware: bool = False
+
     # ABC §Core interface -----------------------------------------------------
     # ``compress`` and ``should_compress`` bodies live in :class:`_CompactMixin`
     # (compact.py). At 02-01 those are no-op passthroughs matching 00-06;
@@ -294,28 +309,97 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         """Record token usage from an API response.
 
-        02-01 implementation (unchanged from 00-06): stores
-        ``prompt_tokens``, ``completion_tokens``, and ``total_tokens``
-        in the standard instance attributes ``run_agent.py`` reads
-        directly. No telemetry-store write — that lands in Epic 04
-        (compaction telemetry).
+        02-04 extension over 00-06/02-01: in addition to
+        ``prompt_tokens``/``completion_tokens``/``total_tokens``, also
+        captures cache-aware fields (``cache_read_tokens`` and
+        ``cache_write_tokens``) when the provider — or Hermes after
+        ADR-015 patch #4 lands — forwards them. The cache fields feed
+        the cache-aware compaction deferral gate (Epic 04). When the
+        fields are absent, ``cache_aware`` stays ``False`` and the gate
+        degrades to a conservative always-compact-when-over-threshold
+        policy. No crash on missing fields — graceful degradation.
 
-        Tolerates both ``prompt_tokens``/``completion_tokens`` (OpenAI
-        style) and ``input_tokens``/``output_tokens`` (Anthropic style)
-        keys; if ``total_tokens`` is missing it is computed from the
-        parts. Maps to engine.ts behavior for the ``last_*_tokens``
-        fields under §"State owned by LcmContextEngine"
-        (porting-guides/engine.md lines 21-50).
+        Tolerates THREE usage shapes simultaneously (the engine has no
+        signal which provider Hermes is wrapping):
+
+        1. **OpenAI Chat** — ``prompt_tokens``, ``completion_tokens``,
+           ``total_tokens``. No cache fields native to this shape.
+        2. **Anthropic native** — ``input_tokens``, ``output_tokens``,
+           ``cache_creation_input_tokens``, ``cache_read_input_tokens``.
+           The cache fields are what ADR-015 patch #4 normalizes to the
+           shared ``cache_read_tokens`` / ``cache_write_tokens`` keys.
+        3. **OpenAI Responses (Codex)** — ``prompt_tokens``,
+           ``completion_tokens``, ``prompt_tokens_details.cached_tokens``.
+           The Codex harness reports cache hits via a nested dict.
+
+        Additionally accepts the **Hermes-normalized** keys
+        ``cache_read_tokens`` / ``cache_write_tokens`` (post-ADR-015
+        patch #4) — these take precedence over the provider-native
+        fields when present, matching the documented forwarding shape.
+
+        If ``total_tokens`` is missing it is computed from prompt +
+        completion. Maps to ``engine.ts`` per-turn token recording
+        inside ``afterTurn`` (lines 6473–6638) — specifically the
+        ``updateCompactionTelemetry`` path that feeds cache state to
+        the deferral gate.
 
         Args:
             usage: The ``usage`` dict from the LLM response.
         """
+        # --- Prompt / completion / total -----------------------------------
         prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
         completion = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
         total = usage.get("total_tokens", prompt + completion) or (prompt + completion)
         self.last_prompt_tokens = prompt
         self.last_completion_tokens = completion
         self.last_total_tokens = total
+
+        # --- Cache-aware fields (ADR-015 patch #4) -------------------------
+        # Precedence: Hermes-normalized keys (when patch #4 forwards them)
+        # win over provider-native shapes. Anthropic-native is checked
+        # before the OpenAI Responses (Codex) nested form. The presence
+        # of ANY cache field flips ``cache_aware`` to True so the
+        # deferral gate knows it has trustworthy signal.
+        cache_read: Optional[int] = None
+        cache_write: Optional[int] = None
+
+        # 1. Hermes-normalized (post-patch #4)
+        if "cache_read_tokens" in usage:
+            cache_read = usage.get("cache_read_tokens") or 0
+        if "cache_write_tokens" in usage:
+            cache_write = usage.get("cache_write_tokens") or 0
+
+        # 2. Anthropic-native: cache_read_input_tokens / cache_creation_input_tokens
+        if cache_read is None and "cache_read_input_tokens" in usage:
+            cache_read = usage.get("cache_read_input_tokens") or 0
+        if cache_write is None and "cache_creation_input_tokens" in usage:
+            cache_write = usage.get("cache_creation_input_tokens") or 0
+
+        # 3. OpenAI Responses (Codex): prompt_tokens_details.cached_tokens
+        # Only the read counter is available in this shape — Codex
+        # doesn't expose a cache-write counter, so cache_write stays
+        # absent and the gate treats it as 0 (conservative).
+        if cache_read is None:
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict) and "cached_tokens" in details:
+                cache_read = details.get("cached_tokens") or 0
+
+        if cache_read is not None or cache_write is not None:
+            self.cache_aware = True
+            self.last_cache_read_tokens = cache_read if cache_read is not None else 0
+            self.last_cache_write_tokens = cache_write if cache_write is not None else 0
+        else:
+            # No cache signal this turn. Per the 02-04 spec acceptance
+            # criterion ("Missing cache fields → cache_aware = False"),
+            # the flag reflects the CURRENT call, not a session sticky
+            # bit. The cache-aware deferral gate (Epic 04) reads this
+            # per-turn; if the most recent turn lacked cache data the
+            # gate falls back to the conservative path even if earlier
+            # turns reported cache hits. We also zero the per-turn
+            # counters so stale values can't feed the gate.
+            self.cache_aware = False
+            self.last_cache_read_tokens = 0
+            self.last_cache_write_tokens = 0
 
     # ABC §Tools (defaults are fine; explicit overrides for 02-01 clarity) ---
 

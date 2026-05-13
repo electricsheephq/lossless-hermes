@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict
 
@@ -48,6 +47,7 @@ from lossless_hermes.engine.assemble import _AssembleMixin
 from lossless_hermes.engine.compact import _CompactMixin
 from lossless_hermes.engine.ingest import _IngestMixin
 from lossless_hermes.engine.lifecycle import _LifecycleMixin
+from lossless_hermes.engine.session_locks import SessionLockRegistry
 from lossless_hermes.hermes_bridge import ContextEngine
 
 # ---------------------------------------------------------------------------
@@ -148,20 +148,20 @@ def test_state_fields_initialized_to_none() -> None:
     assert engine._maintenance_store is None
 
 
-def test_session_locks_is_defaultdict_of_async_lock() -> None:
+def test_session_locks_is_session_lock_registry() -> None:
     """ADR-018 §"Per-session queue": per-session lock dict for ingest
     + compact serialization.
 
-    Type checked via ``defaultdict`` and ``default_factory == asyncio.Lock``;
-    the eager-lock-on-first-access semantics of ``defaultdict``
-    construction means ``self._session_locks["sess"]`` returns a fresh
-    :class:`asyncio.Lock` lazily.
+    Issue 02-08 replaces the issue 02-01 ``defaultdict(asyncio.Lock)``
+    placeholder with a :class:`SessionLockRegistry` that adds a
+    refcount + lazy prune pass. Callers acquire via
+    ``async with engine._session_locks.acquire(session_id): ...``.
     """
     engine = LCMEngine()
-    assert isinstance(engine._session_locks, defaultdict)
-    assert engine._session_locks.default_factory is asyncio.Lock
-    # Sanity: untouched dict has no entries.
+    assert isinstance(engine._session_locks, SessionLockRegistry)
+    # Sanity: untouched registry has no entries.
     assert len(engine._session_locks) == 0
+    assert engine._session_locks.pending_count() == 0
 
 
 def test_circuit_breakers_is_empty_dict() -> None:
