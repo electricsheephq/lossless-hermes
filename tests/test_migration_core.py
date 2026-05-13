@@ -108,13 +108,17 @@ def fresh_db() -> Iterator[sqlite3.Connection]:
 
 @pytest.fixture
 def migrated_db(fresh_db: sqlite3.Connection) -> sqlite3.Connection:
-    """A DB with the core migration ladder already applied.
+    """A DB with the core migration ladder already applied (no FTS5).
 
     Returns the same connection; the fixture exists to factor out the
-    ``run_lcm_migrations(fresh_db)`` call in tests that don't need to
-    observe the pre-migration state.
+    ``run_lcm_migrations(fresh_db, fts5_available=False)`` call in tests
+    that don't need to observe the pre-migration state. ``fts5_available``
+    is pinned to ``False`` here so the table-count / index-count
+    assertions below stay focused on the **core** schema delivered by
+    #01-04 — FTS5 creation is owned by #01-05 and exercised in
+    :mod:`tests.test_migration_fts5`.
     """
-    run_lcm_migrations(fresh_db)
+    run_lcm_migrations(fresh_db, fts5_available=False)
     return fresh_db
 
 
@@ -1037,14 +1041,19 @@ def test_structural_probe_no_op_on_fresh_db(migrated_db: sqlite3.Connection) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_fts5_stub_is_noop(migrated_db: sqlite3.Connection) -> None:
-    """``_ensure_fts5_tables`` is a no-op until #01-05 lands.
+def test_fts5_noop_when_unavailable(migrated_db: sqlite3.Connection) -> None:
+    """``_ensure_fts5_tables(..., fts5_available=False)`` is a no-op.
 
-    No ``messages_fts`` / ``summaries_fts`` / ``summaries_fts_cjk`` tables
-    are created.
+    The ``migrated_db`` fixture passes ``fts5_available=False``, so the
+    fixture itself already exercises this path. The redundant call here
+    verifies idempotency: calling the function again with the same flag
+    does not mutate the schema.
+
+    Note: this test only covers the negative path. The positive path —
+    FTS5 tables are created when ``fts5_available=True`` — is covered in
+    :mod:`tests.test_migration_fts5`.
     """
     schema_before = _snapshot_schema(migrated_db)
-    _ensure_fts5_tables(migrated_db, fts5_available=True)
     _ensure_fts5_tables(migrated_db, fts5_available=False)
     schema_after = _snapshot_schema(migrated_db)
     assert schema_before == schema_after

@@ -7,17 +7,24 @@ and ADR-026.
 
 ### What this module ships
 
-Issue ``#01-04`` (this PR) lands the **core schema**:
+Issues ``#01-04`` and ``#01-05`` (the core schema + FTS5):
 
-* **12 always-on tables** — ``conversations``, ``messages``, ``message_parts``,
-  ``summaries``, ``summary_messages``, ``summary_parents``, ``context_items``,
-  ``large_files``, ``conversation_bootstrap_state``,
-  ``conversation_compaction_telemetry``, ``conversation_compaction_maintenance``,
-  ``lcm_migration_state``.
-* **20 core indexes** — covering FK lookups, conversation/session scope filters,
-  the partial UNIQUE on active session_key, the v4.1 suppression / contains_
-  suppressed / session_key_kind_latest indexes, and the v4.1
-  conversations_session_key_v41 partial index.
+* **12 always-on tables** (#01-04) — ``conversations``, ``messages``,
+  ``message_parts``, ``summaries``, ``summary_messages``,
+  ``summary_parents``, ``context_items``, ``large_files``,
+  ``conversation_bootstrap_state``,
+  ``conversation_compaction_telemetry``,
+  ``conversation_compaction_maintenance``, ``lcm_migration_state``.
+* **20 core indexes** (#01-04) — covering FK lookups, conversation/session
+  scope filters, the partial UNIQUE on active session_key, the v4.1
+  suppression / contains_suppressed / session_key_kind_latest indexes, and
+  the v4.1 conversations_session_key_v41 partial index.
+* **3 FTS5 virtual tables** (#01-05) — ``messages_fts`` (porter unicode61),
+  ``summaries_fts`` (porter unicode61), ``summaries_fts_cjk`` (trigram,
+  gated on the trigram-tokenizer feature probe). Population is handled by
+  the application layer (#01-08 / #01-09); this module only creates the
+  tables and seeds them from the existing ``messages`` / ``summaries``
+  rows on first run.
 
 ### Section-stub pattern (ADR-027 analogue)
 
@@ -26,7 +33,9 @@ The orchestrator is split into seven section helpers so issues #01-05 / #01-06 /
 
 * :func:`_ensure_core_tables` — body lives here (this PR).
 * :func:`_ensure_core_indexes` — body lives here (this PR).
-* :func:`_ensure_fts5_tables` — **stub** in this PR; body lands in #01-05.
+* :func:`_ensure_fts5_tables` — body landed in #01-05 (3 FTS5 virtual tables:
+  ``messages_fts``, ``summaries_fts``, ``summaries_fts_cjk`` (gated on the
+  trigram tokenizer being available)).
 * :func:`_ensure_v41_tables` — **stub** in this PR; body lands in #01-06 (the 13
   v4.1 tables: ``lcm_worker_lock``, ``lcm_extraction_queue``,
   ``lcm_session_key_audit``, ``lcm_prompt_registry``, ``lcm_synthesis_cache``,
@@ -84,8 +93,12 @@ See:
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
+from dataclasses import dataclass, field
 from typing import Iterable, Protocol
+
+from lossless_hermes.db.features import get_lcm_db_features
 
 __all__ = [
     "MigrationLogger",
@@ -863,35 +876,377 @@ def _ensure_message_parts_table_belt_and_suspenders(db: sqlite3.Connection) -> N
     db.execute("CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)")
 
 
-# ---- Stubs for future-PR sections ----------------------------------------
+# ---------------------------------------------------------------------------
+# SQL constants — FTS5 virtual tables (per storage.md §2.2 and migration.ts:1194-1262)
+# ---------------------------------------------------------------------------
+#
+# Three standalone FTS5 virtual tables — none use content/content_rowid tracking
+# (that's the "stale schema" pattern the recreate-detector guards against).
+# Population is handled by the application layer (ConversationStore for
+# messages_fts; SummaryStore for both summaries_fts variants) — there are
+# **no SQL triggers** linking messages → messages_fts. The seed step below
+# bulk-loads existing rows when the FTS table is first created (or recreated
+# after a stale-schema purge); steady-state writes go through application
+# inserts/deletes (see #01-08 / #01-09).
+#
+# String formatting matches TS migration.ts byte-for-byte (including the
+# trailing-newline-and-indent inside each `CREATE VIRTUAL TABLE` body) so the
+# `sqlite_master.sql` stored after CREATE diffs cleanly against the TS-
+# generated reference in `tests/fixtures/lcm_reference_schema.sql`. The
+# `--verify-subset` orchestrator normalizes whitespace via `re.sub(r"\s+", " ")`
+# so minor indent drift is tolerated — but matching the TS layout reduces
+# review noise.
+
+_SQL_CREATE_MESSAGES_FTS = """
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+              content,
+              tokenize='porter unicode61'
+            )
+          """
+
+_SQL_SEED_MESSAGES_FTS = """
+            INSERT INTO messages_fts(rowid, content)
+            SELECT message_id, content FROM messages
+          """
+
+_SQL_CREATE_SUMMARIES_FTS = """
+            CREATE VIRTUAL TABLE summaries_fts USING fts5(
+              summary_id UNINDEXED,
+              content,
+              tokenize='porter unicode61'
+            )
+          """
+
+_SQL_SEED_SUMMARIES_FTS = """
+            INSERT INTO summaries_fts(summary_id, content)
+            SELECT summary_id, content FROM summaries
+          """
+
+_SQL_CREATE_SUMMARIES_FTS_CJK = """
+              CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+                summary_id UNINDEXED,
+                content,
+                tokenize='trigram'
+              )
+            """
+
+_SQL_SEED_SUMMARIES_FTS_CJK = """
+              INSERT INTO summaries_fts_cjk(summary_id, content)
+              SELECT summary_id, content FROM summaries
+            """
+
+
+@dataclass(frozen=True, slots=True)
+class _FtsTableSpec:
+    """Spec for one standalone FTS5 virtual table (ports TS ``FtsTableSpec``).
+
+    Mirrors ``migration.ts:46-52``:
+
+        type FtsTableSpec = {
+          tableName: string;
+          createSql: string;
+          seedSql: string;
+          expectedColumns: string[];
+          staleSchemaPatterns?: string[];
+        };
+
+    Attributes:
+        table_name: The virtual-table name (also used to derive the 5 shadow
+            tables: ``<name>_data``, ``_idx``, ``_content``, ``_docsize``,
+            ``_config``).
+        create_sql: The ``CREATE VIRTUAL TABLE`` statement run when no
+            existing-table-is-fine result.
+        seed_sql: The bulk-load INSERT run immediately after a fresh create.
+            Pulls existing rows from the parent table (``messages`` or
+            ``summaries``).
+        expected_columns: Column names that ``PRAGMA table_info`` must report
+            on the existing FTS table; if any is missing, the table is
+            considered stale and recreated.
+        stale_schema_patterns: Substrings searched in the existing table's
+            ``sqlite_master.sql``; any hit triggers a recreate. Used to
+            detect legacy ``content_rowid`` setups that this PR replaces
+            with default content tracking.
+    """
+
+    table_name: str
+    create_sql: str
+    seed_sql: str
+    expected_columns: tuple[str, ...]
+    stale_schema_patterns: tuple[str, ...] = field(default_factory=tuple)
+
+
+_FTS_SPEC_MESSAGES_FTS = _FtsTableSpec(
+    table_name="messages_fts",
+    create_sql=_SQL_CREATE_MESSAGES_FTS,
+    seed_sql=_SQL_SEED_MESSAGES_FTS,
+    expected_columns=("content",),
+    stale_schema_patterns=("content_rowid",),
+)
+
+_FTS_SPEC_SUMMARIES_FTS = _FtsTableSpec(
+    table_name="summaries_fts",
+    create_sql=_SQL_CREATE_SUMMARIES_FTS,
+    seed_sql=_SQL_SEED_SUMMARIES_FTS,
+    expected_columns=("summary_id", "content"),
+    stale_schema_patterns=(
+        "content_rowid='summary_id'",
+        'content_rowid="summary_id"',
+    ),
+)
+
+_FTS_SPEC_SUMMARIES_FTS_CJK = _FtsTableSpec(
+    table_name="summaries_fts_cjk",
+    create_sql=_SQL_CREATE_SUMMARIES_FTS_CJK,
+    seed_sql=_SQL_SEED_SUMMARIES_FTS_CJK,
+    expected_columns=("summary_id", "content"),
+)
+
+
+# SQL identifier whitelist (ports TS ``quoteSqlIdentifier`` regex check at
+# migration.ts:839). Used to defensively bounds-check table names before
+# embedding them in DROP statements. All call-sites in this module pass
+# hard-coded constants so the check is purely belt-and-suspenders.
+_VALID_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    """Return ``identifier`` double-quoted (TS ``quoteSqlIdentifier``).
+
+    Validates the identifier matches ``[A-Za-z_][A-Za-z0-9_]*`` and escapes
+    any embedded double-quotes by doubling them — same shape as TS source
+    at ``migration.ts:838-843``.
+
+    Args:
+        identifier: A SQL identifier to quote.
+
+    Returns:
+        The identifier wrapped in double-quotes with any internal ``"``
+        doubled.
+
+    Raises:
+        ValueError: If the identifier contains characters outside the
+            allowed alphabet. All call-sites in this module pass module-
+            level constants, so the raise is a defensive bug-catcher.
+    """
+    if not _VALID_SQL_IDENTIFIER.match(identifier):
+        raise ValueError(f"Invalid SQL identifier: {identifier}")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _get_fts_shadow_table_names(table_name: str) -> tuple[str, ...]:
+    """Return the 5 shadow-table names FTS5 creates alongside a virtual table.
+
+    Ports ``getFtsShadowTableNames`` at ``migration.ts:828-836``. SQLite's
+    FTS5 implementation materializes 5 backing tables for every virtual
+    table: ``<name>_data``, ``<name>_idx``, ``<name>_content``,
+    ``<name>_docsize``, ``<name>_config``. The stale-schema purge path
+    drops all 5 before recreating the virtual table itself.
+
+    Args:
+        table_name: The user-visible FTS5 virtual table name.
+
+    Returns:
+        A 5-tuple of shadow table names in stable order (matches the
+        TS source for review parity).
+    """
+    return (
+        f"{table_name}_data",
+        f"{table_name}_idx",
+        f"{table_name}_content",
+        f"{table_name}_docsize",
+        f"{table_name}_config",
+    )
+
+
+def _get_existing_table_names(db: sqlite3.Connection, candidates: Iterable[str]) -> set[str]:
+    """Return the subset of ``candidates`` that exist as tables in ``db``.
+
+    Ports the helper used by ``shouldRecreateStandaloneFtsTable`` at
+    ``migration.ts:805-826``. Issues a single parameterized query so the
+    cost is O(1) round-trips regardless of candidate count.
+
+    Args:
+        db: Open :class:`sqlite3.Connection`.
+        candidates: Table names to look for.
+
+    Returns:
+        A set containing exactly the names present in ``sqlite_master``
+        with ``type = 'table'``.
+    """
+    names = tuple(candidates)
+    if not names:
+        return set()
+    placeholders = ",".join("?" for _ in names)
+    rows = db.execute(
+        f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+        names,
+    ).fetchall()
+    return {row[0] for row in rows if isinstance(row[0], str) and row[0]}
+
+
+def _should_recreate_standalone_fts_table(db: sqlite3.Connection, spec: _FtsTableSpec) -> bool:
+    """Return True if ``spec.table_name`` is missing or stale.
+
+    Ports ``shouldRecreateStandaloneFtsTable`` at ``migration.ts:845-876``.
+    The function returns True if any of:
+
+    * The FTS table doesn't exist (``sqlite_master`` lookup).
+    * Any of the 5 shadow tables is missing (the virtual table is half-
+      created — a previously-interrupted CREATE).
+    * The existing ``sqlite_master.sql`` text contains any of
+      ``spec.stale_schema_patterns`` (legacy ``content_rowid`` config).
+    * ``PRAGMA table_info`` reports any of ``spec.expected_columns`` is
+      missing on the existing table.
+
+    Any other database error during the probe also returns True (treated
+    as "we can't inspect, safer to recreate") — matches the TS source's
+    bare ``catch { return true; }``.
+
+    Args:
+        db: Open :class:`sqlite3.Connection`.
+        spec: Spec describing the expected virtual table shape.
+
+    Returns:
+        ``True`` if the caller should drop+recreate; ``False`` if the
+        existing table is intact and current.
+    """
+    shadow_tables = _get_fts_shadow_table_names(spec.table_name)
+    existing = _get_existing_table_names(db, (spec.table_name, *shadow_tables))
+    if spec.table_name not in existing:
+        return True
+    if any(name not in existing for name in shadow_tables):
+        return True
+
+    try:
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+            (spec.table_name,),
+        ).fetchone()
+        sql_text = (row[0] if row and row[0] else "") or ""
+        if any(pattern in sql_text for pattern in spec.stale_schema_patterns):
+            return True
+
+        # PRAGMA table_info on an FTS5 virtual table returns the user-
+        # declared columns (e.g. ``summary_id``, ``content``). Hidden
+        # columns like ``rank`` are NOT reported by this PRAGMA — only
+        # the columns the CREATE VIRTUAL TABLE statement declared.
+        column_rows = db.execute(
+            f"PRAGMA table_info({_quote_sql_identifier(spec.table_name)})"
+        ).fetchall()
+        column_names = {row[1] for row in column_rows if isinstance(row[1], str) and row[1]}
+        return any(col not in column_names for col in spec.expected_columns)
+    except sqlite3.DatabaseError:
+        return True
+
+
+def _ensure_standalone_fts_table(db: sqlite3.Connection, spec: _FtsTableSpec) -> None:
+    """Idempotently create + seed a standalone FTS5 virtual table.
+
+    Ports ``ensureStandaloneFtsTable`` at ``migration.ts:878-889``. Wrapped
+    around the stale-schema check so callers don't need to know whether
+    the table needs purging — pass the spec and the helper does the right
+    thing.
+
+    On recreate:
+
+    1. ``DROP TABLE IF EXISTS <name>`` (virtual table).
+    2. ``DROP TABLE IF EXISTS <shadow>`` for each of the 5 shadow tables.
+       The shadow drops are not strictly necessary after the virtual-table
+       drop succeeds (SQLite cleans them up automatically), but they're
+       belt-and-suspenders for half-created states the stale-schema check
+       flagged.
+    3. ``CREATE VIRTUAL TABLE …``.
+    4. The seed INSERT (pulls existing rows from the parent table).
+
+    On no-op (no recreate needed) the function returns immediately
+    without touching the DB.
+
+    Args:
+        db: Open :class:`sqlite3.Connection`.
+        spec: Spec describing the table to ensure.
+    """
+    if not _should_recreate_standalone_fts_table(db, spec):
+        return
+
+    quoted = _quote_sql_identifier(spec.table_name)
+    db.execute(f"DROP TABLE IF EXISTS {quoted}")
+    for shadow in _get_fts_shadow_table_names(spec.table_name):
+        db.execute(f"DROP TABLE IF EXISTS {_quote_sql_identifier(shadow)}")
+    db.execute(spec.create_sql)
+    db.execute(spec.seed_sql)
 
 
 def _ensure_fts5_tables(db: sqlite3.Connection, *, fts5_available: bool) -> None:
-    """Create FTS5 virtual tables (``messages_fts``, ``summaries_fts``,
-    ``summaries_fts_cjk``) when FTS5 is available.
+    """Create the 3 FTS5 virtual tables when FTS5 is available.
 
-    **STUB**: body lands in #01-05. Currently a no-op.
+    Ports ``migration.ts:1182-1262``. Creates:
 
-    Per ``migration.ts:1182-1262`` the TS source uses ``ensureStandaloneFtsTable``
-    to detect stale schemas (e.g. an old ``content_rowid='summary_id'`` config)
-    and recreate; the seed pulls from ``messages`` / ``summaries``. Trigram-
-    tokenizer detection gates ``summaries_fts_cjk``.
+    * ``messages_fts`` — ``fts5(content, tokenize='porter unicode61')``.
+      Standalone (default content tracking). Seeded from ``messages``.
+    * ``summaries_fts`` — ``fts5(summary_id UNINDEXED, content,
+      tokenize='porter unicode61')``. Standalone. Seeded from ``summaries``.
+    * ``summaries_fts_cjk`` — ``fts5(summary_id UNINDEXED, content,
+      tokenize='trigram')``. Standalone. Seeded from ``summaries``. Only
+      created when the runtime trigram tokenizer probe succeeds (resolved
+      from :func:`lossless_hermes.db.features.get_lcm_db_features`).
+
+    No SQL triggers are created — population is handled by the
+    application layer (ConversationStore on every message insert/delete;
+    SummaryStore on every summary insert/delete). See spec
+    ``epics/01-storage/01-05-migration-fts5-tables.md`` §"Out of scope".
+
+    Idempotency: each table is wrapped through
+    :func:`_ensure_standalone_fts_table`, which checks the existing
+    schema and only recreates if missing, half-broken, or stale (legacy
+    ``content_rowid`` config). Re-running this function on an already-
+    migrated DB is a no-op.
+
+    Trigram-skip path: when ``trigram_tokenizer_available`` is False, the
+    function drops any pre-existing ``summaries_fts_cjk`` (best-effort —
+    a stale virtual table should not block core migration) and skips
+    creating a fresh one. This mirrors ``migration.ts:1186-1192``.
 
     Args:
         db: Open :class:`sqlite3.Connection` inside the migration txn.
-        fts5_available: When ``False`` the function MUST be a no-op (the
-            ``messages_fts`` etc. tables are not created). Caller resolves
-            this from :func:`lossless_hermes.db.features.get_lcm_db_features`
-            (returns ``DbFeatures(fts5_available=True/False, ...)``).
+        fts5_available: When ``False`` the function is a clean no-op
+            (no FTS table inspection, no drops, no creates). Logs a
+            DEBUG line and returns. Caller resolves this from
+            :func:`lossless_hermes.db.features.get_lcm_db_features`
+            (or passes ``False`` explicitly from tests that validate
+            the LIKE-fallback path).
     """
-    # TODO(epic-01 issue 01-05): body lands in #01-05 (FTS5 virtual tables).
-    # Until that PR ships, `fts5_available=True` callers see no FTS tables
-    # and any code that reads from messages_fts / summaries_fts will fail.
-    # That's the intended ratchet — #01-08 and later store code must guard
-    # FTS reads on `get_lcm_db_features(conn).fts5_available` and fall back
-    # to LIKE search when the table doesn't exist.
-    _ = (db, fts5_available)  # placeholder to silence linter on stub arg
-    return
+    if not fts5_available:
+        _log.debug(
+            "FTS5 not available on this connection; skipping creation of "
+            "messages_fts / summaries_fts / summaries_fts_cjk."
+        )
+        return
+
+    # Detect trigram tokenizer availability at runtime (matches TS at
+    # migration.ts:1185 — `detectedFeatures?.trigramTokenizerAvailable ?? false`).
+    # The probe uses SAVEPOINT internally, which is safe inside the
+    # BEGIN EXCLUSIVE transaction the orchestrator opens around this
+    # function.
+    features = get_lcm_db_features(db)
+    trigram_available = features.fts5_trigram_available
+
+    if not trigram_available:
+        # Best-effort cleanup of any stale CJK table from a previous run
+        # where trigram WAS available. A stale virtual table on its own
+        # should not block migration — swallow errors.
+        try:
+            db.execute("DROP TABLE IF EXISTS summaries_fts_cjk")
+        except sqlite3.DatabaseError:  # pragma: no cover - defensive
+            pass
+
+    _ensure_standalone_fts_table(db, _FTS_SPEC_MESSAGES_FTS)
+    _ensure_standalone_fts_table(db, _FTS_SPEC_SUMMARIES_FTS)
+
+    if trigram_available:
+        _ensure_standalone_fts_table(db, _FTS_SPEC_SUMMARIES_FTS_CJK)
+
+
+# ---- Stubs for future-PR sections ----------------------------------------
 
 
 def _ensure_v41_tables(db: sqlite3.Connection) -> None:
@@ -1071,7 +1426,7 @@ def run_lcm_migrations(
     6. :func:`_drop_legacy_conversation_session_key_index` — drops the
        obsolete non-partial UNIQUE replaced by the v3.1 partial UNIQUE
        (this PR). Runs after the partial UNIQUE is created.
-    7. :func:`_ensure_fts5_tables` — stub, body in #01-05.
+    7. :func:`_ensure_fts5_tables` — 3 FTS5 virtual tables (#01-05).
     8. :func:`_ensure_v41_tables` — stub, body in #01-06 (creates
        ``lcm_embedding_meta`` which #9 depends on).
     9. :func:`_ensure_core_triggers` — stub, body in #01-06 (depends on
@@ -1096,10 +1451,12 @@ def run_lcm_migrations(
             :func:`lossless_hermes.db.connection.open_lcm_db` (so PRAGMAs
             including ``foreign_keys = ON`` are already applied).
         fts5_available: When ``True`` (default), :func:`_ensure_fts5_tables`
-            will create FTS5 virtual tables once #01-05 lands. Pass
-            ``False`` to skip FTS5 creation (e.g. tests that deliberately
-            exclude FTS5 to validate the LIKE-fallback path). Caller can
-            resolve the default from
+            creates the 3 FTS5 virtual tables (``messages_fts``,
+            ``summaries_fts``, ``summaries_fts_cjk`` (gated internally on
+            trigram tokenizer availability)). Pass ``False`` to skip FTS5
+            creation entirely (e.g. tests that deliberately exclude FTS5
+            to validate the LIKE-fallback path). Caller can resolve the
+            default from
             :func:`lossless_hermes.db.features.get_lcm_db_features`.
         seed_default_prompts: When ``True`` (default),
             :func:`_seed_default_prompts` will seed prompts once the
@@ -1180,9 +1537,13 @@ def run_lcm_migrations(
         # legacy DROP is a no-op on a fresh DB.
         _drop_legacy_conversation_session_key_index(db)
 
-        # 7. FTS5 (stub now; body in #01-05). Skipping when fts5_available
-        # is False matches the TS contract — `migration.ts:1184` reads
+        # 7. FTS5 virtual tables (3 tables, gated on the runtime probe).
+        # Skipping when fts5_available is False matches the TS contract —
+        # `migration.ts:1184` reads
         # `options?.fts5Available ?? detectedFeatures?.fts5Available ?? false`.
+        # Trigram availability for the CJK table is resolved internally via
+        # `get_lcm_db_features(db)` — the savepoint-based probe is safe inside
+        # the BEGIN EXCLUSIVE transaction.
         _ensure_fts5_tables(db, fts5_available=fts5_available)
 
         # 8. v4.1 tables (stub now; body in #01-06). Must precede the
