@@ -1,25 +1,38 @@
-"""Compaction engine — trigger evaluation foundation (issue 04-01).
+"""Compaction engine — trigger evaluation + anti-thrashing guards.
 
 Ports :class:`CompactionEngine` from
 ``lossless-claw/src/compaction.ts`` (LCM commit ``1f07fbd`` on branch
-``pr-613``) to Python. **Issue 04-01 lands only the trigger-evaluation
-foundation** — the two evaluators that decide whether compaction should
-run this turn:
+``pr-613``) to Python.
 
-* :meth:`CompactionEngine.evaluate` — context-level threshold trigger
-  (TS lines 408-438). Returns a :class:`CompactionDecision` carrying
-  ``should_compact``, ``reason``, ``current_tokens``, ``threshold``.
-* :meth:`CompactionEngine.evaluate_leaf_trigger` — soft incremental
-  leaf trigger (TS lines 447-459). Returns a :class:`LeafTriggerResult`
-  carrying ``should_compact``, ``reason``, ``raw_tokens_outside_tail``,
-  ``threshold``.
+**Issues landed in this file:**
 
-The heavy machinery (leaf pass, condensed pass, full sweep,
-``compact_until_under``, telemetry-decision logging, anti-thrashing
-state) ships in subsequent issues 04-02..04-08. This file is the
-foundation: subsequent issues extend :class:`CompactionEngine` with
-additional methods + private helpers, sharing this module's imports +
-``config`` / ``store`` plumbing.
+* **04-01** — trigger-evaluation foundation:
+    * :meth:`CompactionEngine.evaluate` — context-level threshold
+      trigger (TS lines 408-438).
+    * :meth:`CompactionEngine.evaluate_leaf_trigger` — soft incremental
+      leaf trigger (TS lines 447-459).
+* **04-04** — the 3 anti-thrashing guards (this PR):
+    * Guard 1 (Wave-12) — per-pass progress guard inside
+      :meth:`CompactionEngine.compact_full_sweep` phase-1 + phase-2 loops
+      (TS lines 705-712 + mirror 757-759).
+    * Guard 2 — :meth:`CompactionEngine.compact_until_under` bail-out
+      (TS line 849).
+    * Guard 3 lives in :mod:`lossless_hermes.summarize` per issue 04-06
+      (the ``_summarize_with_escalation`` cascade).
+
+The :meth:`compact_full_sweep` + :meth:`compact_until_under` methods
+landed by 04-04 are intentionally **skeletons**: they embody the guard
+logic (and the surrounding control-flow scaffolding the guards need to
+make sense) but defer the full leaf-pass / condensed-pass / chunk-
+selection / persistence machinery to issues 04-02 and 04-03. Subclass
+hooks (:meth:`CompactionEngine._run_leaf_pass`,
+:meth:`CompactionEngine._run_condensed_pass`) let regression tests
+drive the guards directly without a fully-migrated SQLite DB; 04-02 /
+04-03 will fill in the production implementations of those hooks.
+
+Subsequent issues 04-02..04-08 extend this class further with the
+selection helpers, persistence calls, telemetry-decision logging, and
+the cross-call anti-thrashing state.
 
 ### Why this lives at ``src/lossless_hermes/compaction.py`` (not the engine package)
 
@@ -94,30 +107,44 @@ See:
 
 ### Wave-N provenance
 
-This file does NOT touch any of the eight known Wave-N fix sites
-enumerated in ADR-029 §"Known Wave-N fixes to preserve". The evaluate
-trigger logic is pre-Wave-N (it's been stable since LCM v3); the
-load-bearing fixes are in the leaf-pass / condensed-pass / telemetry
-machinery that lands in 04-02..04-08. If a Wave-N tagged TS line is
-ported into this file by a follow-up issue, that issue MUST carry the
-``# LCM Wave-N`` comment per ADR-029.
+Issue 04-01 (trigger evaluation) is pre-Wave-N — the gate logic has
+been stable since LCM v3. Issue 04-04 (this PR) introduces the
+**Wave-12 per-pass progress guard** at the phase-1 + phase-2 loop
+breakpoints inside :meth:`CompactionEngine.compact_full_sweep` (TS
+lines 705-712 and the mirroring 757-759). Both sites carry the
+inline ``# LCM Wave-12`` comment per ADR-029; ``grep -n "Wave-12"
+src/lossless_hermes/compaction.py`` MUST find at least two hits.
+Guard 2 (``compact_until_under`` bail-out) and Guard 3
+(``_summarize_with_escalation`` escalation cascade, lives in
+:mod:`lossless_hermes.summarize` per issue 04-06) are not flagged
+Wave-N but are commented as "Anti-thrashing" intent so a future
+contributor doesn't quietly drop them.
+
+If a later issue ports additional Wave-N tagged TS lines into this
+file (e.g. 04-02 may surface another Wave marker), that issue MUST
+carry the ``# LCM Wave-N`` comment per ADR-029.
 """
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 __all__ = [
     "CompactionConfig",
     "CompactionDecision",
     "CompactionEngine",
+    "CompactionLevel",
     "CompactionReason",
+    "CompactionResult",
+    "CompactUntilUnderResult",
     "DEFAULT_LEAF_CHUNK_TOKENS",
     "EMPTY_FRESH_TAIL_ORDINAL",
+    "LeafPassResult",
     "LeafTriggerReason",
     "LeafTriggerResult",
+    "SummarizeFn",
 ]
 
 
@@ -222,6 +249,163 @@ class LeafTriggerResult:
     reason: LeafTriggerReason
     raw_tokens_outside_tail: int
     threshold: int
+
+
+# ---------------------------------------------------------------------------
+# Compaction-result types — :data:`CompactionLevel`,
+# :class:`LeafPassResult`, :class:`CompactionResult`,
+# :class:`CompactUntilUnderResult`
+# ---------------------------------------------------------------------------
+
+
+#: Escalation level recorded on each pass. Mirrors TS
+#: ``CompactionLevel`` (compaction.ts line 63):
+#:
+#: * ``"normal"`` — first-pass summarize succeeded.
+#: * ``"aggressive"`` — normal mode's output did not compress (Guard 3
+#:   in :mod:`lossless_hermes.summarize` retried with aggressive).
+#: * ``"fallback"`` — aggressive also did not compress (Guard 3 fell
+#:   through to the deterministic non-LLM fallback).
+#: * ``"capped"`` — summary was post-trimmed to honor
+#:   ``summary_max_overage_factor``.
+#:
+#: 04-04 declares this type so :class:`CompactionResult` and
+#: :class:`LeafPassResult` can reference it; the escalation logic that
+#: produces ``"aggressive"`` / ``"fallback"`` lives in 04-06.
+CompactionLevel = Literal["normal", "aggressive", "fallback", "capped"]
+
+
+@dataclass(frozen=True)
+class LeafPassResult:
+    """The result of an internal leaf-pass or condensed-pass step.
+
+    Mirrors TS ``PassResult`` (compaction.ts lines 75-94). 04-04 lands
+    only the shape — the actual leaf-pass body that produces these
+    records (and the persistence transaction that backs each
+    ``summary_id``) lands in 04-02 / 04-03. Tests in 04-04 supply
+    pre-built :class:`LeafPassResult` instances through the
+    :meth:`CompactionEngine._run_leaf_pass` /
+    :meth:`CompactionEngine._run_condensed_pass` subclass hooks so the
+    anti-thrashing guards can be exercised end-to-end without a fully
+    migrated SQLite DB.
+
+    Attributes:
+        summary_id: Identifier of the summary row created by the pass.
+            Production code uses ``"sum_" + sha256(content+now)[:16]``;
+            test stand-ins may use any non-empty string.
+        level: Escalation level the summarizer settled on. See
+            :data:`CompactionLevel`.
+        content: The summary text the pass produced. Carried through to
+            the next pass's ``previous_summary`` context (TS line 702
+            ``previousSummaryContent = leafResult.content``).
+        removed_tokens: Sum of source-message token counts that the
+            pass replaced with the new summary. Feeds the running-delta
+            arithmetic ``tokensAfter = tokensBefore - removed + added``
+            (TS line 689).
+        added_tokens: Token count of the newly created summary. Other
+            half of the running-delta arithmetic.
+    """
+
+    summary_id: str
+    level: CompactionLevel
+    content: str
+    removed_tokens: int
+    added_tokens: int
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """The result of :meth:`CompactionEngine.compact_full_sweep`.
+
+    Mirrors TS ``CompactionResult`` (compaction.ts lines 18-32). 04-04
+    lands the shape plus a small addition — ``passes_completed`` — so
+    regression tests can assert "the Wave-12 guard broke us out of the
+    loop after N passes, well below the budget".
+
+    Attributes:
+        action_taken: ``True`` iff at least one leaf or condensed pass
+            ran to completion. Matches TS ``actionTaken``.
+        tokens_before: Token count read from the summary store at the
+            start of the sweep.
+        tokens_after: Token count at the end of the sweep, computed via
+            running-delta arithmetic (NOT a fresh DB read — see TS
+            line 668 for the delta-tracking comment).
+        created_summary_id: ID of the most recent summary the sweep
+            produced. ``None`` when ``action_taken=False``. Matches TS
+            ``createdSummaryId`` (optional in TS; ``None`` here).
+        condensed: ``True`` iff at least one phase-2 condensed pass ran.
+            ``False`` when only leaf passes ran or nothing happened.
+        level: Escalation level recorded by the most recent pass.
+            ``None`` when no pass ran. Matches TS ``level``.
+        passes_completed: Total number of leaf+condensed passes that
+            ran successfully. **Not in TS** — added in 04-04 so
+            regression tests for the Wave-12 guard can assert
+            "broke early before exhausting the no-effective-bound
+            phase loop". Telemetry in 04-08 may consume the field;
+            production callers can ignore it.
+        auth_failure: ``True`` iff a pass short-circuited because the
+            LLM raised a provider-auth error. ``False`` by default.
+            Matches TS ``authFailure`` (optional in TS; ``False`` here
+            so the dataclass stays frozen + comparable).
+    """
+
+    action_taken: bool
+    tokens_before: int
+    tokens_after: int
+    created_summary_id: str | None
+    condensed: bool
+    level: CompactionLevel | None
+    passes_completed: int
+    auth_failure: bool = False
+
+
+#: Type alias for the summarize callback ``compact_full_sweep`` /
+#: ``compact_until_under`` accept. Mirrors TS ``CompactionSummarizeFn``
+#: (compaction.ts lines 70-74). Sync per ADR-017 §"Option 1" — Hermes's
+#: ``auxiliary_client.call_llm`` is synchronous, so the compaction
+#: subsystem can stay sync end-to-end with no event-loop interaction.
+#:
+#: Args:
+#:     text: The source text to summarize (concatenated raw messages or
+#:         lower-tier summaries).
+#:     aggressive: ``True`` when the caller wants the aggressive prompt
+#:         template (Guard 3 escalation path in :mod:`summarize`).
+#:     options: Optional dict carrying ``previous_summary`` /
+#:         ``is_condensed`` / ``depth``. The 04-06 escalation cascade
+#:         reads these.
+#:
+#: Returns:
+#:     The summary text. Caller's anti-thrashing logic (Guard 3) checks
+#:     the returned length against the input.
+SummarizeFn = Callable[..., str]
+
+
+@dataclass(frozen=True)
+class CompactUntilUnderResult:
+    """The result of :meth:`CompactionEngine.compact_until_under`.
+
+    Mirrors the TS return shape (compaction.ts lines 786, 819-855).
+    Carries the bail-out verdict + the round count + the final token
+    count so callers + telemetry can distinguish "stopped because we
+    succeeded" from "stopped because we were thrashing" from "exhausted
+    max_rounds".
+
+    Attributes:
+        success: ``True`` iff ``final_tokens <= target_tokens``.
+            ``False`` when Guard 2 (no-progress bail-out) tripped or
+            ``max_rounds`` exhausted without reaching the target.
+        rounds: Number of compaction rounds attempted. ``0`` when the
+            initial token count was already at/below the target.
+        final_tokens: The token count at the moment the loop exited
+            (post-last-round, or the initial count when ``rounds=0``).
+        auth_failure: ``True`` iff a round short-circuited on a
+            provider-auth error.
+    """
+
+    success: bool
+    rounds: int
+    final_tokens: int
+    auth_failure: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -794,3 +978,454 @@ class CompactionEngine:
             raw_tokens += self._get_message_token_count(item.message_id)
 
         return raw_tokens
+
+    # ------------------------------------------------------------------
+    # compact_full_sweep() — phase-1 + phase-2 loops with Wave-12 guards
+    # ------------------------------------------------------------------
+
+    def compact_full_sweep(
+        self,
+        conversation_id: int,
+        token_budget: int,
+        summarize: SummarizeFn,
+        *,
+        force: bool = False,
+        hard_trigger: bool = False,
+        summary_model: str | None = None,
+    ) -> CompactionResult:
+        """Run a full compaction sweep — phase-1 leaf passes + phase-2 condensed passes.
+
+        Mirrors TS :meth:`CompactionEngine.compactFullSweep`
+        (compaction.ts lines 626-774). **04-04 skeletal landing.** The
+        guard logic (Wave-12 per-pass progress check at the phase-1 +
+        phase-2 break sites) is load-bearing here; the leaf-chunk
+        selection, persistence, telemetry, and full pass bodies land
+        in issue 04-02 (and 04-03 for condensation). Tests inject
+        :meth:`_run_leaf_pass` / :meth:`_run_condensed_pass` overrides
+        to drive the guards.
+
+        Algorithm (matches TS verbatim):
+
+        1. Read ``tokens_before = summary_store.get_context_token_count``.
+        2. Compute ``threshold = floor(context_threshold * token_budget)``.
+        3. Evaluate the leaf trigger. If ``!force`` AND ``tokens_before <=
+           threshold`` AND ``!leaf_trigger.should_compact`` → return a
+           no-op result. (TS lines 640-647.)
+        4. **Phase 1** — loop ``_run_leaf_pass`` until:
+           * No leaf chunk left to process, OR
+           * Pass returned ``None`` (provider-auth failure), OR
+           * ``!force`` AND ``pass_tokens_after <= threshold`` (TS lines
+             705-708 — under-threshold short-circuit), OR
+           * **Guard 1 (Wave-12)** — pass made no progress against
+             either the immediate floor (``pass_tokens_after >=
+             pass_tokens_before``) or the running floor
+             (``pass_tokens_after >= previous_tokens``). (TS lines
+             709-712.)
+        5. **Phase 2** — same loop pattern for condensed passes, only
+           runs while ``force`` is set OR ``previous_tokens >
+           threshold``. Same Wave-12 guard at the break point (TS lines
+           757-759).
+        6. Return :class:`CompactionResult` with running-delta
+           ``tokens_after`` + the recorded escalation level + the
+           passes-completed counter the 04-04 regression tests assert
+           on.
+
+        Args:
+            conversation_id: The conversation to compact.
+            token_budget: The model's context window. Threshold derives
+                from this.
+            summarize: The LLM summarize callback (sync per ADR-017).
+                Passed through to :meth:`_run_leaf_pass` /
+                :meth:`_run_condensed_pass`.
+            force: When ``True``, skip the under-threshold short-circuit
+                in step 3 + ignore the under-threshold break inside
+                the phase loops. Used by
+                :meth:`compact_until_under` to keep pressing past the
+                target until either the budget is met or a guard
+                trips.
+            hard_trigger: Passed through to condensed-pass candidate
+                selection (04-03). Loosens the fanout threshold.
+            summary_model: Optional model override forwarded to the
+                summarize callback.
+
+        Returns:
+            A :class:`CompactionResult`. ``action_taken=False`` when
+            the trigger said "no work needed" or the context is
+            empty; otherwise reflects the phase-1 + phase-2 deltas.
+        """
+        tokens_before = self._summary_store.get_context_token_count(conversation_id)
+        threshold = int(self._config.context_threshold * token_budget)
+        leaf_trigger = self.evaluate_leaf_trigger(conversation_id)
+
+        # TS lines 640-647: short-circuit when neither trigger is active.
+        if not force and tokens_before <= threshold and not leaf_trigger.should_compact:
+            return CompactionResult(
+                action_taken=False,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                created_summary_id=None,
+                condensed=False,
+                level=None,
+                passes_completed=0,
+            )
+
+        # TS lines 649-657: empty-context short-circuit. 04-04 skeleton
+        # uses ``get_context_items`` directly; 04-02 will switch to the
+        # ``getContextItemsCached`` helper (TS line 649). For the
+        # purposes of the guard tests this distinction is invisible —
+        # the cached helper is a refcount wrapper, not a semantic
+        # change.
+        context_items = self._summary_store.get_context_items(conversation_id)
+        if not context_items:
+            return CompactionResult(
+                action_taken=False,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                created_summary_id=None,
+                condensed=False,
+                level=None,
+                passes_completed=0,
+            )
+
+        action_taken = False
+        condensed = False
+        created_summary_id: str | None = None
+        level: CompactionLevel | None = None
+        previous_summary_content: str | None = None
+        previous_tokens = tokens_before
+        had_auth_failure = False
+        passes_completed = 0
+
+        # TS lines 670-713: phase-1 loop. Delta-tracked running token
+        # count; on each pass we compute ``pass_tokens_after =
+        # pass_tokens_before - removed + added`` (TS line 689).
+        running_tokens = tokens_before
+        while True:
+            pass_tokens_before = running_tokens
+            leaf_result = self._run_leaf_pass(
+                conversation_id=conversation_id,
+                summarize=summarize,
+                previous_summary_content=previous_summary_content,
+                summary_model=summary_model,
+            )
+            if leaf_result is None:
+                # TS line 685-687: either nothing left to compact (TS
+                # treats ``leafChunk.items.length === 0`` as a clean
+                # break) OR a provider-auth failure surfaced from
+                # ``_leafPass``. 04-04 skeleton funnels both through
+                # the same ``None`` return; 04-02 will split them.
+                break
+
+            pass_tokens_after = (
+                pass_tokens_before - leaf_result.removed_tokens + leaf_result.added_tokens
+            )
+
+            action_taken = True
+            created_summary_id = leaf_result.summary_id
+            level = leaf_result.level
+            previous_summary_content = leaf_result.content
+            running_tokens = pass_tokens_after
+            passes_completed += 1
+
+            # TS lines 705-708: under-threshold short-circuit (only
+            # honored when not forced). Sets the running floor so the
+            # phase-2 ``force || previousTokens > threshold`` gate
+            # behaves correctly when we transition.
+            if not force and pass_tokens_after <= threshold:
+                previous_tokens = pass_tokens_after
+                break
+
+            # LCM Wave-12 (2026-04-22): per-pass progress guard prevents
+            # thrashing when the summarizer returns near-input-size
+            # output. Break if pass made no progress against either the
+            # immediate or running floor.
+            # Original: lossless-claw/src/compaction.ts:709-712.
+            if pass_tokens_after >= pass_tokens_before or pass_tokens_after >= previous_tokens:
+                break
+            previous_tokens = pass_tokens_after
+
+        # TS lines 716-761: phase-2 loop. Only runs while we're either
+        # forced or still over the threshold; otherwise phase-1 already
+        # ended the sweep.
+        while force or previous_tokens > threshold:
+            pass_tokens_before = running_tokens
+            condense_result = self._run_condensed_pass(
+                conversation_id=conversation_id,
+                hard_trigger=hard_trigger,
+                summarize=summarize,
+                summary_model=summary_model,
+            )
+            if condense_result is None:
+                # TS lines 721-723 (no candidate) + 733-735 (auth
+                # failure). 04-04 skeleton conflates these the same
+                # way phase-1 does.
+                break
+
+            pass_tokens_after = (
+                pass_tokens_before - condense_result.removed_tokens + condense_result.added_tokens
+            )
+
+            action_taken = True
+            condensed = True
+            created_summary_id = condense_result.summary_id
+            level = condense_result.level
+            running_tokens = pass_tokens_after
+            passes_completed += 1
+
+            # TS lines 753-755: under-threshold short-circuit.
+            if not force and pass_tokens_after <= threshold:
+                previous_tokens = pass_tokens_after
+                break
+
+            # LCM Wave-12 (2026-04-22): per-pass progress guard, mirror
+            # of the phase-1 break — prevents thrashing when the
+            # condensed-pass summarizer also returns near-input-size
+            # output. Break if pass made no progress against either
+            # the immediate or running floor.
+            # Original: lossless-claw/src/compaction.ts:757-759.
+            if pass_tokens_after >= pass_tokens_before or pass_tokens_after >= previous_tokens:
+                break
+            previous_tokens = pass_tokens_after
+
+        return CompactionResult(
+            action_taken=action_taken,
+            tokens_before=tokens_before,
+            tokens_after=running_tokens,
+            created_summary_id=created_summary_id,
+            condensed=condensed,
+            level=level,
+            passes_completed=passes_completed,
+            auth_failure=had_auth_failure,
+        )
+
+    # ------------------------------------------------------------------
+    # compact_until_under() — bounded-rounds bail-out with Guard 2
+    # ------------------------------------------------------------------
+
+    def compact_until_under(
+        self,
+        conversation_id: int,
+        token_budget: int,
+        summarize: SummarizeFn,
+        *,
+        target_tokens: int | None = None,
+        current_tokens: int | None = None,
+        summary_model: str | None = None,
+    ) -> CompactUntilUnderResult:
+        """Repeatedly invoke :meth:`compact_full_sweep` until under the target.
+
+        Mirrors TS :meth:`CompactionEngine.compactUntilUnder` (compaction.ts
+        lines 779-867). **04-04 skeletal landing.** Guard 2 (the
+        ``!result.actionTaken || result.tokensAfter >= lastTokens``
+        bail-out) is the load-bearing piece this issue ports. The
+        per-round ``compact_full_sweep`` call is the same one issue
+        04-02 fully ports; 04-04 keeps the call live so the regression
+        test can drive the round loop end-to-end.
+
+        Algorithm (matches TS verbatim):
+
+        1. Resolve ``target_tokens`` — caller's positive value, else
+           ``token_budget``. (TS lines 799-804.)
+        2. Read ``stored_tokens`` + optional ``current_tokens`` (live),
+           seed ``last_tokens = max(stored, live)``. (TS lines 806-813.)
+        3. If ``last_tokens < target_tokens`` already → return
+           ``success=True, rounds=0``. Equality is intentionally
+           treated as "still needs compaction" — see TS lines 815-820.
+        4. Loop up to ``config.max_rounds``:
+           * Call ``compact_full_sweep(force=True)`` (forced because
+             :meth:`compact_until_under` is itself the "force"
+             entrypoint — TS line 827).
+           * Auth-failure path returns ``success=False, auth_failure=
+             True``. (TS lines 831-838.)
+           * Success path (``tokens_after <= target_tokens``) returns
+             ``success=True``. (TS lines 840-846.)
+           * **Guard 2** — bail out when the round made no progress
+             (``!action_taken`` or ``tokens_after >= last_tokens``).
+             (TS lines 848-855.)
+           * Otherwise advance ``last_tokens`` to the new floor.
+        5. ``max_rounds`` exhausted → return ``success = (final_tokens
+           <= target_tokens)`` (the boundary case in TS lines 860-866;
+           usually ``False`` unless the very last round just barely
+           made it).
+
+        Args:
+            conversation_id: The conversation to compact.
+            token_budget: The model's context window.
+            summarize: The LLM summarize callback (sync, ADR-017).
+            target_tokens: Optional target. When ``None`` / non-positive
+                falls through to ``token_budget``. (TS treats the
+                non-finite path same way.)
+            current_tokens: Optional live token count override; max'd
+                with the stored count.
+            summary_model: Optional model override forwarded down.
+
+        Returns:
+            A :class:`CompactUntilUnderResult` capturing the round
+            count + final tokens + success verdict + auth-failure
+            flag.
+        """
+        # TS lines 799-804: resolve target. Negative / zero collapses to
+        # the budget; Python ints are unbounded + never NaN so the TS
+        # ``Number.isFinite`` check has no analogue.
+        effective_target = (
+            int(target_tokens) if target_tokens is not None and target_tokens > 0 else token_budget
+        )
+
+        stored_tokens = self._summary_store.get_context_token_count(conversation_id)
+        live_tokens = (
+            int(current_tokens) if current_tokens is not None and current_tokens > 0 else 0
+        )
+        last_tokens = max(stored_tokens, live_tokens)
+
+        # TS lines 815-820: ``< target`` ⇒ already under. Equality is
+        # NOT a success — TS comment says forced-overflow recovery may
+        # pass an observed count equal to budget, and we still want to
+        # try one more compaction pass to free up framing-overhead
+        # headroom.
+        if last_tokens < effective_target:
+            return CompactUntilUnderResult(
+                success=True,
+                rounds=0,
+                final_tokens=last_tokens,
+            )
+
+        for round_index in range(1, self._config.max_rounds + 1):
+            result = self.compact_full_sweep(
+                conversation_id=conversation_id,
+                token_budget=token_budget,
+                summarize=summarize,
+                force=True,  # TS line 827: forced sweep inside the round loop.
+                summary_model=summary_model,
+            )
+
+            # TS lines 831-838: short-circuit on provider-auth failure
+            # so caller can surface a clean error instead of looping.
+            if result.auth_failure:
+                return CompactUntilUnderResult(
+                    success=False,
+                    rounds=round_index,
+                    final_tokens=result.tokens_after,
+                    auth_failure=True,
+                )
+
+            # TS lines 840-846: success path.
+            if result.tokens_after <= effective_target:
+                return CompactUntilUnderResult(
+                    success=True,
+                    rounds=round_index,
+                    final_tokens=result.tokens_after,
+                )
+
+            # Anti-thrashing: bail out if a single round made no progress.
+            # Either the sweep took no action at all (no eligible
+            # chunks) or it did but the post-sweep token count is
+            # still >= the pre-round floor. Without this, the loop
+            # would burn through every ``max_rounds`` slot retrying a
+            # configuration that cannot make progress.
+            # Original: lossless-claw/src/compaction.ts:848-855.
+            if not result.action_taken or result.tokens_after >= last_tokens:
+                return CompactUntilUnderResult(
+                    success=False,
+                    rounds=round_index,
+                    final_tokens=result.tokens_after,
+                )
+
+            last_tokens = result.tokens_after
+
+        # TS lines 860-866: ``max_rounds`` exhausted. The final-tokens
+        # boundary case (``finalTokens <= targetTokens``) is the only
+        # way ``success`` ends up True via this exit — usually it's
+        # False (otherwise the in-loop success short-circuit would
+        # have returned).
+        return CompactUntilUnderResult(
+            success=last_tokens <= effective_target,
+            rounds=self._config.max_rounds,
+            final_tokens=last_tokens,
+        )
+
+    # ------------------------------------------------------------------
+    # Subclass hooks — pluggable leaf/condensed-pass bodies for 04-02/03
+    # ------------------------------------------------------------------
+    #
+    # 04-04 needs to invoke a leaf or condensed pass to exercise the
+    # Wave-12 guard and the ``compact_until_under`` bail-out. But the
+    # actual pass bodies (chunk selection + summarizer call +
+    # persistence transaction + cache invalidation) land in 04-02 and
+    # 04-03. So 04-04 exposes ``_run_leaf_pass`` and
+    # ``_run_condensed_pass`` as overridable hooks: production wiring
+    # will replace these with the real implementations once 04-02 and
+    # 04-03 land; regression tests for 04-04 supply stub overrides that
+    # drive controlled progress (or lack thereof) into the guards.
+
+    def _run_leaf_pass(
+        self,
+        *,
+        conversation_id: int,
+        summarize: SummarizeFn,
+        previous_summary_content: str | None,
+        summary_model: str | None,
+    ) -> LeafPassResult | None:
+        """Run one leaf pass and return the resulting summary, or ``None``.
+
+        04-04 skeletal stub. Production body lands in issue 04-02
+        (``_leafPass`` in TS, ``compaction.ts:1492-1607``). Return
+        ``None`` to terminate the phase-1 loop — semantic overload that
+        04-02 will split into "no chunk left" (clean break) vs
+        "provider-auth failure" (sets ``auth_failure=True`` on the
+        result).
+
+        04-04 default returns ``None`` so a vanilla
+        :class:`CompactionEngine` exits the phase-1 loop immediately
+        without doing any work. Regression tests subclass and override
+        to return controlled :class:`LeafPassResult` instances.
+
+        Args:
+            conversation_id: The conversation being compacted.
+            summarize: The summarize callback passed down from
+                :meth:`compact_full_sweep`.
+            previous_summary_content: ``content`` field from the most
+                recent ``LeafPassResult``, or ``None`` on the first
+                call. Provides iterative-summarization continuity.
+            summary_model: Optional model override for this pass.
+
+        Returns:
+            A :class:`LeafPassResult` if a pass produced a summary,
+            ``None`` otherwise. The Wave-12 guard inspects
+            ``removed_tokens`` + ``added_tokens`` (via the
+            running-delta arithmetic) to decide whether the pass made
+            progress.
+        """
+        # Silence the unused-arg warnings without ignoring the names —
+        # subclasses in 04-02 + tests use every parameter.
+        del conversation_id, summarize, previous_summary_content, summary_model
+        return None
+
+    def _run_condensed_pass(
+        self,
+        *,
+        conversation_id: int,
+        hard_trigger: bool,
+        summarize: SummarizeFn,
+        summary_model: str | None,
+    ) -> LeafPassResult | None:
+        """Run one condensed pass and return the resulting summary, or ``None``.
+
+        04-04 skeletal stub. Production body lands in issue 04-03
+        (the condensed-pass + chunk-selection helpers in TS). Same
+        ``None``-terminates-the-loop contract as :meth:`_run_leaf_pass`.
+
+        Args:
+            conversation_id: The conversation being compacted.
+            hard_trigger: Whether the caller is a hard-trigger sweep
+                (loosens condensed-pass fanout thresholds).
+            summarize: The summarize callback passed down from
+                :meth:`compact_full_sweep`.
+            summary_model: Optional model override for this pass.
+
+        Returns:
+            A :class:`LeafPassResult` if a pass produced a summary,
+            ``None`` otherwise. Phase-2's Wave-12 guard inspects the
+            same fields as phase-1.
+        """
+        del conversation_id, hard_trigger, summarize, summary_model
+        return None
