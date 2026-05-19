@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,7 +45,6 @@ from typing import Any
 import pytest
 
 from lossless_hermes.commands.rotate import _get_unavailable_reason, run
-from lossless_hermes.db.connection import close_lcm_db, open_lcm_db
 from lossless_hermes.db.migration import run_lcm_migrations
 from lossless_hermes.engine import LCMEngine
 from lossless_hermes.store.conversation import (
@@ -59,31 +59,55 @@ from lossless_hermes.store.conversation import (
 
 
 @pytest.fixture
-def file_db(tmp_path: Path) -> Any:
+def file_db(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
     """A file-backed, migrated LCM database.
 
     Rotate's first step is a backup via ``VACUUM INTO``, which requires
-    a file-backed source — so unlike ``test_status.py`` we cannot use a
-    ``:memory:`` DB here. ``open_lcm_db`` applies WAL mode (so the
-    ``PRAGMA wal_checkpoint`` step is meaningful) and FK enforcement.
+    a *file-backed* source — so unlike ``test_status.py`` we cannot use a
+    ``:memory:`` DB here.
+
+    We deliberately use a bare :func:`sqlite3.connect` rather than
+    :func:`lossless_hermes.db.connection.open_lcm_db`. ``open_lcm_db``
+    runs the Apple-system-Python guard (ADR-004) and loads the
+    ``sqlite-vec`` extension; the macOS CI matrix uses an
+    ``actions/setup-python`` CPython build that lacks
+    ``sqlite3.Connection.enable_load_extension``, so ``open_lcm_db``
+    raises :class:`RuntimeError` there. Rotate reads nothing that needs
+    ``sqlite-vec`` (it backs the DB up, checkpoints the WAL, and writes
+    ``state_meta``), so a plain connection is sufficient and portable —
+    this mirrors ``tests/commands/test_backup.py``'s use of bare
+    ``sqlite3.connect``.
+
+    The connection is configured to match the load-bearing aspects of
+    a production ``open_lcm_db`` connection for this test:
+
+    * ``isolation_level=None`` (autocommit) — so the migration ladder
+      leaves no dangling write transaction into the backup's
+      ``VACUUM INTO`` (which fails with "database is locked" if one is
+      open).
+    * ``PRAGMA journal_mode = WAL`` — so the rotate handler's
+      ``PRAGMA wal_checkpoint(TRUNCATE)`` step is meaningful.
+    * ``PRAGMA foreign_keys = ON`` — production parity.
 
     Yields a ``(connection, db_path)`` pair; the connection is closed on
     teardown and ``tmp_path`` cleanup removes the file + any ``.bak``.
     """
     db_path = tmp_path / "lcm.db"
-    conn = open_lcm_db(db_path)
-    # FTS5 may be absent on some CPython builds — the migration ladder
-    # skips the FTS branches when told so. Rotate reads nothing from
-    # FTS, so skipping is safe.
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        # FTS5 may be absent on some CPython builds — the migration
+        # ladder skips the FTS branches when told so. Rotate reads
+        # nothing from FTS, so skipping is safe.
         run_lcm_migrations(conn, fts5_available=False)
     except Exception:
-        close_lcm_db(conn)
+        conn.close()
         raise
     try:
         yield conn, db_path
     finally:
-        close_lcm_db(conn)
+        conn.close()
 
 
 def _make_engine(
