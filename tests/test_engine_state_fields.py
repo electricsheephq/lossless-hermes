@@ -80,14 +80,14 @@ def test_context_engine_info_is_frozen_dataclass() -> None:
 def test_context_engine_info_default_values() -> None:
     """02-02: default values match the spec table.
 
-    ``name="lcm"`` (ADR-001 selector string), ``version="0.1.1"``
-    (bumped from 0.1.0 by the v0.1.1 patch — tracks ``pyproject.toml``),
-    ``owns_compaction=True`` (degrades to False only on migration
-    failure — Epic 04 wires that path).
+    ``name="lcm"`` (ADR-001 selector string), ``version="0.1.2"``
+    (bumped from 0.1.1 by the v0.1.2 durability patch — tracks
+    ``pyproject.toml``), ``owns_compaction=True`` (degrades to False only
+    on migration failure — Epic 04 wires that path).
     """
     info = ContextEngineInfo()
     assert info.name == "lcm"
-    assert info.version == "0.1.1"
+    assert info.version == "0.1.2"
     assert info.owns_compaction is True
 
 
@@ -109,7 +109,7 @@ def test_engine_info_is_context_engine_info() -> None:
     engine = LCMEngine()
     assert isinstance(engine.info, ContextEngineInfo)
     assert engine.info.name == "lcm"
-    assert engine.info.version == "0.1.1"
+    assert engine.info.version == "0.1.2"
     assert engine.info.owns_compaction is True
 
 

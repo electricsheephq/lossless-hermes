@@ -581,9 +581,27 @@ def open_lcm_db(
     # the registry walk in :func:`close_lcm_connection` (test fixtures may
     # close from a different thread than the opener).
     #
+    # ``isolation_level=None`` puts the connection in autocommit /
+    # explicit-transactions mode — every write either autocommits
+    # immediately or runs inside an explicit ``BEGIN``/``COMMIT``. This is
+    # load-bearing for durability (issue #144): Python's stdlib default
+    # ``isolation_level=""`` silently opens an implicit deferred
+    # transaction on the first DML and never commits it, so a session's
+    # ingested rows roll back on ``conn.close()``. ``isolation_level=None``
+    # matches (a) the ``node:sqlite`` ``DatabaseSync`` semantics the TS
+    # source relies on, (b) the :class:`_ApswConnectionAdapter` autocommit
+    # contract this factory exists to mirror, and (c) the explicit
+    # expectation documented across the store / concurrency / doctor /
+    # synthesis layers (e.g. ``concurrency/worker_lock.py``,
+    # ``synthesis/prompt_registry.py``, ``doctor/cleaners.py``). Under this
+    # mode ``ConversationStore`` / ``SummaryStore``'s ``with_transaction``
+    # ``in_transaction`` checks correctly distinguish a genuinely-nested
+    # explicit transaction from a fresh one, and the migration ladder's
+    # ``BEGIN EXCLUSIVE`` runs from a clean autocommit state.
+    #
     # Path arg accepts both ``str`` and ``Path`` via ``str(...)``.
     path_str = str(path) if isinstance(path, Path) else path
-    conn = sqlite3.connect(path_str, check_same_thread=False)
+    conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level=None)
 
     try:
         _load_sqlite_vec(conn)
@@ -1022,7 +1040,11 @@ def open_db(
     try:
         # ``check_same_thread=False`` matches :func:`open_lcm_db` — the
         # registry permits cross-thread close in test fixtures.
-        conn = sqlite3.connect(path_str, check_same_thread=False)
+        # ``isolation_level=None`` (autocommit / explicit-transactions) is
+        # load-bearing for durability — see the rationale block in
+        # :func:`open_lcm_db`. Without it, writes on this connection roll
+        # back on close (issue #144).
+        conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level=None)
     except sqlite3.OperationalError:
         # Connection-open itself failed (e.g. read-only mount). Try apsw
         # if available; otherwise re-raise so the operator sees the real

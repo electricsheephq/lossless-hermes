@@ -526,6 +526,181 @@ def test_transaction_rollback_on_append_context_message_failure(
 
 
 # ---------------------------------------------------------------------------
+# Cross-session durability — issue #144 P0 regression
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the durability property a within-session
+# write-then-read test cannot: ingest through the real engine path,
+# CLOSE the connection, then reopen ``lcm.db`` on a FRESH connection and
+# assert the rows are still there.
+#
+# The pre-#144 bug: ``open_lcm_db`` opened the stdlib connection with
+# Python's default ``isolation_level=""``, which silently opens an
+# implicit deferred transaction on the first DML (the bare ``INSERT`` in
+# ``ConversationStore.create_conversation``). Nothing on the ingest path
+# ever committed that implicit transaction, so ``conn.close()`` rolled
+# the entire session back — a fresh reopen showed 0 rows. The fix opens
+# the connection with ``isolation_level=None`` (autocommit /
+# explicit-transactions). 4,070 tests passed pre-fix because none did a
+# close-then-reopen.
+
+
+def _count_rows(db_file: Path, table: str) -> int:
+    """Open a fresh stdlib connection to ``db_file`` and count ``table`` rows.
+
+    The fresh connection is the load-bearing part: it does not share the
+    engine's connection or its (pre-fix) uncommitted implicit transaction,
+    so it sees only what was durably committed to the file.
+    """
+    fresh = sqlite3.connect(str(db_file))
+    try:
+        return int(fresh.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])  # noqa: S608
+    finally:
+        fresh.close()
+
+
+@_skip_no_extension_loading
+def test_ingested_data_survives_connection_close(tmp_home: Path) -> None:
+    """Issue #144: a single-turn ingest is durable across ``on_session_end``.
+
+    Ingest one user+assistant turn, end the session (which calls
+    ``close_lcm_db`` → ``conn.close()``), then reopen ``lcm.db`` on a
+    fresh connection. The conversation row + both message rows must still
+    be present. Pre-#144 this reopened to 0 rows.
+    """
+    db_file = tmp_home / ".hermes" / "lossless-hermes" / "lcm.db"
+
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    eng.on_session_start("durable-sess")
+    eng._on_post_llm_call(
+        session_id="durable-sess",
+        conversation_history=[
+            {"role": "user", "content": "will I survive a close?"},
+            {"role": "assistant", "content": "yes, after the #144 fix"},
+        ],
+    )
+    # No write transaction may be left dangling at close time — a True
+    # here is the exact pre-#144 symptom (uncommitted implicit txn).
+    assert eng._db is not None
+    assert eng._db.in_transaction is False, (
+        "issue #144: an uncommitted transaction is open at close time — "
+        "ingested data will roll back on conn.close()"
+    )
+    eng.on_session_end("durable-sess", [])
+
+    # Fresh connection — sees only durably-committed data.
+    assert _count_rows(db_file, "conversations") == 1, (
+        "issue #144: the conversation row did not survive connection close"
+    )
+    assert _count_rows(db_file, "messages") == 2, (
+        "issue #144: ingested messages did not survive connection close"
+    )
+
+
+@_skip_no_extension_loading
+def test_multi_turn_ingest_survives_connection_close(tmp_home: Path) -> None:
+    """Issue #144: a multi-turn conversation is durable across close.
+
+    Turn 1 creates the conversation (via ``create_conversation``'s bare
+    INSERT — the statement that opened the uncommitted implicit txn
+    pre-fix); turns 2-3 append to it. After ``on_session_end`` a fresh
+    reopen must show the conversation row + all 6 message rows, in order.
+    """
+    db_file = tmp_home / ".hermes" / "lossless-hermes" / "lcm.db"
+
+    eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    eng.on_session_start("multi-sess")
+
+    # Turn 1 — creates the conversation row.
+    eng._on_post_llm_call(
+        session_id="multi-sess",
+        conversation_history=[
+            {"role": "user", "content": "turn 1 user"},
+            {"role": "assistant", "content": "turn 1 assistant"},
+        ],
+    )
+    # Turns 2-3 — append to the existing conversation. The full history
+    # is replayed each turn (Hermes hook contract); the engine diffs
+    # against its cursor and ingests only the delta.
+    eng._on_post_llm_call(
+        session_id="multi-sess",
+        conversation_history=[
+            {"role": "user", "content": "turn 1 user"},
+            {"role": "assistant", "content": "turn 1 assistant"},
+            {"role": "user", "content": "turn 2 user"},
+            {"role": "assistant", "content": "turn 2 assistant"},
+            {"role": "user", "content": "turn 3 user"},
+            {"role": "assistant", "content": "turn 3 assistant"},
+        ],
+    )
+    conv_id = eng._conversation_store.get_conversation_by_session_id("multi-sess").conversation_id
+    eng.on_session_end("multi-sess", [])
+
+    # Fresh connection — assert the conversation + every message row and
+    # its ordering survived.
+    assert _count_rows(db_file, "conversations") == 1
+    fresh = sqlite3.connect(str(db_file))
+    try:
+        rows = fresh.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY seq",
+            (conv_id,),
+        ).fetchall()
+    finally:
+        fresh.close()
+    assert [r[0] for r in rows] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ], f"issue #144: multi-turn messages did not survive close: {rows}"
+    assert [r[1] for r in rows] == [
+        "turn 1 user",
+        "turn 1 assistant",
+        "turn 2 user",
+        "turn 2 assistant",
+        "turn 3 user",
+        "turn 3 assistant",
+    ]
+
+
+@_skip_no_extension_loading
+def test_ingest_data_survives_reopen_via_new_engine(tmp_home: Path) -> None:
+    """Issue #144: a second ``LCMEngine`` reads the prior session's data.
+
+    The end-to-end durability contract: session A ingests + closes, then
+    a brand-new engine instance on the same ``hermes_home`` runs
+    ``on_session_start`` (reopening the same ``lcm.db``) and reads the
+    rows back through the normal store API. This is the real
+    restart-survives-data scenario the bug broke.
+    """
+    # Session A — ingest and close.
+    eng_a = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    eng_a.on_session_start("sess-A")
+    eng_a._on_post_llm_call(
+        session_id="sess-A",
+        conversation_history=[
+            {"role": "user", "content": "persisted across restart"},
+        ],
+    )
+    eng_a.on_session_end("sess-A", [])
+
+    # Session B — a fresh engine reopens the same DB and reads it back.
+    eng_b = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    eng_b.on_session_start("sess-B")
+    try:
+        conv = eng_b._conversation_store.get_conversation_by_session_id("sess-A")
+        assert conv is not None, "issue #144: conversation from a prior session was lost on close"
+        msgs = eng_b._conversation_store.get_messages(conv.conversation_id)
+        assert [m.content for m in msgs] == ["persisted across restart"], (
+            "issue #144: messages from a prior session were lost on close"
+        )
+    finally:
+        eng_b.on_session_end("sess-B", [])
+
+
+# ---------------------------------------------------------------------------
 # Per-session lock — acquisition, isolation, cross-session parallelism
 # ---------------------------------------------------------------------------
 
