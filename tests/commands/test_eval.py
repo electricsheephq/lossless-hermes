@@ -32,9 +32,13 @@ from typing import Any
 import pytest
 
 import lossless_hermes.commands.eval as eval_mod
-from lossless_hermes.commands.eval import run as run_eval_command
+import lossless_hermes.embeddings.hybrid_search as hybrid_search_mod
+from lossless_hermes.commands.eval import _build_hybrid_adapter, run as run_eval_command
 from lossless_hermes.db.migration import run_lcm_migrations
+from lossless_hermes.embeddings.hybrid_search import FtsHit, HybridSearchResult
 from lossless_hermes.eval.query_set import QueryRecord, QuerySetIdentity, register_query_set
+from lossless_hermes.store.conversation import ConversationStore, CreateConversationInput
+from lossless_hermes.store.summary import CreateSummaryInput, SummaryStore
 
 
 # ---------------------------------------------------------------------------
@@ -465,3 +469,137 @@ class TestModeNotes:
         out = run_eval_command(_parsed("eval --mode fts_only", db=db))
         assert "Note:" not in out
         assert "Warning:" not in out
+
+
+# ===========================================================================
+# Regression — the REAL hybrid adapter's injected FTS arm (issue #149)
+# ===========================================================================
+
+
+class TestHybridAdapterFtsArmContract:
+    """The real ``_fts_search`` closure must honour the ``FtsSearchFn`` contract.
+
+    **Regression for the issue #149 CRITICAL.** ``_build_hybrid_adapter``
+    builds an inner ``_fts_search`` and injects it into
+    :func:`~lossless_hermes.embeddings.hybrid_search.run_hybrid_search`.
+    ``run_hybrid_search`` invokes the injected callable with ``query``
+    **POSITIONAL** (``hybrid_search.py``:
+    ``fts_search(query_stripped, limit=k_fts, **kwargs)``) — that is the
+    :data:`~lossless_hermes.embeddings.hybrid_search.FtsSearchFn`
+    contract (``async def fts_search(query, *, limit, **filters)``).
+
+    Before the fix ``_fts_search`` declared ``query`` **keyword-only**
+    (``async def _fts_search(*, query, ...)``). A positional call then
+    raised ``TypeError: _fts_search() takes 0 positional arguments ...``.
+    Because :meth:`_HybridAdapter.search` wraps the call in a broad
+    ``except``, that ``TypeError`` was swallowed as a routine "vec0
+    missing" degrade — so ``hybrid`` / ``semantic_only`` silently
+    collapsed to FTS-only on **every** query, even with a healthy vec0 +
+    Voyage key.
+
+    These tests drive the REAL ``_build_hybrid_adapter`` (no
+    ``_build_adapter_for_mode`` monkeypatch) and call ``_fts_search`` the
+    way ``run_hybrid_search`` actually calls it. They FAIL against the
+    pre-fix keyword-only signature (anti-tautology: verified by reverting
+    the signature) and PASS against the positional-or-keyword fix.
+    """
+
+    @staticmethod
+    def _capture_injected_fts(db: sqlite3.Connection, query_text: str) -> list[FtsHit]:
+        """Drive the real hybrid adapter; return what its FTS arm produced.
+
+        Patches ``run_hybrid_search`` at its source module (the
+        ``_build_hybrid_adapter`` body does a *local* ``from ...
+        hybrid_search import run_hybrid_search`` at adapter-build time,
+        so the source-module attribute is the seam). The stand-in
+        replays ``run_hybrid_search``'s real call site verbatim —
+        ``query`` positional, ``limit`` + filter kwargs keyword — so a
+        keyword-only ``query`` parameter on ``_fts_search`` raises the
+        same ``TypeError`` it would raise in production.
+        """
+        captured: dict[str, list[FtsHit]] = {}
+
+        async def _capturing_run_hybrid_search(
+            _conn: Any, *, query: str, fts_search: Any, **_kwargs: Any
+        ) -> HybridSearchResult:
+            # Verbatim replay of hybrid_search.py's call site:
+            #   fts_search(query_stripped, limit=k_fts, **fts_filter_kwargs)
+            # `query` is POSITIONAL — this is the contract under test.
+            fts_filter_kwargs: dict[str, Any] = {
+                "session_keys": None,
+                "conversation_ids": None,
+                "since": None,
+                "before": None,
+                "summary_kinds": None,
+                "exclude_suppressed": True,
+            }
+            captured["hits"] = await fts_search(query.strip(), limit=50, **fts_filter_kwargs)
+            return HybridSearchResult(hits=[])
+
+        @dataclass
+        class _Query:
+            query_id: str
+            query_text: str
+
+        # Patch the SOURCE module — the local import inside
+        # _build_hybrid_adapter resolves the name from here.
+        original = hybrid_search_mod.run_hybrid_search
+        hybrid_search_mod.run_hybrid_search = _capturing_run_hybrid_search  # type: ignore[assignment]
+        try:
+            adapter = _build_hybrid_adapter(db)
+            import asyncio
+
+            asyncio.run(adapter.search(_Query(query_id="q1", query_text=query_text)))
+        finally:
+            hybrid_search_mod.run_hybrid_search = original  # type: ignore[assignment]
+        return captured["hits"]
+
+    def test_real_fts_arm_accepts_positional_query(self, db: sqlite3.Connection) -> None:
+        """The real ``_fts_search`` accepts a POSITIONAL ``query`` without ``TypeError``.
+
+        Pre-fix this raised ``TypeError: _fts_search() takes 0
+        positional arguments ...`` — the exact failure ``run_hybrid_search``
+        would hit in production. An empty corpus is enough: the positional
+        argument binding fails *before* ``search_summaries`` is reached,
+        so the assertion is a true regression guard, not a tautology.
+        """
+        hits = self._capture_injected_fts(db, "any query text")
+        # Empty corpus → empty list. The point is that the positional
+        # call returned cleanly rather than raising TypeError.
+        assert hits == []
+
+    def test_real_fts_arm_returns_fts_hits_for_seeded_summary(self, db: sqlite3.Connection) -> None:
+        """The real ``_fts_search`` returns proper ``FtsHit`` rows for a match.
+
+        Seeds one summary, then drives the real ``_build_hybrid_adapter``
+        FTS arm exactly as ``run_hybrid_search`` would. Proves the arm is
+        not only callable with a positional ``query`` but actually
+        produces the ``FtsHit`` shape the hybrid RRF pipeline consumes —
+        so ``hybrid`` mode does real retrieval rather than silently
+        degrading.
+        """
+        # SummaryStore.insert_summary needs a Row-factory connection.
+        # The shared ``db`` fixture leaves the default tuple factory; set
+        # it locally (harmless for the rest of the handler's read paths).
+        db.row_factory = sqlite3.Row
+        conv = ConversationStore(db, fts5_available=False).create_conversation(
+            CreateConversationInput(session_id="s1", session_key="agent:main:main", title="t")
+        )
+        SummaryStore(db, fts5_available=False, trigram_tokenizer_available=False).insert_summary(
+            CreateSummaryInput(
+                summary_id="leaf_rebase",
+                conversation_id=conv.conversation_id,
+                kind="leaf",
+                content="describe the rebase workflow in detail",
+                token_count=8,
+            )
+        )
+
+        hits = self._capture_injected_fts(db, "rebase workflow")
+
+        assert len(hits) == 1
+        hit = hits[0]
+        assert isinstance(hit, FtsHit)
+        assert hit.summary_id == "leaf_rebase"
+        # rank is 0-indexed; the single hit is at rank 0.
+        assert hit.rank == 0

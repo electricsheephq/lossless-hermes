@@ -516,9 +516,18 @@ def _build_hybrid_adapter(db: sqlite3.Connection) -> RecallSearchAdapter:
     fts_adapter = _build_fts_only_adapter(db)
 
     async def _fts_search(
-        *, query: str, limit: int = _FTS_SEARCH_LIMIT, **_kwargs: Any
+        query: str, *, limit: int = _FTS_SEARCH_LIMIT, **_kwargs: Any
     ) -> list[FtsHit]:
         """FTS arm for :func:`run_hybrid_search`.
+
+        ``query`` is **positional-or-keyword** — :data:`FtsSearchFn`'s
+        contract is ``async def fts_search(query: str, *, limit, **filters)``
+        and ``run_hybrid_search`` invokes the injected function with
+        ``query`` POSITIONAL (``hybrid_search.py``:
+        ``fts_search(query_stripped, limit=k_fts, **kwargs)``). A
+        keyword-only ``query`` here would raise ``TypeError`` — swallowed
+        by :meth:`_HybridAdapter.search`'s ``except`` — so hybrid /
+        semantic_only would silently degrade to FTS-only on every query.
 
         ``run_hybrid_search`` forwards filter kwargs (``session_keys``,
         ``conversation_ids``, ...) which the eval path does not use —
@@ -557,14 +566,20 @@ def _build_hybrid_adapter(db: sqlite3.Connection) -> RecallSearchAdapter:
                     rerank=False,
                 )
                 return [h.summary_id for h in result.hits]
-            except Exception:  # noqa: BLE001 — per-query graceful degrade
+            except Exception as exc:  # noqa: BLE001 — per-query graceful degrade
                 # Hybrid arm unavailable (vec0 missing, no key, etc.) —
                 # fall back to FTS-only for this single query so the
                 # eval still produces a result. Mirrors TS
                 # lcm-command.ts:2029-2034.
+                #
+                # Log the exception itself (``%r`` of ``exc``), not just a
+                # generic message: a programming error such as a signature
+                # mismatch in ``_fts_search`` would otherwise be silently
+                # masked as a routine vec0/Voyage degrade.
                 logger.warning(
-                    "[eval] hybrid arm failed for query %r; degrading to FTS-only",
+                    "[eval] hybrid arm failed for query %r; degrading to FTS-only: %r",
                     getattr(query, "query_id", "<unknown>"),
+                    exc,
                 )
                 return await fts_adapter.search(query)
 
