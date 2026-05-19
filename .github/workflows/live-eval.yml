@@ -1,0 +1,215 @@
+name: live-eval
+
+# Recall@K + drift eval gated on Voyage + Anthropic API keys.
+#
+# Runs the recall + drift suite against the `eva-baseline-v2` query set
+# whenever a PR (or a push to main) touches a retrieval-relevant surface
+# — embeddings, synthesis, compaction, the grep tool, or the eval modules
+# themselves. The job records both an `fts_only` and a `hybrid` eval run,
+# computes per-stratum drift vs the prior cached run, posts the deltas as
+# a sticky PR comment, and writes a full markdown table to the run summary.
+#
+# Auth gate (the load-bearing skip path):
+#   The `live-eval` job is gated `if: secrets.VOYAGE_API_KEY != '' && ...`.
+#   GitHub evaluates a missing/empty secret to the empty string, so on a
+#   fork without the secrets — or on this repo before the secrets are
+#   provisioned — the job is SKIPPED, not FAILED. A skipped required-
+#   check does not block the PR. The orchestration script
+#   (scripts/run_live_eval.py) carries a second, defense-in-depth gate:
+#   if it is somehow invoked without the keys it exits 78 (EX_CONFIG),
+#   which GitHub also surfaces as a clean non-failure.
+#
+# This workflow is intentionally SEPARATE from ci.yml so the existing
+# {ubuntu, macos} x {3.11, 3.12, 3.13} matrix is untouched — a missing
+# secret here can never red the primary CI gate.
+#
+# Source / spec:
+#   - epics/09-eval/09-07-ci-live-eval.md — this issue.
+#   - .github/workflows/ci.yml §live-voyage — the secret-gating precedent.
+#   - docs/porting-guides/tests-and-config.md §"Recommended Hermes CI".
+#   - docs/adr/028-vitest-to-pytest.md §Decision point 10 — live markers.
+
+on:
+  pull_request:
+    paths:
+      - 'src/lossless_hermes/embeddings/**'
+      - 'src/lossless_hermes/synthesis/**'
+      - 'src/lossless_hermes/compaction.py'
+      - 'src/lossless_hermes/tools/grep.py'
+      - 'src/lossless_hermes/eval/**'
+      - 'tests/fixtures/eva_baseline_v2.py'
+      - '.github/workflows/live-eval.yml'
+      - 'scripts/run_live_eval.py'
+  push:
+    branches: [main]
+    paths:
+      - 'src/lossless_hermes/embeddings/**'
+      - 'src/lossless_hermes/synthesis/**'
+      - 'src/lossless_hermes/compaction.py'
+      - 'src/lossless_hermes/tools/grep.py'
+      - 'src/lossless_hermes/eval/**'
+      - 'tests/fixtures/eva_baseline_v2.py'
+      - '.github/workflows/live-eval.yml'
+      - 'scripts/run_live_eval.py'
+  workflow_dispatch: {}
+
+# A push-after-push on the same ref cancels the prior in-flight run so we
+# don't burn Voyage + Anthropic quota on a superseded commit.
+concurrency:
+  group: live-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # the sticky PR comment needs write on PR threads
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Auth gate. The `secrets` context is NOT available in a job-level `if:`
+  # (GitHub only exposes it to `steps` via `env:` and to reusable-workflow
+  # `with`/`secrets`). So we use the canonical two-job pattern: this tiny
+  # gate job always runs, reads the secrets into a `run:` step's `env:`,
+  # and emits a `has-secrets` boolean output. The `live-eval` job below
+  # then gates on `needs.gate.outputs.has-secrets`.
+  #
+  # Net effect — identical to the intended "skip when secrets missing":
+  # on a fork (or this repo before the secrets land) `has-secrets` is
+  # 'false', `live-eval` is SKIPPED, and a skipped job does not block the
+  # PR. `workflow_dispatch` always runs the gate so a manual trigger can
+  # surface the script's own EX_CONFIG skip path.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: gate (secret presence)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      has-secrets: ${{ steps.check.outputs.has-secrets }}
+    steps:
+      - name: Check VOYAGE_API_KEY + ANTHROPIC_API_KEY presence
+        id: check
+        env:
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$VOYAGE_API_KEY" ] && [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "has-secrets=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::live-eval secrets present — recall+drift job will run."
+          else
+            echo "has-secrets=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::VOYAGE_API_KEY and/or ANTHROPIC_API_KEY absent — live-eval job will be skipped (clean non-failure; expected on forks)."
+          fi
+
+  live-eval:
+    name: live-eval (recall + drift)
+    needs: gate
+    # Skip (NOT fail) when either secret is absent — `has-secrets` is
+    # 'false' on forks / before the secrets land. A skipped job is a
+    # clean, non-blocking state.
+    if: ${{ needs.gate.outputs.has-secrets == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Hard ceiling on measured Voyage + Anthropic spend per run. A single
+      # 31-query eval costs ~$0.03; this is defense-in-depth against a
+      # pricing change or a runaway loop. The script aborts (non-zero exit)
+      # if the measured spend exceeds this BEFORE recording the final run.
+      EVAL_COST_CEILING_USD: "0.50"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # `uv sync --locked` re-resolves against the committed lockfile and
+      # fails closed on drift — same supply-chain gate as ci.yml.
+      - name: Install project (uv sync --locked, includes [dev] extras)
+        run: uv sync --locked --extra dev
+
+      # Restore the prior eval-baseline DB so compute_drift has a run to
+      # compare against. The cache key is fixed (`eval-baseline-v1`) for the
+      # RESTORE so any prior save is found; the SAVE step below writes a
+      # SHA-suffixed key (cache entries are immutable, so a rolling suffix
+      # is how the "latest" entry advances). actions/cache restore-matches
+      # by key prefix, so `eval-baseline-v1` matches `eval-baseline-v1-*`.
+      - name: Restore baseline eval DB
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: eval-baseline.db
+          key: eval-baseline-v1
+          restore-keys: |
+            eval-baseline-v1
+
+      # The orchestration script:
+      #   - builds eva-baseline-v2 into eval-baseline.db (if not already there)
+      #   - backfills embeddings for all summaries
+      #   - runs run_recall_eval in fts_only and hybrid modes
+      #   - records both runs, computes per-stratum drift vs the cached prior
+      #   - writes the per-stratum table to $GITHUB_STEP_SUMMARY
+      #   - writes the sticky-comment body to eval-report.md
+      #   - aborts non-zero if measured spend > EVAL_COST_CEILING_USD
+      #   - exits non-zero if the paraphrastic stratum regressed past threshold
+      - name: Run live eval (fts_only + hybrid)
+        id: eval
+        run: |
+          uv run python scripts/run_live_eval.py \
+            --db eval-baseline.db \
+            --summary-md "$GITHUB_STEP_SUMMARY" \
+            --report-md eval-report.md
+
+      # Persist the updated baseline DB. `if: always()` so a drift-regression
+      # failure on the step above still saves the run (the run itself is
+      # valid data; the failure is a gate, not a corruption). The SHA suffix
+      # makes each entry immutable-but-advancing — the next run's restore
+      # picks up the most recent `eval-baseline-v1-*` via restore-keys.
+      - name: Save baseline eval DB
+        if: ${{ always() && steps.eval.outcome != 'cancelled' }}
+        uses: actions/cache/save@v4
+        with:
+          path: eval-baseline.db
+          key: eval-baseline-v1-${{ github.sha }}
+
+      # Sticky PR comment — two-step find-then-upsert so re-runs replace a
+      # single comment rather than spamming the thread on every push.
+      #
+      # Step 1 (find-comment) locates a prior comment by the magic marker
+      # `<!-- live-eval-bot -->` that run_live_eval.py writes into the body.
+      # Step 2 (create-or-update-comment) UPDATES that comment if found
+      # (comment-id non-empty) or CREATES a fresh one if not. `edit-mode:
+      # replace` overwrites the body so stale drift numbers never linger.
+      #
+      # If `peter-evans/*` ever breaks upstream, swap both steps for one
+      # `actions/github-script@v7` step that lists PR comments, greps for
+      # the marker, and PATCHes/POSTs accordingly — the marker is the
+      # contract, documented in the comment body itself.
+      #
+      # `if: always()` so a drift-regression failure still posts the table
+      # (the operator must SEE the regression that failed the build).
+      - name: Find prior live-eval comment
+        id: find-comment
+        if: ${{ github.event_name == 'pull_request' && always() && hashFiles('eval-report.md') != '' }}
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- live-eval-bot -->'
+
+      - name: Upsert drift summary comment on PR
+        if: ${{ github.event_name == 'pull_request' && always() && hashFiles('eval-report.md') != '' }}
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: eval-report.md
+          edit-mode: replace

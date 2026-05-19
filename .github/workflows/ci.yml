@@ -89,16 +89,21 @@ jobs:
       - name: Format check (ruff format --check src tests scripts)
         run: uv run ruff format --check src tests scripts
 
-      # ty is the primary type-checker per ADR-008. `ty check src` walks the
-      # package per [tool.ty.environment] in pyproject.toml. Scoped to `src/`
-      # because in-progress Epic 00 test files reference Hermes-only modules
-      # (`agent.context_engine`, `hermes_cli.config`) inside `try/except
-      # ImportError` guards — ty can't see those at static-check time since
-      # Hermes is intentionally not a pip dep (ADR-007). Test type-checking
+      # ty is the primary type-checker per ADR-008. `ty check src scripts`
+      # walks the package per [tool.ty.environment] in pyproject.toml plus
+      # the standalone CLI entry points under `scripts/`. `tests/` is still
+      # excluded because in-progress Epic 00 test files reference
+      # Hermes-only modules (`agent.context_engine`, `hermes_cli.config`)
+      # inside `try/except ImportError` guards — ty can't see those at
+      # static-check time since Hermes is intentionally not a pip dep
+      # (ADR-007). `scripts/` carries no such Hermes-only imports (it is
+      # first-party `lossless_hermes` + stdlib only), so type-checking it
+      # is safe and catches call-site bugs — e.g. an `await` on a sync
+      # function — that `ty check src` alone would miss. Test type-checking
       # is broadened in the 00-04 / 00-05 PRs that introduce the bridge
       # surface. Failure blocks merge (no --exit-zero).
-      - name: Type check (ty check src)
-        run: uv run ty check src
+      - name: Type check (ty check src scripts)
+        run: uv run ty check src scripts
 
       # Smoke test the plugin entry point. This catches packaging/discovery
       # regressions before they reach the engine tests: if the
