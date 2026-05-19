@@ -113,6 +113,7 @@ References
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Optional
@@ -136,6 +137,8 @@ from lossless_hermes.voyage.client import VoyageClient
 
 if TYPE_CHECKING:  # pragma: no cover — import-cycle dodge, type-only
     from lossless_hermes.engine import LCMEngine
+
+logger = logging.getLogger("lossless_hermes.tools._adapters")
 
 __all__ = (
     "_adapt_lcm_compact",
@@ -444,9 +447,17 @@ class _CompactCtx:
         2. **missing budget** — the engine's ``compact()`` requires a
            concrete ``int`` budget; it cannot represent "budget absent".
            The TS ``executeCompactionCore`` guard (``engine.ts:3363-3369``)
-           returns ``reason: "missing token budget in compact params"``
-           in that case, so the shim reproduces that guard *before*
-           delegating — the handler maps it to ``missing-budget``.
+           returns ``{ok: false, compacted: false, reason: "missing token
+           budget in compact params"}`` in that case, so the shim
+           reproduces that guard *before* delegating. The no-op carries
+           ``reason="missing token budget in compact params"`` and
+           ``auth_failure=False``; the handler's
+           :func:`~lossless_hermes.tools.compact._result_ok` recognises
+           the reason as a non-auth failure and reports ``ok=false``
+           (matching TS), and :func:`~..compact._map_engine_reason`
+           maps it to the ``missing-budget`` tool reason. It is NOT
+           mislabelled as an auth failure — it is honestly a budget
+           problem.
         3. **delegate** — call :meth:`LCMEngine.compact` with the
            resolved ``conversation_id``, the concrete budget, and the
            observed token count (defaulting ``current_token_count`` to
@@ -459,8 +470,11 @@ class _CompactCtx:
         engine-side cache / threshold gates stay authoritative (the
         handler's own docstring, Stage 6). Were the handler ever to
         pass ``force=True``, this shim has no way to honour it; that is
-        a documented, currently-unreachable limitation, not a silent
-        drop on the live path.
+        a documented, currently-unreachable limitation. As a defence
+        against a future handler change that *does* start passing
+        ``force=True``, the shim emits a ``logger.warning`` in that case
+        so the dropped flag is visible in the gateway log rather than a
+        silent no-op.
 
         Args:
             session_id: The runtime session id — resolved to a
@@ -481,6 +495,19 @@ class _CompactCtx:
             result, or a synthesized no-op for the
             no-conversation / missing-budget short-circuits.
         """
+        # Defensive: handle_lcm_compact hardcodes force=False (Stage 6),
+        # and LCMEngine.compact() has no force parameter, so force=True is
+        # currently unreachable and would be silently dropped. Warn so a
+        # future handler change that starts passing force=True is caught
+        # in the gateway log rather than producing a silent no-op.
+        if force:
+            logger.warning(
+                "[lcm] _CompactCtx.compact received force=True, but "
+                "LCMEngine.compact() has no force parameter — the flag is "
+                "dropped. Engine-side cache / threshold gates stay "
+                "authoritative. (handle_lcm_compact currently always "
+                "passes force=False; this path indicates a handler change.)"
+            )
         del session_key, session_file, force  # see docstring
 
         store = self._engine._conversation_store
