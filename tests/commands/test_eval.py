@@ -34,6 +34,7 @@ import pytest
 import lossless_hermes.commands.eval as eval_mod
 import lossless_hermes.embeddings.hybrid_search as hybrid_search_mod
 from lossless_hermes.commands.eval import _build_hybrid_adapter, run as run_eval_command
+from lossless_hermes.db.features import clear_db_features_cache
 from lossless_hermes.db.migration import run_lcm_migrations
 from lossless_hermes.embeddings.hybrid_search import FtsHit, HybridSearchResult
 from lossless_hermes.eval.query_set import QueryRecord, QuerySetIdentity, register_query_set
@@ -88,10 +89,32 @@ def _new_db() -> sqlite3.Connection:
 
 @pytest.fixture
 def db() -> Iterator[sqlite3.Connection]:
+    """Migrated in-memory connection, isolated from the ``db.features`` cache.
+
+    :func:`lossless_hermes.db.features.get_lcm_db_features` caches probe
+    results in a process-global dict keyed on ``id(conn)`` and does NOT
+    evict on ``conn.close()`` (see ``db/features.py`` module docstring
+    §"Cache"). A connection closed by an earlier test can therefore have
+    its address recycled by CPython for this fixture's fresh connection,
+    handing it a stale :class:`DbFeatures` — e.g. a ``vec0_available=True``
+    entry left by a module that loaded ``sqlite-vec`` via ``open_lcm_db``.
+    That would make a bare ``:memory:`` connection here falsely report
+    vec0 as present and silently skip the ``hybrid`` degrade warning.
+
+    Clearing the entry for this connection's ``id`` at both setup and
+    teardown makes every test in this module deterministic regardless of
+    cross-module collection order — the documented escape hatch
+    (``db/features.py`` §"Cache": "callers can call
+    ``clear_db_features_cache`` explicitly").
+    """
     conn = _new_db()
+    # Evict any stale entry an id()-recycled prior connection left behind.
+    clear_db_features_cache(conn)
     try:
         yield conn
     finally:
+        # Don't leak this connection's entry to a future id() collision.
+        clear_db_features_cache(conn)
         conn.close()
 
 
