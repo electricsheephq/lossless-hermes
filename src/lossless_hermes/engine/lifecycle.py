@@ -148,6 +148,14 @@ class _LifecycleMixin:
         last_completion_tokens: int
         last_total_tokens: int
         compression_count: int
+        # Compaction-budget state — written by :meth:`update_model`'s
+        # Hermes-less fallback branch (the ABC default owns the
+        # Hermes-available path). ``threshold_percent`` is a class
+        # attribute on the :class:`LCMEngine` shell; declared here so ty
+        # can resolve the ``self.threshold_percent`` read in that branch.
+        context_length: int
+        threshold_tokens: int
+        threshold_percent: float
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         """Open ``lcm.db``, run migrations, and instantiate the four stores.
@@ -506,6 +514,105 @@ class _LifecycleMixin:
         self._last_seen_message_idx.clear()
 
         logger.debug("[lcm] on_session_reset: token state + ingest cursors cleared")
+
+    def update_model(
+        self,
+        model: str,
+        context_length: int,
+        base_url: str = "",
+        api_key: str = "",
+        provider: str = "",
+        api_mode: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Recalculate context budget on a mid-session model switch.
+
+        Hermes calls ``context_compressor.update_model(...)`` at seven
+        sites in ``run_agent.py``. Five of them pass the five-argument
+        shape the :class:`~agent.context_engine.ContextEngine` ABC
+        declares (``model``, ``context_length``, ``base_url``,
+        ``api_key``, ``provider`` — ``context_engine.py:191``). The
+        remaining **two** pass an extra ``api_mode=`` keyword:
+
+        * ``run_agent.py:2587`` — the LM-Studio context preload, after a
+          ``/model`` switch resolves the newly-loaded context window.
+        * ``run_agent.py:2728`` — the in-place model switch
+          (``switch_model`` → ``update_model``).
+
+        Both of those call sites pass **every** argument by keyword,
+        including ``api_mode=self.api_mode``. The ABC's default
+        ``update_model`` has no ``api_mode`` parameter, and
+        :class:`LCMEngine` does not otherwise override the method — so
+        without this shim a ``/model`` switch raises
+        ``TypeError: update_model() got an unexpected keyword argument
+        'api_mode'`` and crashes the turn.
+
+        This override absorbs ``api_mode`` (and any future keyword the
+        host may start forwarding, via ``**kwargs``) and delegates the
+        real work to :func:`super().update_model`, so the ABC default
+        still recalculates :attr:`context_length` and
+        :attr:`threshold_tokens` from :attr:`threshold_percent`. LCM has
+        no per-``api_mode`` budget logic — the parameter is accepted and
+        ignored purely so the host call shape never raises.
+
+        Hermes-less robustness: like :meth:`on_session_reset`, this body
+        looks the parent method up via ``super()`` and falls back to
+        inlining the ABC default's two-line budget recalculation when it
+        is absent. The Hermes-less :mod:`hermes_bridge` stub
+        ``ContextEngine`` is a synthesized :class:`type` with only
+        ``__init__`` (``hermes_bridge.py:64``) — it carries no
+        ``update_model`` — so a bare ``super().update_model(...)`` would
+        raise :class:`AttributeError` under the test suite (Hermes is
+        intentionally not a pip dependency per ADR-007).
+
+        .. note::
+
+            ``api_mode`` is **deliberately unused**. It is on the
+            signature solely to match the host call shape at
+            ``run_agent.py:2587`` / ``:2728``. If a future LCM revision
+            grows ``api_mode``-dependent budget behaviour, this is the
+            seam to implement it; until then "accept and ignore" is the
+            correct, forward-compatible contract.
+
+        Args:
+            model: The new model identifier.
+            context_length: The new model's context window, in tokens.
+            base_url: Provider base URL (forwarded to the ABC default).
+            api_key: Provider API key (forwarded to the ABC default).
+            provider: Provider name (forwarded to the ABC default).
+            api_mode: The host's API-mode string (e.g. from
+                ``run_agent.py``'s ``self.api_mode``). Accepted to match
+                the host call shape; not consumed by LCM.
+            **kwargs: Forward-compat sink for any additional keyword the
+                host may forward to ``update_model`` in future Hermes
+                releases. Accepted and ignored.
+        """
+        # Delegate to the ABC default (five-arg signature). It updates
+        # ``self.context_length`` and re-derives ``self.threshold_tokens``
+        # from ``self.threshold_percent`` — the contract every other
+        # ``update_model`` call site already relies on. ``api_mode`` and
+        # ``**kwargs`` are intentionally NOT forwarded: the ABC default
+        # does not accept them, and LCM has no use for them.
+        #
+        # Hermes-less env: the bridge stub ``ContextEngine`` has no
+        # ``update_model`` (it is a synthesized ``type`` with only
+        # ``__init__`` — ``hermes_bridge.py:64``), so look the parent up
+        # via ``super()`` and inline the ABC's two-line body when it is
+        # absent. Same defensive pattern as ``on_session_reset`` above.
+        parent_update = getattr(super(), "update_model", None)
+        if callable(parent_update):
+            parent_update(model, context_length, base_url, api_key, provider)
+        else:
+            # Hermes-less env: inline the ABC default body
+            # (agent/context_engine.py:205-206).
+            self.context_length = context_length
+            self.threshold_tokens = int(context_length * self.threshold_percent)
+        logger.debug(
+            "[lcm] update_model: model=%s context_length=%d (api_mode=%r ignored)",
+            model,
+            context_length,
+            api_mode,
+        )
 
     # ------------------------------------------------------------------
     # Issue 08-16 — ``/lcm rotate`` engine support.
