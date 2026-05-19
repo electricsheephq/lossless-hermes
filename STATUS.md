@@ -6,17 +6,17 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **Post-v0.1.0 hardening — architecture review against `hermes-lcm` complete** — v0.1.0 shipped (all 122 port issues, Epics 00–09); a 2-wave / 12-slice + production-scars review against the sibling project `stephenschoettler/hermes-lcm` ran, found 4 confirmed bugs, and shipped them as **v0.1.1 / v0.1.2 / v0.1.3**. v0.2.0 architecture work (ADRs 032–036) is recorded; implementation is GitHub-issue-tracked. |
-| **Current milestone** | M1–M11 ✅ (v0.1.0). M6 — `fts_only` baseline measured offline; live +52.5pp hybrid confirmation operator-gated (B-001). **Post-release patch line: v0.1.1 → v0.1.2 → v0.1.3 shipped.** M12 (v0.2.0) is the next track. |
-| **Last merged PR** | [#142](https://github.com/electricsheephq/lossless-hermes/pull/142) `fix: v0.1.3 — ingest-cursor restart reconciliation + compaction desync` |
-| **Last commit on main** | `a34edec` |
-| **Latest release** | **v0.1.3** — see `gh release list`. v0.1.0/v0.1.1 are superseded (do not persist context across a session close — v0.1.2 fixes that; upgrade). |
-| **Total PRs merged** | Waves 0–6 (all 122 port issues) + the architecture-review series #126/#138–#142/#145 (README rewrite, ADRs 032–036, doc corrections, 4 bug-fix patches). |
-| **Open PRs** | None. |
-| **Total tests** | 4080 passing (`pytest -m 'not live'`); 6 OS×Python matrix cells. |
+| **Current wave** | **v0.2.0 implementation in progress.** Wave 1 ✅ (#147 path-resolve, #148 base64 guard, #149 `/lcm eval` wiring); Wave 2 ✅ (ADR-033 embeddings-off #154, ADR-034 directory-distribution #152, ADR-035 diagnostics-as-tools #155). A **P0 found during the #155 review** — the 7 ported `lcm_*` tools never dispatch (`TOOL_DISPATCH` unwired; issue #156) — is in flight ahead of Wave 3. **Wave 3** = ADR-032 (drop `preassemble`, debt-gated compaction; impl plan posted to issue #132). |
+| **Current milestone** | M1–M11 ✅ (v0.1.0); patch line v0.1.1 → v0.1.2 → v0.1.3 shipped. **M12 (v0.2.0) in progress** — Wave 1 + Wave 2 merged; P0 #156 + Wave 3 (ADR-032) remain before the v0.2.0 tag. |
+| **Last merged PR** | [#155](https://github.com/electricsheephq/lossless-hermes/pull/155) `feat: lcm_status + lcm_doctor as model-callable tools (ADR-035, #135)` |
+| **Last commit on main** | `10a0bfd` |
+| **Latest release** | **v0.1.3** — see `gh release list`. v0.2.0 not yet tagged (P0 #156 + Wave 3 outstanding). |
+| **Total PRs merged** | Waves 0–6 (all 122 port issues) + the architecture-review series #126/#138–#142/#145 + **v0.2.0 Wave 1 (#147/#148/#149) + Wave 2 (#152/#154/#155)**. |
+| **Open PRs** | P0 #156 tool-dispatch fix — Issue Executor in flight. |
+| **Total tests** | 4200+ passing (`pytest -m 'not live'`); 6 OS×Python matrix cells. |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None. B-001/B-002 resolved at the v0.1.0 release-gate (operator-gated, accepted). The architecture review's findings are all either fixed (v0.1.1–v0.1.3) or issue-tracked for v0.2.0 — see below. |
-| **Architecture review (vs `hermes-lcm`)** | 12 slices + 2 production-scars audits, all 95%-gated. **Fixed:** #128 model-switch crash, #129 recall-policy tool ref (v0.1.1); #144 durability P0 (v0.1.2); #130 ingest-cursor (v0.1.3). **v0.2.0 issue-tracked:** #131 base64 guard, #132–#136 ADRs 032–036, #137 doc-corrections (done), #143 `/lcm eval` stub, #146 telemetry-txn. |
+| **Architecture review (vs `hermes-lcm`)** | 12 slices + 2 production-scars audits, all 95%-gated. **Fixed (v0.1.x):** #128 model-switch crash, #129 recall-policy tool ref (v0.1.1); #144 durability P0 (v0.1.2); #130 ingest-cursor (v0.1.3). **Shipped (v0.2.0 W1/W2):** #65 (#147), #131 (#148), #143 (#149), ADR-034 (#152), ADR-033 (#154), ADR-035 (#155). **v0.2.0 remaining:** P0 #156 tool-dispatch, ADR-032/#132 (Wave 3), #146 telemetry-txn, minor #150/#151/#153/#157. |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -76,7 +76,7 @@
 | M9 | All operator commands; import-openclaw verified | ✅ done | Wave 5 — Epic 08 (15 issues ported: status/health/purge/backup/reconcile/doctor-{shared,apply,cleaners}/worker-orchestrator/worker-status/rotate/eval-runner/semantic-infra/import-openclaw; 08-11/08-12 superseded by 05-11/07-04) |
 | M10 | Eval suite green; drift CI live | ✅ done | Wave 6 — Epic 09: 09-01..09-08 all merged (#115/#120-125, incl. drift CI + live-eval workflow + benchmark harness) |
 | M11 | v0.1.0 release | ✅ done | Wave 6 — 12-item release-gate checklist passed (9 PASS; items 6/7/11 operator-gated + documented per B-001/B-002); v0.1.0 tagged on `8b71b12` |
-| M12 | v0.2.0 release (#628 stub-tier) | future | — |
+| M12 | v0.2.0 release | 🔄 in progress | Wave 1 ✅ (#147/#148/#149); Wave 2 ✅ (ADR-033/034/035 — #152/#154/#155); P0 #156 tool-dispatch + Wave 3 (ADR-032/#132) remain before tag |
 
 ## Upstream watch
 
@@ -102,4 +102,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-19 (post-v0.1.0 hardening — `hermes-lcm` architecture review complete; v0.1.1/v0.1.2/v0.1.3 shipped 4 confirmed bug fixes; ADRs 032–036 merged; v0.2.0 implementation issue-tracked. Last commit `a34edec`.)_
+_Last refreshed: 2026-05-19 (v0.2.0 Wave 1 + Wave 2 merged — #147/#148/#149, #152/#154/#155; P0 #156 tool-dispatch found during the #155 review and in flight; Wave 3/ADR-032 implementation plan posted to issue #132. Last commit `10a0bfd`.)_
