@@ -145,14 +145,21 @@ def fake_llm() -> Any:
 def test_corpus(db_in_memory: sqlite3.Connection) -> dict[str, Any]:
     """Synthetic conversation corpus.
 
-    Ports ``test/fixtures/v41-test-corpus.ts``. Returns a metadata dict
-    (BASE_DATE, conversation ids, summary ids) — the underlying rows are
-    seeded into the ``db_in_memory`` connection that was just yielded.
+    Ports ``test/fixtures/v41-test-corpus.ts`` via
+    :func:`tests.fixtures.test_corpus.build_test_corpus` (issue 09-08 —
+    the eval-benchmark issue named this corpus port as its own
+    prerequisite). Returns the
+    :class:`~tests.fixtures.test_corpus.CorpusMetadata` dict
+    (``base_date``, conversation rows, leaf/condensed/entity counts,
+    seeded summary-id tuples) — the underlying conversation, message,
+    summary, condensed-summary, entity, and mention rows are seeded into
+    the ``db_in_memory`` connection that was just yielded.
 
-    Lands in Epic 03 (storage layer) once ``buildTestCorpus`` ports.
+    The bare ``db_in_memory`` fixture yields an un-migrated connection;
+    :func:`build_test_corpus` runs the migration ladder itself (with
+    ``fts5_available=True``), so this fixture leaves the connection both
+    migrated and corpus-seeded.
     """
+    from tests.fixtures.test_corpus import build_test_corpus
 
-    raise NotImplementedError(
-        "test_corpus: Epic 03 (storage) will port v41-test-corpus.ts -> "
-        "tests/fixtures/test_corpus.py and seed db_in_memory here."
-    )
+    return dict(build_test_corpus(db_in_memory))
