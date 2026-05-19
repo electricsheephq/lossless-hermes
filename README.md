@@ -1,46 +1,133 @@
 # lossless-hermes
 
 [![CI](https://github.com/electricsheephq/lossless-hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/electricsheephq/lossless-hermes/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
+[![Release](https://img.shields.io/github/v/release/electricsheephq/lossless-hermes)](https://github.com/electricsheephq/lossless-hermes/releases)
+[![Python 3.11 – 3.13](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
-Lossless Context Management plugin for **[Hermes-agent](https://github.com/NousResearch/hermes-agent)**, ported from [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) (TypeScript/OpenClaw) to Python/Hermes. **v0.1.0 is feature-complete** — it ports LCM v4.1's lossless conversation pyramid (raw messages → leaf summaries → condensed summaries), per-turn ingest and always-on context assembly, compaction, Voyage hybrid retrieval, 7 agent tools, entity coreference + synthesis, and the full `/lcm` operator command surface. Existing OpenClaw LCM users can migrate their `lcm.db` without data loss — see [OpenClaw migration](#openclaw-migration) below.
+**Lossless Context Management for [Hermes-agent](https://github.com/NousResearch/hermes-agent).**
 
-## Status: ✅ v0.1.0 — feature-complete
+> The context window stays bounded. The memory doesn't. Nothing is ever dropped.
 
-All 122 port issues across Epics 00–09 are merged; the CI matrix is green on `{macOS, ubuntu} × {Python 3.11, 3.12, 3.13}`. Architecture, decisions, risks, and the epic/issue breakdown live under [`docs/`](./docs/) and [`epics/`](./epics/); release state is tracked in [`STATUS.md`](./STATUS.md). Two features are deliberately deferred to v0.2.0 — see [Deferred to v0.2.0](#deferred-to-v020).
+`lossless-hermes` is a context-engine plugin for Hermes. When a conversation outgrows the
+model's context window, most agents truncate old turns or replace them with a flat summary —
+and the original detail is gone from the prompt. `lossless-hermes` instead **persists every
+message**, compacts older history into a navigable **summary DAG**, and gives the agent
+**tools to drill back into the exact detail that was compacted**. A long-running conversation
+keeps full recall without ever blowing the token budget.
+
+It is a Python port of [Lossless Claw](https://github.com/Martian-Engineering/lossless-claw)
+(LCM v4.1) — the design from the [LCM paper](https://papers.voltropy.com/LCM) — re-homed onto
+Hermes's pluggable `ContextEngine` slot.
+
+---
+
+## Contents
+
+- [The problem](#the-problem)
+- [How it works](#how-it-works)
+- [Why lossless-hermes](#why-lossless-hermes)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Configuration](#configuration)
+- [Agent tools](#agent-tools)
+- [Operator commands](#operator-commands)
+- [Migrating from OpenClaw](#migrating-from-openclaw)
+- [Platform support](#platform-support)
+- [Status & maturity](#status--maturity)
+- [Architecture](#architecture)
+- [Related work](#related-work)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+## The problem
+
+Every agent eventually fills its context window. The usual remedy is a sliding window or a
+flat summary: older turns are replaced by one lossy paragraph and the original material
+leaves the prompt for good. When the agent later needs a specific decision, file, error, or
+number from earlier in the conversation, it simply cannot see it — and recovery, where it
+exists at all, lives in a separate history path the model rarely reaches for on its own.
+
+The result is an agent that quietly gets *worse* the longer you talk to it.
+
+## How it works
+
+`lossless-hermes` makes recall a first-class part of the context engine:
+
+1. **Persist** — every message is written to a local SQLite database, organized by
+   conversation. Nothing is discarded, ever.
+2. **Summarize** — when older history grows past a token threshold, chunks of raw messages
+   are summarized into *leaf* nodes by your configured LLM.
+3. **Condense** — as leaves accumulate, they are condensed into higher-level nodes, forming
+   a depth-aware **summary DAG** (directed acyclic graph). Every node links back to its
+   sources.
+4. **Assemble** — each turn the active context is rebuilt from condensed summaries plus the
+   recent raw tail, kept under the model's token budget.
+5. **Recall** — the agent gets [tools](#agent-tools) to search and expand compacted history:
+   any summary can be drilled back down to the original messages on demand.
+
+```text
+   ACTIVE CONTEXT  ── always under the token budget ─────────────┐
+   │  ◆ condensed summaries        ▪ recent raw tail (verbatim)  │
+   └──────────│──────────────────────────────│───────────────────┘
+              │ expand on demand             │ never compacted
+   SUMMARY DAG ▼                             │
+   │  ◆ condensed ──▶ ◆ leaf ──▶ ▪ raw messages                  │
+   │  every node links to its sources — fully reversible         │
+   └──────────────────────────────│──────────────────────────────┘
+   SQLite STORE ───────────────────▼─────────────────────────────┐
+   │  every message, permanently — the source of truth           │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+The raw messages never leave the database, summaries are reversible, and the agent can
+always recover the detail. In normal operation you never think about compaction again.
+
+## Why lossless-hermes
+
+| | |
+|---|---|
+| **Lossless by construction** | Every message is persisted; compaction only ever *adds* a summary layer. Drill-down is exact, not approximate. |
+| **Recall lives in the engine** | The agent expands compacted history through first-class LCM tools during the active turn — not via a bolted-on, separate cross-session search step. |
+| **The complete LCM feature port** | Full summary DAG, hybrid retrieval, entity coreference, tier-aware synthesis, and a full `/lcm` operator surface — the whole of LCM v4.1, not a subset. |
+| **Drop-in for OpenClaw LCM users** | The on-disk SQLite schema is byte-compatible; an existing `lcm.db` migrates with [one command](#migrating-from-openclaw), no data loss. |
+| **Degrades gracefully** | No `VOYAGE_API_KEY`? Retrieval runs FTS-only. `sqlite-vec` unavailable? The engine still runs. Optional dependencies stay optional. |
+| **Built with provenance** | Every scar-tissue fix from LCM's 12 upstream audit waves is ported verbatim with `# LCM Wave-N` comments; decisions are recorded as [ADRs](./docs/adr/). |
+
+### Versus Hermes built-in compression
+
+Hermes core can persist conversation history in `state.db` before its built-in compression
+rewrites the active prompt, and that pre-compression record may be recoverable later through
+host-level history tools. `lossless-hermes` is different in *where recall lives*: it ships a
+plugin-local store and summary DAG built specifically for drill-down, and exposes recall to
+the agent **inside the active context engine** — current-session retrieval through LCM
+tools, with explicit source-lineage and session-boundary rules. Position LCM on retrieval
+quality and autonomous drill-down, not on the absence of any host-side history.
 
 ## Install
 
-Lossless-hermes is a **Hermes plugin**. Install Hermes first, then install the plugin into the same Python environment.
+`lossless-hermes` is a Hermes plugin. Install Hermes first, then install the plugin into the
+**same Python environment**.
 
-### 1. Install Hermes
+### 1 · Install Hermes
 
-Per [Hermes's README](https://github.com/NousResearch/hermes-agent#quick-install), the recommended path on Linux, macOS, WSL2, or Termux is the curl one-liner:
+Per [Hermes's install guide](https://github.com/NousResearch/hermes-agent#quick-install):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 ```
 
-Hermes is not on PyPI (see [ADR-007](./docs/adr/007-hermes-as-dependency.md)), so the plugin does **not** pin `hermes-agent` as a dependency — operators install it separately.
+Hermes is not published to PyPI, so the plugin does **not** pin `hermes-agent` as a
+dependency — operators install it separately.
 
-Alternative (source install for contributors):
-
-```bash
-git clone https://github.com/NousResearch/hermes-agent
-cd hermes-agent
-uv pip install -e ".[all,dev]"
-```
-
-### 2. Install the plugin
-
-Once Hermes is on your `PATH` (and `python -c "import agent.context_engine"` succeeds), install lossless-hermes into the **same Python environment**:
+### 2 · Install the plugin
 
 ```bash
-# Recommended (uv-managed env)
+# Recommended (uv-managed environment)
 uv pip install lossless-hermes
 
-# Or plain pip
+# Or with pip
 pip install lossless-hermes
 ```
 
@@ -52,13 +139,15 @@ cd lossless-hermes
 uv pip install -e ".[dev]"
 ```
 
-The `[dev]` extra pulls in `pytest`, `ruff`, `ty`, `pre-commit`, and `respx` — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the dev loop.
-
-Discovery happens via the `hermes_agent.plugins` entry-point group declared in [`pyproject.toml`](./pyproject.toml) (per [ADR-001](./docs/adr/001-plugin-distribution-model.md)) — no manual file copy into `~/.hermes/plugins/` is required or supported.
+The plugin is discovered through the `hermes_agent.plugins` entry-point group declared in
+[`pyproject.toml`](./pyproject.toml) — no manual steps beyond installing into the same
+environment as Hermes.
 
 ## Quickstart
 
-After installing Hermes and lossless-hermes into the same environment, edit `~/.hermes/config.yaml` to enable the plugin and select LCM as the active context engine. Both settings are required per [ADR-001 §Consequences](./docs/adr/001-plugin-distribution-model.md#consequences) — adding to `plugins.enabled` alone is not enough; LCM also has to win the `context.engine` selection ladder.
+Enable the plugin and select LCM as the active context engine in `~/.hermes/config.yaml`.
+**Both** settings are required — adding the plugin to `plugins.enabled` is not enough; LCM
+must also win the `context.engine` selection:
 
 ```yaml
 context:
@@ -69,126 +158,217 @@ plugins:
     - lossless-hermes
 ```
 
-Verify the plugin registers:
+Start Hermes:
 
 ```bash
 hermes
 ```
 
-A startup log line confirms `lossless-hermes` is loaded and the context engine is `lcm`. From the first turn, LCM ingests messages into its SQLite pyramid, assembles context on every `pre_llm_call`, and exposes the `/lcm` command surface (`/lcm help` lists all subcommands).
+A startup log line confirms `lossless-hermes` is loaded and the context engine is `lcm`.
+From the first turn, LCM ingests messages into its SQLite store, assembles context each
+turn, and exposes the `/lcm` command surface. Run `/lcm help` for the full subcommand list,
+or `/lcm status` to see the database path, summary counts, and health at a glance.
 
-For plugin-specific configuration (Voyage keys, model choices, worker intervals, compaction thresholds), the namespace is `lossless_hermes:` (snake_case — see [Naming convention](#naming-convention) below). Voyage hybrid retrieval is opt-in: without `VOYAGE_API_KEY` the engine runs FTS5-only and degrades gracefully (no embeddings backfill, no semantic recall).
+## Configuration
+
+LCM reads configuration from the `lossless_hermes:` namespace in `~/.hermes/config.yaml`,
+and from `LCM_*` environment variables. **Environment variables take precedence** when both
+are set. Every setting has a sensible default — a zero-config install works.
 
 ```yaml
 lossless_hermes:
-  voyage_api_key: "${VOYAGE_API_KEY}"   # optional — enables hybrid retrieval
+  # ── Compaction ──────────────────────────────────────────────
+  context_threshold: 0.75        # fraction of the window that triggers compaction
+  fresh_tail_count: 64           # most-recent messages never compacted
+  leaf_chunk_tokens: 20000       # source tokens per leaf-summary chunk
+  incremental_max_depth: 1       # 0 = leaves only · 1 = one condensed pass · -1 = unlimited
+  new_session_retain_depth: 2    # context retained after /new (-1 keeps everything)
+
+  # ── Summarization model (falls back to the Hermes default model when unset) ──
+  summary_model: "openai/gpt-5.4-mini"
+
+  # ── Semantic + hybrid retrieval — optional; omit to run FTS-only ──
+  voyage_api_key: "${VOYAGE_API_KEY}"
+
+  # ── Scope control ──────────────────────────────────────────
+  ignore_session_patterns:       # glob patterns: never store these sessions
+    - "agent:*:cron:**"
+  stateless_session_patterns: [] # glob patterns: may read LCM, never write to it
 ```
 
-## OpenClaw migration
+### Common settings
 
-Existing OpenClaw LCM users can carry their conversation history into Hermes without data loss. The on-disk SQLite schema is byte-compatible (per [ADR-025](./docs/adr/025-openclaw-migration.md) and [spike 003](./docs/spike-results/003-identity-hash.md) — `identity_hash` does not diverge):
+| YAML key (`lossless_hermes:`) | Environment variable | Default | Purpose |
+|---|---|---|---|
+| `enabled` | `LCM_ENABLED` | `true` | Enable / disable the plugin |
+| `database_path` | `LCM_DATABASE_PATH` | `$HERMES_HOME/lossless-hermes/lcm.db` | SQLite database location |
+| `context_threshold` | `LCM_CONTEXT_THRESHOLD` | `0.75` | Window fraction that triggers compaction (0.0–1.0) |
+| `fresh_tail_count` | `LCM_FRESH_TAIL_COUNT` | `64` | Recent messages protected from compaction |
+| `leaf_chunk_tokens` | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf-summary chunk |
+| `incremental_max_depth` | `LCM_INCREMENTAL_MAX_DEPTH` | `1` | Condensation depth (`0` / `1` / `-1`) |
+| `summary_model` | `LCM_SUMMARY_MODEL` | *(Hermes default)* | Model used for compaction summarization |
+| `summary_provider` | `LCM_SUMMARY_PROVIDER` | *(Hermes default)* | Provider for summarization calls |
+| `summary_timeout_ms` | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Per-call summarization timeout |
+| `large_file_token_threshold` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are externalized |
+| `ignore_session_patterns` | `LCM_IGNORE_SESSION_PATTERNS` | *(none)* | Glob patterns for sessions to exclude from LCM |
+| `stateless_session_patterns` | `LCM_STATELESS_SESSION_PATTERNS` | *(none)* | Glob patterns for read-only sessions |
+| `voyage_api_key` | `VOYAGE_API_KEY` | *(unset)* | Enables semantic + hybrid retrieval |
+
+> **Retrieval modes & `VOYAGE_API_KEY`.** Regex, full-text (FTS5), and verbatim search work
+> with no external dependency. The `semantic` and `hybrid` modes of `lcm_grep` additionally
+> require a `VOYAGE_API_KEY` for query embeddings; without one, those modes return a clear
+> operator-facing error pointing back to the FTS modes.
+
+## Agent tools
+
+LCM registers **7 agent tools** so the model can search and recall compacted history:
+
+| Tool | What it does |
+|---|---|
+| `lcm_grep` | Search history — `regex` / `full_text` (FTS5) / `verbatim` / `semantic` / `hybrid` (FTS + embeddings + rerank) modes; scope hits to leaf vs. condensed summaries |
+| `lcm_describe` | Drill into a summary — its lineage plus a one-hop expansion to child summaries or raw messages |
+| `lcm_expand` | DAG walker that expands a summary subtree back toward the original messages |
+| `lcm_synthesize_around` | Fresh windowed synthesis — by calendar period (`"yesterday"`, `"last-7-days"`), by ±N hours around an anchor, or by top-K semantic similarity |
+| `lcm_get_entity` | Look up a tracked entity in the coreference catalog |
+| `lcm_search_entities` | Search / browse the entity catalog, optionally by entity type |
+| `lcm_compact` | Operator-opt-in escape valve — let the agent trigger an LCM compaction pass |
+
+> `lcm_expand_query` (recursive expansion via a bounded sub-agent) is deferred to a future
+> release — see [ADR-012](./docs/adr/012-subagent-defer.md).
+
+## Operator commands
+
+All operator commands are reachable as `/lcm <subcommand>` from within a Hermes session:
+
+| Command | Purpose |
+|---|---|
+| `/lcm status` | Version, enablement, DB path & size, summary counts, health at a glance |
+| `/lcm health` | Detailed subsystem health — embeddings, workers, synthesis cache, eval recall |
+| `/lcm doctor` | Scan for broken / truncated summaries; `doctor apply` repairs, `doctor clean` removes |
+| `/lcm purge` | Soft-suppress leaves matching criteria (dry-run by default) |
+| `/lcm reconcile-session-keys` | Merge legacy session keys into one logical session |
+| `/lcm worker` | Inspect background-worker state, or force an embedding-backfill tick |
+| `/lcm backup` | Timestamped backup of the LCM SQLite database |
+| `/lcm rotate` | Back up the database, clear the assemble-snapshot cache, WAL-checkpoint, and stamp the last-rotate time |
+| `/lcm help` | List every subcommand |
+
+> The recall + drift **evaluation harness** ships in `src/lossless_hermes/eval/` and runs
+> via the `live-eval` CI workflow; the `/lcm eval` slash-command wiring is not yet landed.
+
+## Migrating from OpenClaw
+
+Already running LCM on OpenClaw? Your conversation history comes with you. The on-disk
+SQLite schema is byte-compatible (per [ADR-025](./docs/adr/025-openclaw-migration.md) and
+[spike 003](./docs/spike-results/003-identity-hash.md) — message `identity_hash` values do
+not diverge across the port):
 
 ```bash
 cp ~/.openclaw/lcm.db "$HERMES_HOME/lossless-hermes/lcm.db"
 lossless-hermes import-openclaw
 ```
 
-`import-openclaw` runs the migration ladder idempotently, refuses to overwrite an existing destination without `--force`, and sample-validates `identity_hash` on migrated rows. See `lossless-hermes import-openclaw --help` for the `--from`, `--to`, `--force`, `--validate-rows`, and `--dry-run` options.
+`import-openclaw` runs the migration ladder idempotently, refuses to overwrite an existing
+destination without `--force`, and sample-validates `identity_hash` on migrated rows. See
+`lossless-hermes import-openclaw --help` for `--from`, `--to`, `--force`, `--validate-rows`,
+and `--dry-run`.
 
 ## Platform support
 
-Per [`docs/reference/dependencies.md`](./docs/reference/dependencies.md) §"Platform support matrix" and the spike results in [`docs/spike-results/`](./docs/spike-results/). Cells marked **tested** were exercised first-hand during spikes 001 and 005; **inferred** is strong inference from PyPI wheel availability + CPython build defaults but not yet locally run (CI matrix will convert these — see [ADR-005 §Consequences](./docs/adr/005-python-version.md#consequences)).
-
-| Platform | Python source | Supported | Notes |
-|---|---|---|---|
-| macOS arm64 | Homebrew `python@3.12` | YES (tested) | **Recommended default.** |
-| macOS arm64 | Homebrew `python@3.11`, `python@3.13`, `python@3.14` | YES (3.13 tested; others inferred) | Same code path. |
-| macOS arm64 | `/usr/bin/python3` (Apple system, 3.9.6) | **NO** | Below the `>=3.11` floor AND missing `enable_load_extension` (spike 001). See warning below. |
-| macOS arm64 | python.org installer | YES (inferred) | CI matrix close-out planned. |
-| macOS x86_64 | Homebrew | YES (inferred) | Wheel coverage confirmed. |
-| Linux x86_64 / arm64 | system / deadsnakes / uv | YES (inferred) | Hermes runs FTS5 + trigram on stdlib `sqlite3` in production on Linux. |
-| Linux musl / Alpine | `python:3.13-alpine` | YES (inferred) | Add to CI if needed. |
-| Windows WSL2 | Ubuntu Python | YES (inferred) | **Recommended Windows path.** |
-| Windows (native) | python.org installer | **Out of scope for v0.1** | Hermes itself tags native Windows as "early beta"; use WSL2. |
-
-**Recommended Python: 3.12** (Homebrew, pyenv, or uv-managed) per [ADR-005 §Decision](./docs/adr/005-python-version.md#decision) — best performance, mature toolchain, broadest spike coverage.
-
-> [!WARNING]
-> **Apple `/usr/bin/python3` is UNSUPPORTED.** It is Python 3.9.6 (below the `>=3.11` floor) and its `sqlite3` module is built **without** `enable_load_extension`, which prevents `sqlite-vec` from loading at all. See [ADR-004 §Consequences](./docs/adr/004-sqlite3-backend.md#consequences) and [ADR-005 §Consequences](./docs/adr/005-python-version.md#consequences). One-line fix: `brew install python@3.12` (or use `uv python install 3.12`), then re-run the install steps against that interpreter.
-
-## Naming convention
-
-Three names refer to "this plugin." They are deliberately distinct (per [ADR-023 §Open questions](./docs/adr/023-config-delivery.md#open-questions--5-uncertainty) — naming-convention-split visibility):
-
-| Form | Where it appears | Example |
+| Platform | Python | Status |
 |---|---|---|
-| `lossless-hermes` (hyphenated) | PyPI distribution name, `pyproject.toml [project.name]`, `pip install` / `pip uninstall` commands | `uv pip install lossless-hermes` |
-| `lossless_hermes` (snake_case, importable) | Python module name, `import lossless_hermes`, file/directory paths under `src/` | `from lossless_hermes import register` |
-| `lossless_hermes:` (snake_case, YAML) | `~/.hermes/config.yaml` namespace key for plugin-specific configuration | `lossless_hermes:`<br>`  voyage_api_key: "${VOYAGE_API_KEY}"` |
+| macOS arm64 / x86_64 | Homebrew · python.org · uv — **3.12 recommended** | Supported |
+| Linux x86_64 / arm64 | system · deadsnakes · uv · Alpine | Supported |
+| Windows | via **WSL2** (Ubuntu Python) | Supported |
+| Windows (native) | — | Out of scope — use WSL2 |
 
-Operators type the **snake_case** form in `config.yaml`; they only see the **hyphenated** form when running `pip install` or `pip uninstall`. Both forms appear in the Hermes startup banner so the mapping is visible at runtime.
+> **Apple `/usr/bin/python3` is unsupported.** It is Python 3.9.6 (below the `>=3.11` floor)
+> and its `sqlite3` is built without `enable_load_extension`, which blocks `sqlite-vec`. Fix:
+> `brew install python@3.12` (or `uv python install 3.12`) and install against that
+> interpreter. See [ADR-004](./docs/adr/004-sqlite3-backend.md) and
+> [ADR-005](./docs/adr/005-python-version.md).
 
-## What v0.1.0 ships
+## Status & maturity
 
-Feature-complete parity with LCM v4.1 (minus the two deferrals below):
+**Current release: [v0.1.1](https://github.com/electricsheephq/lossless-hermes/releases).**
 
-| Capability | Where |
+`lossless-hermes` is a **feature-complete** port of LCM v4.1 — all 122 planned port issues
+are merged, and CI is green across `{macOS, ubuntu} × {Python 3.11, 3.12, 3.13}` with
+~4,000 tests. It is **early**: production exposure is still limited, and the project is in an
+active hardening phase. An ongoing architecture review against an independent, production
+LCM implementation feeds correctness fixes back in — v0.1.1 shipped two such fixes, and
+further findings are tracked openly in the
+[issue tracker](https://github.com/electricsheephq/lossless-hermes/issues).
+
+Recommended use today: evaluation, development, and non-critical workloads. Watch the
+[releases](https://github.com/electricsheephq/lossless-hermes/releases) and
+[`CHANGELOG.md`](./CHANGELOG.md) as hardening continues.
+
+A few capabilities are gated on operator-provided resources rather than shipped on by
+default — the live Voyage recall benchmark requires a `VOYAGE_API_KEY`, and a full
+integration soak is recommended before production rollout. These are documented in
+[`BLOCKERS.md`](./BLOCKERS.md).
+
+## Architecture
+
+LCM layers cleanly onto Hermes's `ContextEngine` plugin slot:
+
+- **Storage** — a SQLite schema with an idempotent migration ladder, FTS5 + trigram search,
+  and optional `sqlite-vec` vector tables. Byte-compatible with OpenClaw LCM databases.
+- **Engine** — `LCMEngine` implements the `ContextEngine` ABC; per-turn ingest and context
+  assembly run through Hermes's `pre_llm_call` / `post_llm_call` hooks.
+- **Compaction** — leaf and condensed summary passes build the DAG, with anti-thrashing
+  guards and a synthesis circuit breaker.
+- **Retrieval** — FTS5 / trigram search, plus optional Voyage embeddings + `sqlite-vec`
+  hybrid search (reciprocal-rank fusion + rerank) when a key is configured.
+- **Entities & synthesis** — an entity-coreference pipeline and tier-aware synthesis
+  dispatch with a result cache.
+- **Operator surface** — the `/lcm` command family and the `import-openclaw` CLI.
+
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full system map, and
+[`docs/adr/`](./docs/adr/) for the decision record behind every load-bearing choice.
+
+### Naming convention
+
+Three forms of the name appear, deliberately distinct:
+
+| Form | Where it appears |
 |---|---|
-| SQLite schema, migration ladder, FTS5 + sqlite-vec wiring (schema-diff byte-compatible with OpenClaw LCM) | [Epic 01 — Storage](./epics/01-storage/) |
-| `LCMEngine` (`ContextEngine` ABC) round-trips messages; `/lcm` slash-command surface | [Epic 02 — Engine](./epics/02-engine-skeleton/) |
-| Per-turn ingest + always-on context assembly via `pre_llm_call` / `post_llm_call` hooks | [Epic 03 — Ingest + assembly](./epics/03-ingest-assembly/) |
-| Compaction — leaf summaries, condensed summaries, anti-thrashing, circuit breaker | [Epic 04 — Compaction](./epics/04-compaction/) |
-| Voyage embeddings + hybrid retrieval (FTS5 ∪ vec0, RRF, rerank-2.5) with graceful degradation | [Epic 05 — Embeddings](./epics/05-embeddings/) |
-| 7 agent tools — `lcm_grep`, `lcm_describe`, `lcm_get_entity`, `lcm_search_entities`, `lcm_expand`, `lcm_synthesize_around`, `lcm_compact` | [Epic 06 — Tools](./epics/06-tools/) |
-| Entity coreference pipeline + tier-aware synthesis (dispatch, cache, invalidation, audit) | [Epic 07 — Entity + synthesis](./epics/07-entity-synthesis/) |
-| `/lcm` operator commands — `status`, `health`, `purge`, `backup`, `reconcile`, `doctor`, `worker`, `rotate`, `eval`, `help` — plus the `lossless-hermes import-openclaw` CLI | [Epic 08 — CLI + ops](./epics/08-cli-ops/) |
-| Recall eval suite, per-stratum drift detection, `live-eval` CI gating, Voyage recall benchmark | [Epic 09 — Eval](./epics/09-eval/) |
+| `lossless-hermes` (hyphenated) | PyPI distribution name; `pip install` / `pip uninstall` |
+| `lossless_hermes` (snake_case) | Python module — `import lossless_hermes` |
+| `lossless_hermes:` (YAML key) | the configuration namespace in `~/.hermes/config.yaml` |
 
-Every Wave-N audit fix from LCM's 12 review waves is ported verbatim with `# LCM Wave-N` provenance comments (per [ADR-029](./docs/adr/029-wave-fix-provenance.md)).
+## Related work
 
-### Deferred to v0.2.0
+- **[Lossless Claw](https://github.com/Martian-Engineering/lossless-claw)** — the upstream
+  LCM v4.1 implementation for OpenClaw (TypeScript) that `lossless-hermes` is a faithful port
+  of. The canonical source of the design.
+- **[hermes-lcm](https://github.com/stephenschoettler/hermes-lcm)** — an independent,
+  currently-shipping LCM-for-Hermes plugin built from the LCM paper. A leaner sibling
+  implementation; `lossless-hermes` tracks its production experience as part of an ongoing
+  architecture review (see the
+  [issue tracker](https://github.com/electricsheephq/lossless-hermes/issues)).
+- **[The LCM paper](https://papers.voltropy.com/LCM)** — Ehrlich & Blackman, Voltropy PBC —
+  the design both implementations descend from.
 
-Two LCM v4.1 features are intentionally out of scope for v0.1.0, per accepted ADRs:
-
-| Deferred | Reason |
-|---|---|
-| `lcm_expand_query` tool + `prepareSubagentSpawn` / `subagentEnded` sub-agent lifecycle | [ADR-012](./docs/adr/012-subagent-defer.md) — sub-agent delegation deferred |
-| PR #628 stub-tier substitution | [ADR-030](./docs/adr/030-pr-628-stub-tier-deferred.md) |
-
-Dropped entirely (no Hermes equivalent): transcript-GC, JSONL session-file rotation, auto-rotate session files — Hermes uses a SQLite session store, not JSONL.
-
-## Source of truth
+## Documentation
 
 | Document | Purpose |
 |---|---|
-| [`ROADMAP.md`](./ROADMAP.md) | 10-epic roadmap, milestones, critical path |
-| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | System architecture, target structure, data flow |
-| [`STATUS.md`](./STATUS.md) | Current wave, last merged PR, milestone progress |
-| [`BLOCKERS.md`](./BLOCKERS.md) | Open blockers and their owners |
-| [`LEDGER.md`](./LEDGER.md) | Per-issue execution ledger |
-| [`docs/risks.md`](./docs/risks.md) | Identified risks + mitigation status |
-| [`docs/adr/`](./docs/adr/) | Architecture Decision Records (numbered, dated, status-tagged) |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | System architecture, data flow, target layout |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Per-release change history |
+| [`docs/adr/`](./docs/adr/) | Architecture Decision Records — numbered, dated, status-tagged |
 | [`docs/porting-guides/`](./docs/porting-guides/) | Per-subsystem TS → Python porting guides |
-| [`docs/reference/`](./docs/reference/) | Cross-reference docs (dependencies, Hermes hooks) |
+| [`docs/reference/`](./docs/reference/) | Dependency matrix, Hermes-hook reference, source map |
 | [`docs/spike-results/`](./docs/spike-results/) | De-risking spike findings |
-| [`docs/upstream/`](./docs/upstream/) | Upstream Hermes patches we're tracking |
-| [`epics/`](./epics/) | 10 epics, each with per-issue specifications |
-| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev setup, test policy, lint/format, branch policy |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev setup, test policy, lint / format, branch policy |
+| [`STATUS.md`](./STATUS.md) · [`BLOCKERS.md`](./BLOCKERS.md) | Live project state and open decisions |
 
-## Project context
+## Contributing
 
-- **Source**: `Martian-Engineering/lossless-claw` main + [PR #613](https://github.com/Martian-Engineering/lossless-claw/pull/613) (v4.1 omnibus, 52k LOC) + [PR #628](https://github.com/Martian-Engineering/lossless-claw/pull/628) (stub-tier, merged)
-- **Target**: `NousResearch/hermes-agent` Python plugin via `ContextEngine` ABC
-- **OpenClaw coupling surface**: 26 LOC in `src/openclaw-bridge.ts` (single import seam)
-- **Hermes anticipation**: `agent/context_engine.py` docstring at line 5 explicitly names LCM as a planned tenant
-
-## Quick links
-
-- Hermes-agent repo: https://github.com/NousResearch/hermes-agent
-- Source repo: https://github.com/Martian-Engineering/lossless-claw
-- PR #613 (omnibus): https://github.com/Martian-Engineering/lossless-claw/pull/613
-- PR #628 (stub-tier): https://github.com/Martian-Engineering/lossless-claw/pull/628
-- Hermes ContextEngine ABC: https://github.com/NousResearch/hermes-agent/blob/main/agent/context_engine.py
+Contributions are welcome. The development loop, test policy, and lint/format gates are in
+[`CONTRIBUTING.md`](./CONTRIBUTING.md). In short: `uv pip install -e ".[dev]"`, work on a
+branch, keep the CI matrix green, and open a PR. Pre-commit hooks (`ruff`, `ty`,
+file-hygiene) must pass.
 
 ## License
 
