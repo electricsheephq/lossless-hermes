@@ -187,7 +187,6 @@ def test_unknown_cmd_returns_unknown_message() -> None:
     "subcommand,expected_epic",
     [
         ("doctor", "Epic 08"),
-        ("eval", "Epic 09"),
         # Note: ``import-openclaw`` was previously stubbed; issue 08-15
         # wired the real body in ``lossless_hermes.cli.import_openclaw``.
         # The dedicated tests live in ``tests/cli/test_import_openclaw.py``.
@@ -200,6 +199,11 @@ def test_unknown_cmd_returns_unknown_message() -> None:
         # real body in ``lossless_hermes.commands.purge``.
         # Note: ``health`` was previously stubbed; issue 08-03 wired the
         # real body in ``lossless_hermes.commands.health``.
+        # Note: ``eval`` was previously stubbed (issue #143); the real
+        # body now lives in ``lossless_hermes.commands.eval`` and bridges
+        # to ``operator.eval_runner.run_eval``. The dedicated tests live
+        # in ``tests/commands/test_eval.py``. Routing is asserted by
+        # ``test_eval_routes_to_eval_handler`` below.
     ],
 )
 def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_epic: str) -> None:
@@ -223,6 +227,37 @@ def test_rotate_routes_to_rotate_handler() -> None:
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("rotate")
     assert "rotate: no active session" in out
+    assert "not yet implemented" not in out
+
+
+def test_eval_routes_to_eval_handler() -> None:
+    """`/lcm eval` routes to the real ``eval:run`` body, not the stub.
+
+    Issue #143 wired the real ``eval`` body. With the default stub
+    engine (``_db is None``) ``/lcm eval --baseline`` parses cleanly
+    (``--baseline`` resolves the ambiguity) and then short-circuits to
+    the DB-unavailable block — that "unavailable" string is the routing
+    signal proving the route reached the real handler rather than the
+    "not yet implemented" stub.
+    """
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("eval --baseline")
+    assert out.startswith("[lcm] eval")
+    assert "unavailable" in out
+    assert "not yet implemented" not in out
+
+
+def test_eval_bare_requires_mode_or_baseline() -> None:
+    """Bare `/lcm eval` (no flags) is rejected by the real handler.
+
+    The handler — not the dispatcher stub — rejects an ambiguous bare
+    invocation with a ``parse_error`` block naming ``--baseline`` /
+    ``--mode``. Proves the route reached the real handler's parser.
+    """
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("eval")
+    assert "parse_error" in out
+    assert "--baseline" in out
     assert "not yet implemented" not in out
 
 
