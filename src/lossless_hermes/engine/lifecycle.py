@@ -140,6 +140,8 @@ class _LifecycleMixin:
         _telemetry_store: Optional[CompactionTelemetryStore]
         _maintenance_store: Optional[CompactionMaintenanceStore]
         _last_seen_message_idx: Dict[str, int]
+        _previous_assembled_messages_by_conversation: Dict[int, Any]
+        current_session_id: Optional[str]
         hermes_home: Path
         config: LcmConfig
         last_prompt_tokens: int
@@ -504,3 +506,160 @@ class _LifecycleMixin:
         self._last_seen_message_idx.clear()
 
         logger.debug("[lcm] on_session_reset: token state + ingest cursors cleared")
+
+    # ------------------------------------------------------------------
+    # Issue 08-16 — ``/lcm rotate`` engine support.
+    #
+    # Per ADR-024 §"Consequences" + Epic 01 README ("JSONL bootstrap,
+    # file-anchor checkpointing, session-file rollover" drop entirely),
+    # ``/lcm rotate`` in Hermes is SQLite-only — there is no JSONL
+    # transcript file to rename. The TS source's
+    # ``rotateSessionStorageWithBackup`` (``lossless-claw/src/engine.ts``)
+    # physically rotated the session JSONL; the Hermes equivalent backs
+    # up the DB, clears the per-session assemble snapshot cache, compacts
+    # the WAL, and stamps ``state_meta.last_rotate_at``. The backup +
+    # WAL-compaction live in :mod:`lossless_hermes.commands.rotate`; the
+    # two state-touching primitives below are engine-owned because they
+    # mutate engine-internal state (the snapshot dict) and the DB.
+    # ------------------------------------------------------------------
+
+    def clear_assemble_snapshot(self, session_id: str) -> bool:
+        """Drop the assemble prefix-stability snapshot for ``session_id``.
+
+        Removes the per-conversation entry from
+        :attr:`_previous_assembled_messages_by_conversation` so the next
+        :meth:`_AssembleMixin._assemble` pass for that conversation
+        rebuilds from scratch instead of comparing against the cached
+        prior assembly (the prefix-stability diagnostic snapshot —
+        see the field doc in :meth:`LCMEngine.__init__` and the snapshot
+        write in ``assemble.py``).
+
+        Called by ``/lcm rotate`` (issue 08-16, step 2). The snapshot
+        dict is keyed by ``conversation_id`` (an ``int``), NOT by
+        ``session_id`` — so this method first resolves the session's
+        conversation row via
+        :meth:`ConversationStore.get_conversation_by_session_id` and then
+        deletes the keyed entry. This mirrors how
+        :meth:`_AssembleMixin._assemble_locked` resolves the same id.
+
+        Best-effort and never raises:
+
+        * No DB / no conversation store (pre-``on_session_start``) —
+          returns :data:`False`, no-op.
+        * Session has no conversation row yet — returns :data:`False`,
+          no-op (nothing to clear; the next assemble would seed a fresh
+          entry anyway).
+        * Conversation resolved but no snapshot cached for it — returns
+          :data:`False` (the ``dict.pop`` default branch).
+
+        Args:
+            session_id: The Hermes session identifier whose conversation
+                snapshot should be dropped. Typically
+                :attr:`current_session_id`.
+
+        Returns:
+            :data:`True` if a snapshot entry was actually removed;
+            :data:`False` if there was nothing to remove (no
+            conversation, or no cached snapshot for it).
+        """
+        store = self._conversation_store
+        if store is None:
+            logger.debug(
+                "[lcm] clear_assemble_snapshot session=%s: no conversation "
+                "store (pre-on_session_start) — no-op",
+                session_id,
+            )
+            return False
+
+        conversation = store.get_conversation_by_session_id(session_id)
+        if conversation is None:
+            logger.debug(
+                "[lcm] clear_assemble_snapshot session=%s: no conversation row — no-op",
+                session_id,
+            )
+            return False
+
+        conversation_id = conversation.conversation_id
+        # ``dict.pop`` with a sentinel default is the atomic
+        # remove-if-present idiom — no separate membership check (which
+        # would be a TOCTOU window). The return value tells the caller
+        # whether anything was actually cleared.
+        sentinel = object()
+        removed = (
+            self._previous_assembled_messages_by_conversation.pop(conversation_id, sentinel)
+            is not sentinel
+        )
+        logger.debug(
+            "[lcm] clear_assemble_snapshot session=%s conversation_id=%d: snapshot %s",
+            session_id,
+            conversation_id,
+            "cleared" if removed else "absent (no-op)",
+        )
+        return removed
+
+    def write_state_meta(self, key: str, value: str) -> None:
+        """UPSERT a ``(key, value)`` row into the ``state_meta`` table.
+
+        ``state_meta`` is a Hermes-only single-row-per-key store
+        (``key TEXT PRIMARY KEY, value TEXT, updated_at TEXT``). It is
+        deliberately NOT in the migration ladder — per
+        ``src/lossless_hermes/cli/import_openclaw.py`` §"``state_meta``
+        design note", a Python-only table in ``db/migration.py`` would
+        trip the schema-diff CI gate (the gate exits non-zero on objects
+        absent from the TS reference schema). The table is therefore
+        created on demand by whichever caller writes first; this method
+        runs the same ``CREATE TABLE IF NOT EXISTS`` so ``/lcm rotate``
+        works on a DB that has never been through ``import-openclaw``.
+
+        Called by ``/lcm rotate`` (issue 08-16, step 4) to stamp
+        ``last_rotate_at`` so ``/lcm status`` can later show "last
+        rotated N ago".
+
+        Per [ADR-017](../../docs/adr/017-sync-vs-async-db.md) this is a
+        synchronous DB write — it commits before returning so the row is
+        durable even if the process exits immediately after ``/lcm
+        rotate``.
+
+        Args:
+            key: The ``state_meta`` key (e.g. ``"last_rotate_at"``).
+            value: The string value to store (callers serialize
+                timestamps as ISO-8601 UTC strings).
+
+        Raises:
+            RuntimeError: The engine has no open DB connection
+                (``on_session_start`` has not run). Callers in Epic 08
+                resolve the DB defensively before reaching this method,
+                so this is a programmer-error guard rather than an
+                expected path.
+        """
+        db = self._db
+        if db is None:
+            raise RuntimeError(
+                "write_state_meta requires an open DB connection — on_session_start has not run."
+            )
+
+        # Create-on-demand: ``state_meta`` is not in the migration
+        # ladder (see docstring). The DDL is byte-identical to
+        # ``import_openclaw._ensure_state_meta_table`` so the two
+        # writers agree on the schema.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS state_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT,
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO state_meta (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value),
+        )
+        db.commit()
+        logger.debug("[lcm] write_state_meta: %s = %s", key, value)

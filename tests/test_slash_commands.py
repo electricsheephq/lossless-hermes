@@ -187,13 +187,15 @@ def test_unknown_cmd_returns_unknown_message() -> None:
     "subcommand,expected_epic",
     [
         ("doctor", "Epic 08"),
-        ("rotate", "Epic 08"),
         ("eval", "Epic 09"),
         # Note: ``import-openclaw`` was previously stubbed; issue 08-15
         # wired the real body in ``lossless_hermes.cli.import_openclaw``.
         # The dedicated tests live in ``tests/cli/test_import_openclaw.py``.
         # Note: ``backup`` was previously stubbed; issue 08-09 wired the
         # real body in ``lossless_hermes.commands.backup``.
+        # Note: ``rotate`` was previously stubbed; issue 08-16 wired the
+        # real body in ``lossless_hermes.commands.rotate``. The dedicated
+        # tests live in ``tests/commands/test_rotate.py``.
         # Note: ``purge`` was previously stubbed; issue 08-04 wired the
         # real body in ``lossless_hermes.commands.purge``.
         # Note: ``health`` was previously stubbed; issue 08-03 wired the
@@ -207,6 +209,21 @@ def test_known_subcommand_returns_not_yet_implemented(subcommand: str, expected_
     assert "not yet implemented" in out
     assert expected_epic in out
     assert f"/lcm {subcommand}" in out
+
+
+def test_rotate_routes_to_rotate_handler() -> None:
+    """`/lcm rotate` routes to the real ``rotate:run`` body, not the stub.
+
+    Issue 08-16 wired the real ``rotate`` body. With the default stub
+    engine (``current_session_id is None``) the handler short-circuits
+    to the no-active-session message — that string is the routing
+    signal proving the route reached the real handler rather than the
+    "not yet implemented" stub.
+    """
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("rotate")
+    assert "rotate: no active session" in out
+    assert "not yet implemented" not in out
 
 
 def test_nested_subcommand_routes_to_nested_handler() -> None:
