@@ -6,17 +6,17 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **v0.2.0 implementation in progress.** Wave 1 ✅ (#147 path-resolve, #148 base64 guard, #149 `/lcm eval` wiring); Wave 2 ✅ (ADR-033 embeddings-off #154, ADR-034 directory-distribution #152, ADR-035 diagnostics-as-tools #155). A **P0 found during the #155 review** — the 7 ported `lcm_*` tools never dispatch (`TOOL_DISPATCH` unwired; issue #156) — is in flight ahead of Wave 3. **Wave 3** = ADR-032 (drop `preassemble`, debt-gated compaction; impl plan posted to issue #132). |
-| **Current milestone** | M1–M11 ✅ (v0.1.0); patch line v0.1.1 → v0.1.2 → v0.1.3 shipped. **M12 (v0.2.0) in progress** — Wave 1 + Wave 2 merged; P0 #156 + Wave 3 (ADR-032) remain before the v0.2.0 tag. |
-| **Last merged PR** | [#155](https://github.com/electricsheephq/lossless-hermes/pull/155) `feat: lcm_status + lcm_doctor as model-callable tools (ADR-035, #135)` |
-| **Last commit on main** | `10a0bfd` |
+| **Current wave** | **v0.2.0 implementation in progress.** Wave 1 ✅ (#147/#148/#149); Wave 2 ✅ (ADR-033 #154, ADR-034 #152, ADR-035 #155). **P0 #156** (7 ported `lcm_*` tools never dispatched) — PR-0/1/2 merged (#158/#159/#161); **7 of 8 tools now dispatch**; the 8th (`lcm_synthesize_around`) is blocked on the compaction P0. **A second P0 — #164 — was found: compaction is non-functional** (`CompactionEngine` never wired into `LCMEngine`; `compress()` silently passes through). Wave 3 = the #164 Epic-04 wrap-up + ADR-032 (#132), now unified — ADR-032 presupposes a working `compress()`. |
+| **Current milestone** | **M12 (v0.2.0) in progress.** Wave 1 + Wave 2 merged; #156 tool-dispatch at 7/8. **Two P0s block the v0.2.0 tag: #156 (last tool) and #164 (compaction non-functional).** M5 ("Compaction working") and M8 ("Entity + synthesis green") were marked done in v0.1.0 but are now known/suspected false — see the milestone table. |
+| **Last merged PR** | [#161](https://github.com/electricsheephq/lossless-hermes/pull/161) `fix: dispatch adapter for lcm_compact (#156 PR-2)` |
+| **Last commit on main** | `dc6372d` |
 | **Latest release** | **v0.1.3** — see `gh release list`. v0.2.0 not yet tagged (P0 #156 + Wave 3 outstanding). |
 | **Total PRs merged** | Waves 0–6 (all 122 port issues) + the architecture-review series #126/#138–#142/#145 + **v0.2.0 Wave 1 (#147/#148/#149) + Wave 2 (#152/#154/#155)**. |
-| **Open PRs** | P0 #156 tool-dispatch fix — Issue Executor in flight. |
+| **Open PRs** | None. (#156 PR-0/1/2 merged; PR-3 escalated → `lcm_synthesize_around` folded into the #164 compaction work.) |
 | **Total tests** | 4200+ passing (`pytest -m 'not live'`); 6 OS×Python matrix cells. |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None. B-001/B-002 resolved at the v0.1.0 release-gate (operator-gated, accepted). The architecture review's findings are all either fixed (v0.1.1–v0.1.3) or issue-tracked for v0.2.0 — see below. |
-| **Architecture review (vs `hermes-lcm`)** | 12 slices + 2 production-scars audits, all 95%-gated. **Fixed (v0.1.x):** #128 model-switch crash, #129 recall-policy tool ref (v0.1.1); #144 durability P0 (v0.1.2); #130 ingest-cursor (v0.1.3). **Shipped (v0.2.0 W1/W2):** #65 (#147), #131 (#148), #143 (#149), ADR-034 (#152), ADR-033 (#154), ADR-035 (#155). **v0.2.0 remaining:** P0 #156 tool-dispatch, ADR-032/#132 (Wave 3), #146 telemetry-txn, minor #150/#151/#153/#157. |
+| **Architecture review (vs `hermes-lcm`)** | 12 slices + 2 production-scars audits, all 95%-gated. **Fixed (v0.1.x):** #128/#129 (v0.1.1), #144 durability P0 (v0.1.2), #130 (v0.1.3). **Shipped (v0.2.0 W1/W2):** #65 (#147), #131 (#148), #143 (#149), ADR-034 (#152), ADR-033 (#154), ADR-035 (#155), #156 PR-0/1/2 (#158/#159/#161). **Two integration P0s found in the never-run-live port — #156 (tool dispatch unwired) + #164 (compaction unwired).** v0.2.0 remaining: #164 compaction P0 + ADR-032/#132 (unified Wave 3), `lcm_synthesize_around` (blocked on #164), minor #146/#150/#151/#153/#157/#160/#162/#163. |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -69,14 +69,14 @@
 | M2 | DB layer feature-complete | ✅ done | Wave 2 closed 2026-05-13T13:43Z; 13 PRs + 1 chore; 907 tests; schema-diff subset 92/92 |
 | M3 | Engine round-trips messages | ✅ done | Wave 3 closed 2026-05-13; 9 PRs covering 10 issues + 2 fix-forwards; 1101 tests; LCMEngine wired through Hermes ABC + 4 plugin hooks + /lcm slash command |
 | M4 | Per-turn ingest + assembly live | ✅ done | Wave 4 closed 2026-05-13/14; 25 PRs covering Epic 03 (10 issues: 03-01..03-10) + Epic 05 (11 issues: 05-01..05-11); ContextAssembler.assemble() with full 16-step pipeline; preassemble ABC override (Option B) + experimental force-compress (Option A) coexistent per ADR-010; Voyage HTTP client + sqlite-vec store + WorkerLoop + WorkerLock + backfill cron + semantic + hybrid + degraded-modes contract + autostart |
-| M5 | Compaction working | ✅ done | Wave 5 — Epic 04 (04-01..04-08 + circuit-breaker; compaction.py ~3000 LOC) |
+| M5 | Compaction working | ⚠️ **broken — P0 #164** | Epic 04 delivered the algorithm (`compaction.py`, the ~3,892-LOC `CompactionEngine`) + issues 04-01..04-08 + circuit-breaker — but the engine-side wiring was never built: `CompactionEngine` is never instantiated, `_execute_compaction_core` is a `NotImplementedError` stub, and `compress()` (the Hermes-driven path) silently passes messages through unchanged. Same integration-gap class as M7/#156. Fix = the #164 Epic-04 wrap-up, unified with ADR-032. |
 | M6 | Embeddings + +52.5pp lift | 🔄 harness done | Wave 6 — 09-08 (#125) shipped the benchmark harness + measured `fts_only` baseline (paraphrastic R@5 0.0%); the live +52.5pp hybrid number is operator-gated on `VOYAGE_API_KEY` (B-001), documented in `docs/benchmarks/voyage-recall-2026-q2.md` |
 | M7 | 8 tools wired | ⚠️ dispatch broken — fix in flight (#156) | Wave 5 — Epic 06 delivered the per-tool ports + schemas + token-gate + recursion-guard + SHA-256 verbatim lint, but the **dispatch wiring was never built** — the 7 ported `lcm_*` tools had schemas the model sees with no `TOOL_DISPATCH` entries (P0 #156, found during the #155 review). Being fixed across v0.2.0 PR-0..PR-3: PR-0 = crash-hardening + `lcm_expand` deferral (ADR-037) + #156 regression scaffold; PR-1..PR-3 wire the 6 remaining ported tools via a dispatch-adapter layer. `lcm_status`/`lcm_doctor` (#155) already dispatch. |
-| M8 | Entity + synthesis green | ✅ done | Wave 5 — Epic 07 (coreference, extractor, synthesis dispatch/cache_key/invalidation/tier-routing/audit) |
+| M8 | Entity + synthesis green | ⚠️ suspect — verify under #164 | Epic 07 delivered coreference, extractor, synthesis dispatch/cache_key/invalidation/tier-routing/audit — but synthesis needs an `LlmCall` and `LCMEngine` has no summarizer/`complete` surface (the same gap that breaks compaction, #164). Whether synthesis runs end-to-end is unverified; to be checked as part of the #164 summarizer-surface work. |
 | M9 | All operator commands; import-openclaw verified | ✅ done | Wave 5 — Epic 08 (15 issues ported: status/health/purge/backup/reconcile/doctor-{shared,apply,cleaners}/worker-orchestrator/worker-status/rotate/eval-runner/semantic-infra/import-openclaw; 08-11/08-12 superseded by 05-11/07-04) |
 | M10 | Eval suite green; drift CI live | ✅ done | Wave 6 — Epic 09: 09-01..09-08 all merged (#115/#120-125, incl. drift CI + live-eval workflow + benchmark harness) |
 | M11 | v0.1.0 release | ✅ done | Wave 6 — 12-item release-gate checklist passed (9 PASS; items 6/7/11 operator-gated + documented per B-001/B-002); v0.1.0 tagged on `8b71b12` |
-| M12 | v0.2.0 release | 🔄 in progress | Wave 1 ✅ (#147/#148/#149); Wave 2 ✅ (ADR-033/034/035 — #152/#154/#155); P0 #156 tool-dispatch + Wave 3 (ADR-032/#132) remain before tag |
+| M12 | v0.2.0 release | 🔄 in progress | Wave 1 ✅ (#147/#148/#149); Wave 2 ✅ (ADR-033/034/035 — #152/#154/#155); #156 tool-dispatch at 7/8 (PR-0/1/2 merged #158/#159/#161). **Two P0s remain before tag: #156 (last tool) + #164 (compaction).** Wave 3 = #164 Epic-04 wrap-up + ADR-032/#132, unified. |
 
 ## Upstream watch
 
@@ -102,4 +102,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-19 (v0.2.0 Wave 1 + Wave 2 merged — #147/#148/#149, #152/#154/#155; P0 #156 tool-dispatch found during the #155 review and in flight; Wave 3/ADR-032 implementation plan posted to issue #132. Last commit `10a0bfd`.)_
+_Last refreshed: 2026-05-19 (v0.2.0 Wave 1+2 merged; P0 #156 tool-dispatch at 7/8 — PR-0/1/2 merged #158/#159/#161; second P0 #164 found — compaction non-functional, `CompactionEngine` never wired; M5 downgraded to ⚠️ broken, M8 to ⚠️ suspect; Wave 3 = #164 Epic-04 wrap-up unified with ADR-032/#132. Last commit `dc6372d`.)_
