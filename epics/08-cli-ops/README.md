@@ -76,8 +76,8 @@ Full operator command surface for `lossless-hermes`: the `/lcm` slash-command di
 | [08-08](./08-08-doctor-cleaners.md) | `applyDoctorCleaners` + 3 predefined predicates | 8 | 90% | 08-06, 08-09 backup |
 | [08-09](./08-09-backup.md) | `/lcm backup` — `VACUUM INTO` primitive | 4 | 95% | 08-01 |
 | [08-10](./08-10-worker-orchestrator.md) | Worker orchestrator (merging `worker-llm.ts`) | 6 | 90% | 08-01, Epic 05 workers |
-| [08-11](./08-11-backfill-autostart.md) | Embedding-backfill autostart loop | 5 | 88% | 08-10, ADR-020 |
-| [08-12](./08-12-extraction-autostart.md) | Entity-extraction autostart loop | 5 | 90% | 08-10, ADR-020, Epic 07-04 |
+| [08-11](./08-11-backfill-autostart.md) | Embedding-backfill autostart loop | 5 | 88% | 08-10, ADR-020 — **SUPERSEDED: delivered by issue 05-11 (PR #58); `operator/backfill_autostart.py` exists on `main`** |
+| [08-12](./08-12-extraction-autostart.md) | Entity-extraction autostart loop | 5 | 90% | 08-10, ADR-020, Epic 07-04 — **SUPERSEDED: delivered by issue 07-04 (PR #89); `operator/extraction_autostart.py` exists on `main`** |
 | [08-13](./08-13-eval-runner.md) | `/lcm eval` runner (recall@K + drift) | 6 | 90% | 08-01 |
 | [08-14](./08-14-semantic-infra-init.md) | One-time vec0 + embedding-profile init | 3 | 92% | 08-01 |
 | [08-15](./08-15-import-openclaw-cli.md) | `lossless-hermes import-openclaw` CLI per ADR-025 | 6 | 90% | 08-01 |
