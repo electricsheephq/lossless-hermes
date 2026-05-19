@@ -3,8 +3,24 @@
 The ``LOSSLESS_RECALL_POLICY_PROMPT`` constant is the ~3 KB text the
 plugin injects into every turn's user-message content via
 ``pre_llm_call`` (issue 03-10). The text guides the agent on when to
-reach for ``lcm_grep`` / ``lcm_describe`` / ``lcm_expand_query`` and how
-to interpret compacted summaries.
+reach for ``lcm_grep`` / ``lcm_describe`` and how to interpret compacted
+summaries.
+
+.. note:: v0.1.1 — ``lcm_expand_query`` references removed
+
+   Per [ADR-012](../docs/adr/012-subagent-defer.md), ``lcm_expand_query``
+   is deferred to v0.2.0 and is NOT registered in ``TOOL_SCHEMAS``. The
+   recall-policy prompt is injected into the model's context **every
+   turn** — so any ``lcm_expand_query`` mention in this text told the
+   model, every turn, to call a tool it could not see in its tool list.
+   v0.1.1 rewrites the escalation ladder, the scope-selection rules, and
+   the precision flow to route deep-recall through ``lcm_describe``'s
+   one-hop ``expandChildren`` / ``expandMessages`` flags (the registered
+   path) instead. This deliberately diverges from the byte-verbatim TS
+   port (ADR-016) — see the ``# ADR-012`` provenance comments at each
+   edit site in :data:`_RAW_POLICY_LINES` — because never advertising an
+   unregistered tool overrides verbatim fidelity. Each ``# ADR-012``
+   comment marks one such divergence.
 
 ### Two-layer design (ADR-014 §Rationale)
 
@@ -84,18 +100,28 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# _RAW_POLICY_PROMPT — verbatim port of TS constant
+# _RAW_POLICY_PROMPT — port of TS constant, with v0.1.1 ADR-012 edits
 # ---------------------------------------------------------------------------
 #
 # Source: ``lossless-claw/src/plugin/index.ts:244-321`` (commit ``1f07fbd``).
 # The TS form is an array of strings joined with ``"\n"``. We join the same
-# way so the resulting text is byte-identical to what the TS bridge would
-# have injected into a system prompt. The user-voice rewording (below)
-# transforms this to user-message form per ADR-014.
+# way. The user-voice rewording (below) transforms this to user-message form
+# per ADR-014.
 #
-# DO NOT EDIT this constant without updating the TS pin AND running the
-# snapshot test in ``tests/test_recall_policy.py`` — it asserts a stable
-# hash so silent drift surfaces as a test failure.
+# v0.1.1 — NO LONGER byte-identical to the TS source. Per ADR-012,
+# ``lcm_expand_query`` is deferred to v0.2.0 and unregistered; because this
+# text is injected into the model's context every turn, every mention told
+# the model to call a tool it could not see. The lines that referenced
+# ``lcm_expand_query`` (escalation step 3, the drilldown bullet, the dedicated
+# usage block, two scope-selection bullets, precision-flow step 2) were
+# rewritten to route through the registered ``lcm_describe`` expand flags.
+# Each such line carries a ``# ADR-012`` provenance comment. "Don't advertise
+# an unregistered tool" deliberately overrides ADR-016's verbatim rule here.
+#
+# DO NOT make further edits to this constant without (a) recording the reason
+# in a provenance comment AND (b) updating the snapshot test in
+# ``tests/test_recall_policy.py`` — it asserts a stable hash so silent drift
+# surfaces as a test failure.
 
 _RAW_POLICY_LINES: Final[Tuple[str, ...]] = (
     "## Lossless Recall Policy",
@@ -112,14 +138,21 @@ _RAW_POLICY_LINES: Final[Tuple[str, ...]] = (
     "Recall order for compacted conversation history:",
     "1. `lcm_grep` — search by regex or full-text across messages and summaries",
     "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-    "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. The escalation step 3 now points at
+    # lcm_describe's one-hop expand flags (the registered deep-recall path).
+    "3. `lcm_describe` with `expandChildren=true` / `expandMessages=true` — deep recall: inline the first-hop child summaries or raw source messages for a specific summary, then answer from that retrieved evidence",
     "",
     "**Specialized tools beyond the 1/2/3 escalation** (use when the question type clearly matches):",
     '- **Time-anchored** ("what did we work on yesterday/last week?"): `lcm_synthesize_around` with `window_kind="period"` and a period shortcut (`yesterday`, `last-7-days`, `this-month`, `last-12h`, etc.) OR explicit `since`/`before`. No anchor lookup needed.',
     '- **Topic-anchored / paraphrastic** ("did we discuss X?"): `lcm_grep mode="hybrid"` (FTS + Voyage rerank — strongest recall) or `lcm_grep mode="semantic"` (embedding-only, cheaper, with confidence band; supports `summaryKinds` filter for kind-scoped recall).',
     '- **Verbatim citation** ("quote exactly what was said"): `lcm_grep mode="verbatim"` returns FULL untruncated message rows with optional `role` filter (user/assistant/tool/system).',
     '- **Entity / pattern** ("who is this person?", "history of project X"): `lcm_get_entity` (exact name) or `lcm_search_entities` (fuzzy). Entity catalog is populated by an async worker; if empty, the tools return a `catalogStatus` field.',
-    '- **Drilldown** ("where did this come from?"): `lcm_describe` with `expandChildren=true` or `expandMessages=true` for inline one-hop expansion (no sub-agent). For deeper traversal, `lcm_expand_query`.',
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. The "deeper traversal" sentence (which
+    # named lcm_expand_query) is dropped; one-hop expansion via lcm_describe is
+    # the registered drilldown path.
+    '- **Drilldown** ("where did this come from?"): `lcm_describe` with `expandChildren=true` or `expandMessages=true` for inline one-hop expansion (no sub-agent). Re-issue `lcm_describe` against a child summary ID to traverse another hop.',
     "",
     "**`lcm_grep` routing guidance:**",
     '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
@@ -132,19 +165,23 @@ _RAW_POLICY_LINES: Final[Tuple[str, ...]] = (
     '- Use `sort: "relevance"` when hunting for the best older match on a topic.',
     '- Use `sort: "hybrid"` when relevance matters but newer context should still get a boost.',
     "",
-    "**`lcm_expand_query` usage** — two patterns (always requires `prompt`):",
-    '- With IDs: `lcm_expand_query(summaryIds: ["sum_xxx"], prompt: "What config changes were discussed?")`',
-    '- With search: `lcm_expand_query(query: "database migration", prompt: "What strategy was decided?")`',
-    "- `query` uses the same FTS5 full-text search path as `lcm_grep`, so the same query-construction rules apply.",
-    "- `query` is for matching candidate summaries; `prompt` is the natural-language question or task to answer after expansion.",
-    "- FTS5 defaults to AND matching, so more query terms narrow results instead of broadening them.",
-    "- For `query`, use 1-3 distinctive terms or a quoted phrase. Do not stuff synonyms or extra keywords into it.",
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. The dedicated "lcm_expand_query usage"
+    # block (two-pattern invocation guide) is dropped entirely; the registered
+    # recall tools (lcm_grep, lcm_describe) are documented in the escalation
+    # ladder and lcm_grep routing-guidance blocks above.
     "**Scope selection rule:**",
     "- Start with the current conversation scope.",
-    "- If the in-context summaries already look relevant to the user's question, prefer `lcm_grep` or `lcm_expand_query` without `allConversations`.",
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. Scope guidance now names only the
+    # registered recall tools.
+    "- If the in-context summaries already look relevant to the user's question, prefer `lcm_grep` or `lcm_describe` without `allConversations`.",
     "- Use `allConversations: true` only when the current summaries do not appear sufficient, the question seems outside the current conversation, or the user is explicitly asking about work across sessions.",
     "- For global discovery, prefer `lcm_grep(..., allConversations: true)` first.",
-    "- If global matches are found and the user needs one synthesized answer, use `lcm_expand_query(..., allConversations: true)`; this is bounded synthesis, not exhaustive expansion.",
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. Global synthesis now routes through
+    # lcm_grep + lcm_describe rather than the deferred sub-agent wrapper.
+    "- If global matches are found and the user needs one synthesized answer, drill into the strongest hits with `lcm_describe` (`expandChildren=true` / `expandMessages=true`) and answer from that retrieved evidence.",
     "- If you already know the exact target conversation, prefer explicit `conversationId` instead of `allConversations`.",
     "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
     "- Keep raw summary IDs out of normal user-facing prose unless the user explicitly asks for sources or IDs.",
@@ -161,7 +198,10 @@ _RAW_POLICY_LINES: Final[Tuple[str, ...]] = (
     "",
     "**Precision flow:**",
     "1. `lcm_grep` to find the relevant summaries or messages",
-    "2. `lcm_expand_query` when you need exact evidence before answering",
+    # ADR-012: lcm_expand_query deferred — reference removed so the model isn't
+    # told to call an unregistered tool. Step 2 now points at lcm_describe's
+    # one-hop expand flags (the registered exact-evidence path).
+    "2. `lcm_describe` with `expandChildren=true` / `expandMessages=true` when you need exact evidence before answering",
     "3. Answer from the retrieved evidence instead of summary paraphrase",
     "",
     "**Uncertainty checklist:**",
