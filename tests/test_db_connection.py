@@ -47,6 +47,7 @@ from lossless_hermes.db.connection import (
     get_file_backed_database_path,
     is_in_memory_path,
     normalize_path,
+    open_db,
     open_lcm_db,
 )
 
@@ -704,5 +705,127 @@ class TestOpenLcmDbApi:
         conn = open_lcm_db(tmp_path / "lcm.db")
         try:
             assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        finally:
+            close_lcm_db(conn)
+
+
+# ---------------------------------------------------------------------------
+# 10. Durability — issue #144 P0 regression (autocommit / no implicit txn)
+# ---------------------------------------------------------------------------
+#
+# ``open_lcm_db`` MUST open the stdlib connection with
+# ``isolation_level=None`` (autocommit / explicit-transactions). With
+# Python's default ``isolation_level=""`` the first DML silently opens an
+# implicit deferred transaction that nothing on the ingest path commits,
+# so ``conn.close()`` rolls the whole session back (issue #144 — the
+# "lossless" engine lost everything on session close). These tests guard
+# the connection-factory invariant directly, independent of the engine
+# ingest path.
+
+
+@_skip_no_extension_loading
+class TestDurability:
+    """Issue #144: writes must be durable across connection close."""
+
+    def test_open_lcm_db_connection_is_autocommit(self, tmp_path: Path) -> None:
+        """``open_lcm_db`` returns an ``isolation_level=None`` connection.
+
+        This is the root-cause guard. ``isolation_level=None`` means no
+        implicit transaction is opened on DML; a regression back to the
+        stdlib default ``""`` reintroduces issue #144.
+        """
+        conn = open_lcm_db(tmp_path / "lcm.db")
+        try:
+            assert conn.isolation_level is None, (
+                "issue #144: open_lcm_db must use isolation_level=None — "
+                f"got {conn.isolation_level!r}, which silently opens an "
+                "uncommitted implicit transaction on the first write"
+            )
+        finally:
+            close_lcm_db(conn)
+
+    def test_open_db_connection_is_autocommit(self, tmp_path: Path) -> None:
+        """The role-aware ``open_db`` factory is autocommit too.
+
+        ``open_db`` is the embeddings-subsystem factory; it shares the
+        same durability requirement as ``open_lcm_db``.
+        """
+        conn = open_db(tmp_path / "lcm.db")
+        try:
+            # ``open_db`` may return an apsw adapter on the fallback path;
+            # apsw is autocommit-by-default so this assertion is stdlib-
+            # specific (the primary path on supported platforms).
+            if isinstance(conn, sqlite3.Connection):
+                assert conn.isolation_level is None, (
+                    "issue #144: open_db must use isolation_level=None"
+                )
+        finally:
+            close_lcm_db(conn)  # type: ignore[arg-type]
+
+    def test_no_implicit_transaction_after_write(self, tmp_path: Path) -> None:
+        """A bare INSERT does not leave an open transaction.
+
+        Mirrors ``ConversationStore.create_conversation``'s bare INSERT —
+        the exact statement that opened the never-committed implicit txn
+        pre-#144. Under ``isolation_level=None`` the write autocommits and
+        ``in_transaction`` stays ``False``.
+        """
+        conn = open_lcm_db(tmp_path / "lcm.db")
+        try:
+            conn.execute("CREATE TABLE durability_probe (id INTEGER PRIMARY KEY)")
+            assert conn.in_transaction is False
+            conn.execute("INSERT INTO durability_probe (id) VALUES (1)")
+            assert conn.in_transaction is False, (
+                "issue #144: a bare INSERT left an implicit transaction "
+                "open — it will roll back on conn.close()"
+            )
+        finally:
+            close_lcm_db(conn)
+
+    def test_write_survives_close_and_reopen(self, tmp_path: Path) -> None:
+        """A row written then closed is visible on a fresh reopen.
+
+        The end-to-end durability assertion at the connection layer:
+        open → write → ``close_lcm_db`` → reopen via ``open_lcm_db`` →
+        the row is still there. Pre-#144 the reopen showed 0 rows.
+        """
+        db_path = tmp_path / "lcm.db"
+
+        conn = open_lcm_db(db_path)
+        conn.execute("CREATE TABLE durable (id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute("INSERT INTO durable (id, payload) VALUES (1, 'survives')")
+        close_lcm_db(conn)
+
+        reopened = open_lcm_db(db_path)
+        try:
+            rows = reopened.execute("SELECT id, payload FROM durable").fetchall()
+            assert rows == [(1, "survives")], (
+                f"issue #144: data written before close was rolled back — fresh reopen shows {rows}"
+            )
+        finally:
+            close_lcm_db(reopened)
+
+    def test_explicit_begin_commit_still_works(self, tmp_path: Path) -> None:
+        """Explicit ``BEGIN IMMEDIATE`` / ``COMMIT`` works under autocommit.
+
+        ``isolation_level=None`` does not disable explicit transactions —
+        it is exactly the "explicit-transactions" half of the apsw
+        adapter's "autocommit + explicit-transactions" contract. This
+        guards the ``with_transaction`` / migration ``BEGIN EXCLUSIVE``
+        paths that depend on explicit transactions still functioning.
+        """
+        conn = open_lcm_db(tmp_path / "lcm.db")
+        try:
+            conn.execute("CREATE TABLE tx_probe (id INTEGER PRIMARY KEY)")
+            conn.execute("BEGIN IMMEDIATE")
+            assert conn.in_transaction is True
+            conn.execute("INSERT INTO tx_probe (id) VALUES (1)")
+            conn.execute("COMMIT")
+            assert conn.in_transaction is False
+            # Rollback path: the row is discarded.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO tx_probe (id) VALUES (2)")
+            conn.execute("ROLLBACK")
+            assert conn.execute("SELECT COUNT(*) FROM tx_probe").fetchone()[0] == 1
         finally:
             close_lcm_db(conn)

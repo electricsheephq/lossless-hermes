@@ -5,6 +5,49 @@ All notable changes to `lossless-hermes` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-05-19
+
+Patch release. Fixes a **P0 data-durability bug**: prior to this release LCM
+did not durably persist any conversation data — every message ingested during
+a session was silently rolled back when the session's database connection
+closed. The "lossless" context engine was, in fact, losing everything on
+session close, with no error.
+
+### Fixed
+
+- **LCM now durably persists ingested conversation data.** The single
+  sanctioned connection factory, `db/connection.py`, opened its stdlib
+  `sqlite3` connections without specifying `isolation_level`, leaving Python's
+  default `isolation_level=""`. In that mode the first `INSERT` / `UPDATE` /
+  `DELETE` silently opens an implicit *deferred* transaction that the driver
+  never auto-commits. The first turn of a session runs
+  `ConversationStore.create_conversation` — a bare `INSERT` with no transaction
+  wrapper — which opened that implicit transaction; `conn.in_transaction` then
+  stayed `True` for the rest of the session. Subsequent message persistence
+  routed through `ConversationStore.with_transaction`, which saw
+  `in_transaction == True`, took the `SAVEPOINT` branch, and `RELEASE
+  SAVEPOINT`'d into the *uncommitted* implicit transaction — never issuing a
+  `COMMIT`. Nothing on the ingest path committed, and `close_lcm_db` does not
+  commit, so `conn.close()` rolled the whole session back. The same hazard
+  silently discarded every single-statement write in the compaction telemetry
+  and maintenance stores. The fix opens connections with
+  `isolation_level=None` (autocommit / explicit-transactions mode) in both
+  `open_lcm_db` and `open_db`: writes now autocommit unless inside an explicit
+  `BEGIN`/`COMMIT`, so a session's data survives connection close. This
+  restores the documented contract the rest of the codebase already assumed —
+  the `apsw` adapter in the same file is explicitly autocommit, and
+  `concurrency/worker_lock.py`, `synthesis/prompt_registry.py`,
+  `doctor/cleaners.py`, and every store test fixture all state the connection
+  is expected to be `isolation_level=None`. `with_transaction`'s
+  `in_transaction` check now correctly distinguishes a genuinely-nested
+  explicit transaction from a fresh one, and the migration ladder's
+  `BEGIN EXCLUSIVE` runs from a clean autocommit state. A cross-session
+  durability regression suite (ingest → close → reopen a fresh connection →
+  assert the data is present), covering both the single-turn and multi-turn
+  cases, is added so this class of bug — a durability property no
+  write-then-read-on-the-same-connection test can detect — is caught going
+  forward.
+
 ## [0.1.1] — 2026-05-19
 
 Patch release. Fixes two production bugs surfaced by an architecture review

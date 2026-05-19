@@ -8,11 +8,11 @@
 |---|---|
 | **Current wave** | **W6 COMPLETE — v0.1.0 released** — ALL 122 port issues merged (Epics 00–09); the 12-item release-gate checklist passed (9 PASS, 3 operator-gated + documented). v0.1.0 tagged. |
 | **Current milestone** | M1–M11 ✅. M0 doc set → M11 v0.1.0 release all done. M6 — `fts_only` baseline measured offline; live +52.5pp hybrid confirmation operator-gated (B-001, accepted). M12 (v0.2.0 — `lcm_expand_query`, #628 stub-tier) is the future track. |
-| **Last merged PR** | [#127](https://github.com/electricsheephq/lossless-hermes/pull/127) `docs(epics): mark all 10 epic READMEs closed for v0.1.0` |
-| **Last commit on main** | `8b71b12` |
-| **Total PRs merged** | **111** (Waves 0–6 complete: all 122 port issues + release-gate docs + chores + fix-forwards) |
-| **Open PRs** | None |
-| **Total tests** | ~4050 passing across 6 OS×Python matrix cells; main CI green on HEAD |
+| **Last merged PR** | [#141](https://github.com/electricsheephq/lossless-hermes/pull/141) `docs: ADRs 035-036 + review-confirmed doc corrections` |
+| **Last commit on main** | `42ff9b5` |
+| **Total PRs merged** | Waves 0–6 complete (all 122 port issues + release-gate docs + chores + fix-forwards); post-v0.1.0 patch + docs PRs #138–#141 also merged. See `gh pr list --state merged` for the exact count. |
+| **Open PRs** | `fix/v0.1.2-durability` in flight — issue #144 P0 data-durability fix. |
+| **Total tests** | 4067 passing (`pytest -m 'not live'`, +8 cross-session durability regression tests added by the v0.1.2 fix); 6 OS×Python matrix cells. |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
 | **Open blockers** | None — B-001 (live +52.5pp benchmark) and B-002 (24h soak / Eva-DB round-trip) resolved at the release-gate review: accepted as documented operator-gated v0.1.0 items. See [`BLOCKERS.md`](./BLOCKERS.md). |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
