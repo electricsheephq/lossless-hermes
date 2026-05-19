@@ -77,6 +77,7 @@ __all__ = [
     "FALLBACK_SUMMARY_WINDOW",
     "TRUNCATED_SUMMARY_PREFIX",
     "TRUNCATED_SUMMARY_WINDOW",
+    "DoctorApplyResult",
     "DoctorCleanerApplyResult",
     "DoctorCleanerExample",
     "DoctorCleanerFilter",
@@ -476,3 +477,86 @@ class DoctorCleanerApplyResult(BaseModel):
     reason: str | None = None
     """Set ONLY on the ``"unavailable"`` arm — the human-readable reason
     the cleaners were refused. :data:`None` on the ``"applied"`` arm."""
+
+
+# ---------------------------------------------------------------------------
+# Apply contract surface — ports ``lcm-doctor-apply.ts`` exported types
+# ---------------------------------------------------------------------------
+
+
+class DoctorApplyResult(BaseModel):
+    """Result of :func:`lossless_hermes.doctor.apply.apply_scoped_doctor_repair`.
+
+    Ports the TS ``DoctorApplyResult`` discriminated union
+    (``lcm-doctor-apply.ts:26-38``):
+
+    .. code-block:: typescript
+
+        export type DoctorApplyResult =
+          | { kind: "applied"; detected; repaired; unchanged; skipped;
+              repairedSummaryIds }
+          | { kind: "unavailable"; reason };
+
+    The TS shape is a two-arm union discriminated on ``kind``. Python
+    collapses it into a single model with a ``kind`` discriminator and
+    nullable fields, matching the canonical Python shape mandated by
+    issue ``08-07``'s spec §"Return shape":
+
+    * ``kind="applied"`` — the repair pass ran. ``detected`` /
+      ``repaired`` / ``unchanged`` / ``skipped`` / ``repaired_summary_ids``
+      describe the outcome; ``reason`` is :data:`None`.
+    * ``kind="unavailable"`` — no summarizer could be resolved (no
+      provider configured, or the summarizer factory raised). Only
+      ``reason`` is populated; the count fields stay at their ``0`` /
+      empty-list defaults.
+
+    The ``skipped`` field is intentionally ``list[dict[str, str]]`` (NOT
+    a dedicated model) to match the spec verbatim — each entry is
+    ``{"summary_id": "...", "reason": "..."}`` (ports the TS
+    ``DoctorApplySkip`` object literal at ``lcm-doctor-apply.ts:21-24``).
+
+    See:
+
+    * ``epics/08-cli-ops/08-07-doctor-apply.md`` §"Return shape" — the
+      canonical Python shape.
+    * ``docs/porting-guides/doctor-ops.md`` §"Doctor contract API
+      (canonical)" lines 92-101 — the TS union.
+    * ``lossless-claw/src/plugin/lcm-doctor-apply.ts:21-38`` — TS source
+      pinned at commit ``1f07fbd`` on branch ``pr-613``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["applied", "unavailable"]
+    """Discriminator. ``"applied"`` when the repair pass ran (even if it
+    repaired nothing); ``"unavailable"`` when no summarizer could be
+    resolved."""
+
+    detected: int = Field(default=0, ge=0)
+    """Count of broken summaries the doctor scan found for this
+    conversation (``len`` of :func:`lossless_hermes.doctor.shared.load_doctor_targets`).
+    Always ``0`` when ``kind="unavailable"``."""
+
+    repaired: int = Field(default=0, ge=0)
+    """Count of summaries whose ``content`` was successfully re-written
+    (equals ``len(repaired_summary_ids)``)."""
+
+    unchanged: int = Field(default=0, ge=0)
+    """Count of targets where the summarizer produced output byte-equal
+    to the existing (trimmed) ``content`` — re-summarizing yielded no
+    change, so no write was queued."""
+
+    skipped: list[dict[str, str]] = Field(default_factory=list)
+    """Targets that were NOT repaired, each as
+    ``{"summary_id": "...", "reason": "..."}``. Reasons include empty
+    source text, empty summarizer output, output that still contains a
+    doctor marker, or a per-target exception message."""
+
+    repaired_summary_ids: list[str] = Field(default_factory=list)
+    """The ``summary_id`` of every successfully re-written summary, in
+    repair order (leaves-first, then condensed)."""
+
+    reason: str | None = None
+    """Set only when ``kind="unavailable"`` — a human-readable
+    explanation of why no summarizer was available. :data:`None` when
+    ``kind="applied"``."""
