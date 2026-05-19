@@ -527,3 +527,153 @@ def test_db_path_relative_to_hermes_home_param(tmp_home: Path) -> None:
         assert expected.exists()
     finally:
         engine.on_session_end("sess-1", [])
+
+
+# ---------------------------------------------------------------------------
+# update_model — mid-session model switch (v0.1.1 P0 fix)
+# ---------------------------------------------------------------------------
+#
+# Hermes's run_agent.py calls ``context_compressor.update_model(...)`` at
+# seven sites. Two of them — the LM-Studio context preload
+# (run_agent.py:2587) and the in-place model switch (run_agent.py:2728) —
+# pass an extra ``api_mode=`` keyword that the ContextEngine ABC's default
+# ``update_model`` (agent/context_engine.py:191) does NOT declare. Before
+# the v0.1.1 fix, ``LCMEngine`` inherited that 5-param default and a
+# ``/model`` switch raised ``TypeError: update_model() got an unexpected
+# keyword argument 'api_mode'``. The override added in
+# ``engine/lifecycle.py`` absorbs ``api_mode`` (+ ``**kwargs``) and
+# delegates the budget recalculation to the ABC default.
+#
+# These tests construct a bare engine (no DB open) — ``update_model``
+# touches only the in-memory ``context_length`` / ``threshold_tokens``
+# fields, so no ``@_skip_no_extension_loading`` marker is needed.
+
+
+def test_update_model_accepts_host_call_shape_with_api_mode(tmp_home: Path) -> None:
+    """The exact run_agent.py:2728 call shape must not raise.
+
+    This is the v0.1.1 P0 regression: ``run_agent.py``'s ``switch_model``
+    path calls ``update_model`` with EVERY argument passed by keyword,
+    including ``api_mode=self.api_mode``. Reproduce that call shape
+    byte-for-byte and assert no exception — pre-fix this raised
+    ``TypeError: ... unexpected keyword argument 'api_mode'``.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+
+    # Byte-for-byte the run_agent.py:2728 keyword-call shape.
+    engine.update_model(
+        model="claude-opus-4",
+        context_length=200_000,
+        base_url="https://api.anthropic.com",
+        api_key="sk-test",
+        provider="anthropic",
+        api_mode="responses",
+    )
+
+    # The ABC default still ran: context_length is updated and
+    # threshold_tokens is re-derived from threshold_percent (0.75).
+    assert engine.context_length == 200_000
+    assert engine.threshold_tokens == int(200_000 * engine.threshold_percent)
+
+
+def test_update_model_lmstudio_preload_call_shape(tmp_home: Path) -> None:
+    """The run_agent.py:2587 LM-Studio preload call shape must not raise.
+
+    The second of the two ``api_mode``-passing call sites. Same keyword
+    shape as :func:`test_update_model_accepts_host_call_shape_with_api_mode`
+    — pinned separately so a future signature edit that breaks only one
+    site is still caught.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    engine.update_model(
+        model="local-model",
+        context_length=32_768,
+        base_url="http://localhost:1234/v1",
+        api_key="",
+        provider="lmstudio",
+        api_mode="chat",
+    )
+    assert engine.context_length == 32_768
+    assert engine.threshold_tokens == int(32_768 * engine.threshold_percent)
+
+
+def test_update_model_five_param_init_path_still_works(tmp_home: Path) -> None:
+    """The 5-param (no ``api_mode``) call shape still works.
+
+    Five of run_agent.py's seven ``update_model`` call sites (e.g. the
+    initial engine selection at run_agent.py:2301, the fallback
+    activation at :8811) pass exactly the ABC's 5-parameter signature.
+    The v0.1.1 override must not break that path — ``api_mode`` defaults
+    to ``""`` and is ignored.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    engine.update_model(
+        model="gpt-4o",
+        context_length=128_000,
+        base_url="https://api.openai.com/v1",
+        api_key="sk-init",
+        provider="openai",
+    )
+    assert engine.context_length == 128_000
+    assert engine.threshold_tokens == int(128_000 * engine.threshold_percent)
+
+
+def test_update_model_positional_minimal_call_works(tmp_home: Path) -> None:
+    """The minimal 2-positional-arg call (``model``, ``context_length``) works.
+
+    ``base_url`` / ``api_key`` / ``provider`` / ``api_mode`` all default,
+    so a caller passing only the two required positionals must succeed.
+    Guards the positional-call path alongside the keyword-call paths
+    above.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    engine.update_model("some-model", 64_000)
+    assert engine.context_length == 64_000
+    assert engine.threshold_tokens == int(64_000 * engine.threshold_percent)
+
+
+def test_update_model_recalculates_threshold_on_switch(tmp_home: Path) -> None:
+    """A second ``update_model`` re-derives the budget for the new window.
+
+    Mid-session model switch: the engine starts with one context window,
+    then ``/model`` switches to a smaller one. ``threshold_tokens`` must
+    track the NEW ``context_length``, not stay pinned to the old value —
+    otherwise the compaction gate would fire against a stale budget.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+
+    # First model — large context window.
+    engine.update_model("big-model", 200_000, provider="anthropic", api_mode="chat")
+    assert engine.context_length == 200_000
+    big_threshold = engine.threshold_tokens
+    assert big_threshold == int(200_000 * engine.threshold_percent)
+
+    # Switch to a smaller-window model mid-session.
+    engine.update_model("small-model", 8_192, provider="openai", api_mode="chat")
+    assert engine.context_length == 8_192
+    assert engine.threshold_tokens == int(8_192 * engine.threshold_percent)
+    assert engine.threshold_tokens < big_threshold, (
+        "threshold_tokens did not shrink with the smaller context window — "
+        "update_model is not re-deriving the budget"
+    )
+
+
+def test_update_model_ignores_unknown_forward_compat_kwargs(tmp_home: Path) -> None:
+    """Unknown keyword args are absorbed by ``**kwargs`` — no raise.
+
+    The override carries a ``**kwargs`` sink so a future Hermes release
+    that forwards an additional keyword to ``update_model`` degrades
+    gracefully instead of crashing the turn (the same failure class as
+    the original ``api_mode`` bug). Pin that forward-compat contract.
+    """
+    engine = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
+    # ``api_mode`` plus a hypothetical future keyword.
+    engine.update_model(
+        model="future-model",
+        context_length=100_000,
+        provider="anthropic",
+        api_mode="responses",
+        some_future_hermes_kwarg="whatever",
+    )
+    assert engine.context_length == 100_000
+    assert engine.threshold_tokens == int(100_000 * engine.threshold_percent)
