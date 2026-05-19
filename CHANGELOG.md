@@ -5,6 +5,75 @@ All notable changes to `lossless-hermes` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-05-19
+
+Patch release. Fixes two coupled defects in the diff-ingest cursor
+(`_last_seen_message_idx`) reported in
+[#130](https://github.com/electricsheephq/lossless-hermes/issues/130),
+reimplemented from the production-tested sibling project `hermes-lcm`
+(commits `79629c2`/#111, `17578a0`/#113, `4bc6b9c`/#1).
+
+### Fixed
+
+- **Restart no longer re-ingests an existing transcript.** The diff-ingest
+  cursor `_last_seen_message_idx` is a process-local dict that is never
+  persisted, and `on_session_start` had no cursor-restore logic. On a
+  gateway restart the cursor reset to `0`, so the next `post_llm_call`
+  re-diffed the entire replayed `conversation_history` from the start.
+  Because `messages` has no `UNIQUE` constraint on `identity_hash` (only
+  `UNIQUE(conversation_id, seq)`) and the ingest path assigns a fresh
+  `seq = get_max_seq() + 1` per row with no dedup lookup, every restart
+  would silently re-ingest the whole transcript with new `seq`s. Before
+  v0.1.2 this symptom was *masked*: a separate durability bug rolled back
+  every session's ingest on connection close, so a restart found an empty
+  store and re-ingestion could not manifest (the restart instead caused
+  total ingest loss). With v0.1.2's durability fix now in place the store
+  survives a restart, so the restart re-ingestion path is fully live and
+  this fix is load-bearing. `_IngestMixin._reconcile_ingest_cursor` now
+  reconciles the cursor against the durable `messages` store the first time
+  a process sees a session: it walks the incoming history and counts the
+  longest leading run of persistable messages whose `(role, content)`
+  identity matches the stored rows in `seq` order, and sets the cursor past
+  that proven-replay prefix. The reconciliation is replay-evidence-gated —
+  a post-restart turn that shares no prefix with the durable transcript
+  leaves the cursor at `0` so its messages still ingest (no data loss).
+- **Compaction no longer silently stops ingest.** The cursor is an absolute
+  index into the live message list. When a compaction entry point
+  substituted a hierarchical-summary list for older raw turns (a DAG
+  substitution), the cursor — left at the pre-compaction length — could
+  become permanently `>= len(new_list)`, so `_do_ingest_history_diff`
+  early-returned on every subsequent turn and ingest stopped for the rest
+  of the session. Both compaction entry points (`compress()` in
+  `engine/compact.py` and `preassemble()` in `engine/assemble.py`) now call
+  `_CompactMixin._reset_ingest_cursor_after_compaction`, which resets the
+  cursor **only when a genuine compaction / DAG substitution actually
+  occurred** — detected by a content-identity comparison of the leading
+  region, not by a list-length test. A non-compaction reshape that merely
+  shortens the list (notably `_safe_fallback` stripping trailing
+  `assistant` messages during assembly) does *not* reset the cursor, and a
+  same-length compaction substitution (N raw turns → N summary+tail
+  messages) *does*. Because Hermes's `compress` / `preassemble` ABC
+  signatures do not pass `session_id`, the session is resolved via
+  `_infer_session_id`; when inference fails the reset is *skipped* rather
+  than writing a bogus empty-string key.
+
+### Notes
+
+- **`identity_hash` is not `UNIQUE`.** [ADR-009](./docs/adr/009-per-message-ingest.md)
+  §Consequences describes `identity_hash` as "the `UNIQUE` constraint on
+  `messages.identity_hash`". It is not: both the TS source
+  (`lossless-claw` at the pinned commit `1f07fbd`,
+  `src/db/migration.ts:1161`) and this port (`db/migration.py:455`) define
+  only a plain index `messages_conv_identity_hash_idx`. The Python port is
+  a faithful copy — the schema-diff CI gate is correctly green — so this is
+  an ADR overstatement, not a port-fidelity gap. No schema migration is
+  added in this patch; the cursor reconciliation fix stands on its own.
+- **`preassemble` is ADR-032-slated for demotion.** [ADR-032](./docs/adr/032-per-turn-assembly-not-required.md)
+  supersedes ADR-010 and decides per-turn pre-assembly is not required,
+  demoting `preassemble`. Its removal is separate v0.2.0 work; this patch
+  only makes the compaction cursor reset correct for the `compress()` +
+  `preassemble()` paths that exist in v0.1.x today.
+
 ## [0.1.2] — 2026-05-19
 
 Patch release. Fixes a **P0 data-durability bug**: prior to this release LCM
@@ -137,5 +206,7 @@ First release. `lossless-hermes` is a feature-complete Python port of
   step (`docs/benchmarks/voyage-recall-2026-q2.md`).
 - Native Windows is out of scope; use WSL2.
 
+[0.1.3]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.3
+[0.1.2]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.2
 [0.1.1]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.1
 [0.1.0]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.0

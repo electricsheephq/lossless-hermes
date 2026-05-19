@@ -140,6 +140,7 @@ class _LifecycleMixin:
         _telemetry_store: Optional[CompactionTelemetryStore]
         _maintenance_store: Optional[CompactionMaintenanceStore]
         _last_seen_message_idx: Dict[str, int]
+        _ingest_cursor_reconciled: set[str]
         _previous_assembled_messages_by_conversation: Dict[int, Any]
         current_session_id: Optional[str]
         hermes_home: Path
@@ -512,6 +513,14 @@ class _LifecycleMixin:
         # Here we keep to the symmetric reset of state owned by the
         # shell at 02-01.
         self._last_seen_message_idx.clear()
+
+        # v0.1.3 fix (issue #130): clear the restart-reconciliation
+        # tracking set in lockstep with the cursor dict. ``/reset``
+        # starts a fresh conversation, so the next ingest for any
+        # session_id must re-run :meth:`_IngestMixin._reconcile_ingest_cursor`
+        # against the (now-archived-or-empty) durable store rather than
+        # trusting a stale "already reconciled" mark.
+        self._ingest_cursor_reconciled.clear()
 
         logger.debug("[lcm] on_session_reset: token state + ingest cursors cleared")
 

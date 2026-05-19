@@ -190,7 +190,7 @@ class ContextEngineInfo:
     """
 
     name: str = "lcm"
-    version: str = "0.1.2"
+    version: str = "0.1.3"
     owns_compaction: bool = True
 
 
@@ -448,6 +448,30 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # the engine has already ingested. ``_on_post_llm_call`` diffs
         # ``conversation_history[idx:]`` against this on each turn.
         self._last_seen_message_idx: Dict[str, int] = {}
+
+        # v0.1.3 fix (issue #130): the diff-ingest cursor above is
+        # process-local — it is never persisted. On a gateway restart
+        # the engine rebinds an *existing* session whose transcript is
+        # already in the durable ``messages`` store, but the cursor
+        # resets to 0. Without reconciliation the next ``post_llm_call``
+        # re-diffs the full replayed history and re-ingests every row
+        # with a fresh ``seq`` (``messages`` has no UNIQUE on
+        # ``identity_hash`` — only ``UNIQUE(conversation_id, seq)`` —
+        # and the ingest path assigns ``seq = max_seq + 1`` with no
+        # dedup lookup), silently duplicating the transcript.
+        #
+        # This set tracks which session_ids have had their cursor
+        # reconciled against the durable store this process. The first
+        # ingest for a session not in this set runs
+        # :meth:`_IngestMixin._reconcile_ingest_cursor` (which has the
+        # live message list ``post_llm_call`` does NOT pass to
+        # ``on_session_start``). The reconciliation is replay-evidence-
+        # gated so a genuinely-new first turn after restart still
+        # ingests rather than being skipped. Cleared with the cursor on
+        # ``on_session_reset``. Reference: hermes-lcm commits 79629c2
+        # (#111) + 17578a0 (#113), reimplemented for this session_id-
+        # keyed, store-based architecture.
+        self._ingest_cursor_reconciled: set[str] = set()
 
         # ``_compression_history`` — bounded deque of (before_tokens,
         # after_tokens) tuples, one entry per ``compress()`` call.

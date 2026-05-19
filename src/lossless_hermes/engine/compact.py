@@ -148,6 +148,13 @@ class _CompactMixin:
     compression_count: int
     context_length: int
     _compression_history: Deque[Tuple[int, int]]
+    # v0.1.3 fix (issue #130, Defect 2) — the diff-ingest cursor.
+    # Initialized in :meth:`LCMEngine.__init__`. :meth:`compress` resets
+    # the per-session entry after a genuine compaction / DAG
+    # substitution so the next ingest does not desync forever — gated on
+    # the substitution signal, not list length (see
+    # :meth:`_reset_ingest_cursor_after_compaction`).
+    _last_seen_message_idx: Dict[str, int]
     # 02-09 — Circuit-breaker state-machine map. Initialized in
     # :meth:`LCMEngine.__init__`. 04-07 reads via
     # :meth:`_get_circuit_breaker_state` (the configured-defaults
@@ -167,8 +174,8 @@ class _CompactMixin:
     # — Python's MRO resolves to the appropriate ``_FooMixin`` body at
     # call time. ``ty`` doesn't follow the MRO across sibling mixins, so
     # we re-declare the expected signatures here (TYPE_CHECKING gated)
-    # so the type-checker can resolve ``self._assemble(...)`` /
-    # ``self._infer_session_id(...)`` /
+    # so the type-checker can resolve ``self._assemble_with_signal(...)``
+    # / ``self._infer_session_id(...)`` /
     # ``self._emit_experimental_warning_if_due()`` calls against the
     # documented contract. Bodies live in
     # :class:`_AssembleMixin` (sibling on the MRO).
@@ -181,6 +188,14 @@ class _CompactMixin:
             token_budget: int,
             prompt: Optional[str] = None,
         ) -> List[Dict[str, Any]]: ...
+
+        def _assemble_with_signal(
+            self,
+            session_id: str,
+            messages: List[Dict[str, Any]],
+            token_budget: int,
+            prompt: Optional[str] = None,
+        ) -> Tuple[List[Dict[str, Any]], bool]: ...
 
         def _infer_session_id(
             self,
@@ -403,11 +418,15 @@ class _CompactMixin:
             else:
                 effective_budget = 128_000
 
-            # Run the substitution body. Note: ``self._assemble`` is
-            # provided by :class:`_AssembleMixin` (sibling on the MRO).
-            # The call is sync (PR #34 sync conversion); the per-
-            # session lock is acquired inside _assemble.
-            substituted = self._assemble(
+            # Run the substitution body. Note: ``self._assemble_with_signal``
+            # is provided by :class:`_AssembleMixin` (sibling on the
+            # MRO). The call is sync (PR #34 sync conversion); the per-
+            # session lock is acquired inside the assemble body. The
+            # ``did_substitute`` flag reports whether the real assembler
+            # produced ``substituted`` (a genuine DAG substitution) or
+            # the call fell back to ``_safe_fallback`` — it gates the
+            # post-compaction cursor reset below (issue #130, Defect 2).
+            substituted, did_substitute = self._assemble_with_signal(
                 session_id=session_id,
                 messages=messages,
                 token_budget=effective_budget,
@@ -429,6 +448,29 @@ class _CompactMixin:
             after = before  # Approximate; not load-bearing.
             self._compression_history.append((before, after))
             self.compression_count += 1
+
+            # v0.1.3 fix (issue #130, Defect 2): when the assembler
+            # produced a genuine DAG substitution, reset the diff-ingest
+            # cursor to the new length. Otherwise the cursor — an
+            # absolute index, still pointing at the pre-substitution
+            # length — stays permanently past ``len(substituted)`` and
+            # ``_do_ingest_history_diff`` early-returns forever,
+            # silently stopping ingest. The gate is the
+            # ``did_substitute`` signal, NOT a list-length test: a
+            # ``_safe_fallback`` reshape (e.g. the trailing-``assistant``
+            # strip) reports ``did_substitute=False`` and must NOT reset
+            # the cursor, while a real same-length substitution reports
+            # ``True`` and must. The session_id is already non-empty
+            # here (the ``if not session_id`` guard above returned
+            # early).
+            self._reset_ingest_cursor_after_compaction(
+                original=messages,
+                result=substituted,
+                session_id=session_id,
+                compaction_occurred=did_substitute,
+                source="compress (experimental)",
+            )
+
             logger.debug(
                 "[lcm] compress (experimental always-on substitution): "
                 "session=%s budget=%d input_msgs=%d output_msgs=%d",
@@ -459,10 +501,38 @@ class _CompactMixin:
         # later split into separate counters for real vs. no-op runs.
         self.compression_count += 1
 
-        # 02-06: debug breadcrumb so an operator scanning logs sees the
-        # no-op fire. Useful while Epic 04 is still in flight (a real
-        # compaction would produce richer telemetry); for now this
-        # confirms the surface is reached.
+        # The 02-06 overflow-recovery body is a passthrough — it returns
+        # the SAME list object it was handed. Epic 04 fills this branch
+        # with the real overflow-recovery algorithm, which will build
+        # and return a NEW, compacted list.
+        result = messages
+
+        # v0.1.3 fix (issue #130, Defect 2): the Epic-04-forward
+        # post-compaction cursor reset. The "compaction occurred" signal
+        # for this branch is ``result is not messages`` — today the
+        # passthrough makes it ``False``, so the reset is a guarded
+        # no-op; when Epic 04 fills the branch with a real algorithm
+        # that returns a fresh compacted list, the signal becomes
+        # ``True`` automatically (no edit to this call needed) and the
+        # post-compaction cursor reset engages so ingest cannot silently
+        # stall. The signal is identity-based, NOT a list-length test —
+        # a length test both over-fires (a non-compaction reshape that
+        # happens to be shorter) and under-fires (a same-length
+        # substitution). The session_id is inferred from the message
+        # list (Hermes's ``compress`` ABC signature does not pass it);
+        # a failed inference makes the reset skip — see the helper's
+        # caveat. (ADR-032 supersedes ADR-010 and demotes ``preassemble``
+        # — but ``compress`` overflow-recovery is unaffected by that
+        # demotion and stays the Epic-04 overflow path.)
+        fallthrough_session_id = self._infer_session_id(messages)
+        self._reset_ingest_cursor_after_compaction(
+            original=messages,
+            result=result,
+            session_id=fallthrough_session_id,
+            compaction_occurred=result is not messages,
+            source="compress (overflow-recovery)",
+        )
+
         logger.debug(
             "[lcm] compress called (no-op): %d messages, current_tokens=%s, focus_topic=%s",
             len(messages),
@@ -470,7 +540,181 @@ class _CompactMixin:
             focus_topic,
         )
 
-        return messages
+        return result
+
+    # ------------------------------------------------------------------
+    # Compaction cursor reset — v0.1.3 fix (issue #130, Defect 2)
+    # ------------------------------------------------------------------
+
+    def _reset_ingest_cursor_after_compaction(
+        self,
+        *,
+        original: List[Dict[str, Any]],
+        result: List[Dict[str, Any]],
+        session_id: str,
+        compaction_occurred: bool,
+        source: str,
+    ) -> None:
+        """Reset the diff-ingest cursor after a genuine compaction substitution.
+
+        v0.1.3 fix for issue #130, Defect 2. The diff-ingest cursor
+        ``_last_seen_message_idx[session_id]`` is an absolute index into
+        the live message list. When :meth:`compress` or
+        :meth:`_AssembleMixin.preassemble` performs a genuine
+        compaction / DAG substitution — folding older raw turns into a
+        hierarchical-summary list — the cursor, left at the
+        pre-substitution length, becomes a *stale absolute index* into a
+        list that no longer has those positions. The next
+        ``post_llm_call`` then hits the ``last_idx >= len(snapshot)``
+        early-return in :meth:`_IngestMixin._do_ingest_history_diff` (or,
+        for a same-length substitution, diffs from a position that no
+        longer corresponds to un-ingested content) and ingest silently
+        desyncs — potentially for the rest of the session.
+
+        The fix: after a genuine substitution, set the cursor to
+        ``len(result)`` so the next ingest diffs only messages appended
+        *after* the substitution boundary.
+
+        ### Why the reset is gated on ``compaction_occurred``, not length
+
+        v0.1.2's first cut gated this on ``len(result) < len(original)``
+        — a list-**length** test. That is wrong in both directions:
+
+        * **Over-fires.** The
+          ``preassemble``/``compress`` → ``_assemble`` → ``_safe_fallback``
+          path (:meth:`_AssembleMixin._safe_fallback`) strips trailing
+          ``assistant`` messages — a non-compaction shortening of the
+          live list. A length guard fires on it, resets the cursor
+          *backward*, and the next ``post_llm_call`` re-ingests the
+          stripped trailing message with a fresh ``seq`` and no
+          ``identity_hash`` dedup — i.e. it re-introduces Defect 1's
+          duplication.
+        * **Under-fires.** A genuine compaction can substitute N raw
+          turns with N summary + fresh-tail messages — a *same-length*
+          result. A length guard never trips, so the cursor stays
+          desynced and Defect 2 is left unfixed for that case.
+
+        So the reset is gated on whether a genuine compaction / DAG
+        substitution *actually occurred* — the ``compaction_occurred``
+        argument — which the callers source from a real signal:
+
+        * :meth:`_AssembleMixin.preassemble` and the
+          :meth:`compress` experimental branch pass the
+          ``did_substitute`` flag from
+          :meth:`_AssembleMixin._assemble_with_signal` — ``True`` only
+          when the real :class:`ContextAssembler` produced the list,
+          ``False`` on every ``_safe_fallback`` path.
+        * The :meth:`compress` overflow-recovery fallthrough passes
+          ``result is not messages`` — ``False`` for the current
+          passthrough, ``True`` once Epic 04's algorithm returns a
+          fresh compacted list.
+
+        This mirrors hermes-lcm, which gates the equivalent reset on a
+        content test (``compressed != original_messages`` at
+        ``engine.py:855-861`` and ``:3483-3486``) or an unconditional
+        post-compaction reset (``engine.py:908``, gated by
+        ``leaf_compacted_this_turn``) — **never** a list-length test.
+
+        ### Defensive sanity check
+
+        Even with ``compaction_occurred=True``, the reset is skipped if
+        ``result`` is identical to ``original`` (``result == original``)
+        — a genuine compaction always changes the list, so an
+        equal-content result alongside a ``True`` signal indicates a
+        caller bug; skipping avoids a pointless cursor write. A real
+        substitution that legitimately produced an equal-length but
+        content-different list still resets (``result != original`` is
+        the discriminator there, not length).
+
+        **session_id caveat (issue #130 scope note).** Our cursor is
+        ``session_id``-keyed, but Hermes's ``compress`` / ``preassemble``
+        ABC signatures do NOT pass ``session_id`` — the callers infer it
+        via :meth:`_AssembleMixin._infer_session_id`. When inference
+        fails (returns ``""``), this method SKIPS the reset entirely:
+        writing ``_last_seen_message_idx[""] = N`` would (a) not fix the
+        real session's desync and (b) plant a bogus empty-string key. A
+        skipped reset is recoverable on a later turn once a session_id
+        resolves; a wrong-key write is not.
+
+        Args:
+            original: The live message list handed to the compaction
+                entry point.
+            result: The list the compaction entry point returns. When a
+                genuine substitution occurred the cursor is reset to
+                ``len(result)``.
+            session_id: Session id resolved by the caller via
+                :meth:`_AssembleMixin._infer_session_id`. Empty string
+                → reset skipped (see the caveat above).
+            compaction_occurred: Whether a genuine compaction / DAG
+                substitution produced ``result``. ``False`` →
+                non-compaction reshape (``_safe_fallback`` strip,
+                passthrough) → reset skipped. This is the load-bearing
+                gate; length is deliberately NOT consulted.
+            source: Free-form attribution for the log breadcrumb
+                (``"compress"`` / ``"preassemble"``).
+        """
+        # session_id caveat — skip rather than plant a bogus key.
+        if not session_id:
+            logger.debug(
+                "[lcm] %s: compaction cursor reset skipped — no "
+                "session_id inferred (original=%d, result=%d, "
+                "compaction_occurred=%s)",
+                source,
+                len(original),
+                len(result),
+                compaction_occurred,
+            )
+            return
+
+        # The load-bearing gate: only a genuine compaction / DAG
+        # substitution desyncs the absolute cursor. A non-compaction
+        # reshape — ``_safe_fallback``'s trailing-``assistant`` strip,
+        # the overflow-recovery passthrough — leaves the cursor exactly
+        # where ingest left it; resetting it there would re-ingest the
+        # reshaped tail (Defect 1's duplication). NOT a length test:
+        # see the docstring's over-fire / under-fire analysis.
+        if not compaction_occurred:
+            logger.debug(
+                "[lcm] %s session=%s: cursor reset skipped — no genuine "
+                "compaction (non-compaction reshape; original=%d, "
+                "result=%d)",
+                source,
+                session_id,
+                len(original),
+                len(result),
+            )
+            return
+
+        # Defensive: a genuine compaction always changes the list. An
+        # identical result alongside compaction_occurred=True signals a
+        # caller bug — skip the pointless write rather than trust it.
+        # A same-length-but-content-different substitution still passes
+        # (``result != original``) and resets, which is the point of
+        # the under-fire fix.
+        if result == original:
+            logger.debug(
+                "[lcm] %s session=%s: cursor reset skipped — compaction "
+                "signalled but result is identical to the live list "
+                "(len=%d)",
+                source,
+                session_id,
+                len(original),
+            )
+            return
+
+        previous = self._last_seen_message_idx.get(session_id)
+        self._last_seen_message_idx[session_id] = len(result)
+        logger.info(
+            "[lcm] %s session=%s: compaction substituted the live list "
+            "%d -> %d messages; ingest cursor reset %s -> %d (issue #130 "
+            "— post-compaction ingest desync prevented)",
+            source,
+            session_id,
+            len(original),
+            len(result),
+            previous if previous is not None else "unset",
+            len(result),
+        )
 
     # ------------------------------------------------------------------
     # 04-07 — Circuit-breaker integration

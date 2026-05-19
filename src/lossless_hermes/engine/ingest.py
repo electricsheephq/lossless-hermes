@@ -549,6 +549,7 @@ class _IngestMixin:
         _summary_store: Optional[SummaryStore]
         _session_locks: SessionLockRegistry
         _last_seen_message_idx: Dict[str, int]
+        _ingest_cursor_reconciled: set[str]
         ignore_session_patterns: List[re.Pattern[str]]
         stateless_session_patterns: List[re.Pattern[str]]
         config: Any  # LcmConfig — avoid the circular import for ty
@@ -784,6 +785,33 @@ class _IngestMixin:
             return
 
         snapshot = history or []
+
+        # v0.1.3 fix (issue #130, Defect 1): reconcile the diff cursor
+        # against the durable store the first time this process sees
+        # ``session_id``. On a gateway restart ``_last_seen_message_idx``
+        # is empty (it is never persisted) but the conversation's
+        # transcript is already in the ``messages`` store. Without this
+        # the cursor defaults to 0, the full replayed ``history`` is
+        # re-diffed, and every row is re-ingested with a fresh ``seq``
+        # → silent transcript duplication. The reconciliation runs here
+        # — NOT in ``on_session_start`` — because the live message list
+        # is only available on the hook, and ``on_session_start``'s
+        # ``session_id`` can differ from the ingest ``session_id``.
+        # ``_reconcile_ingest_cursor`` is replay-evidence-gated: a
+        # genuinely-new first turn after restart (no stored-tail match)
+        # leaves the cursor at 0 so its messages still ingest. Reference:
+        # hermes-lcm commits 79629c2 (#111) + 17578a0 (#113).
+        #
+        # The session is marked reconciled only once a NON-EMPTY history
+        # has been seen: ``post_llm_call`` / ``handle_tool_call`` always
+        # carry the full live snapshot on a real turn, but guarding on
+        # ``snapshot`` means a degenerate empty-history first call cannot
+        # consume the one-shot reconciliation slot and leave a genuine
+        # replay on a later turn un-reconciled.
+        if snapshot and session_id not in self._ingest_cursor_reconciled:
+            self._reconcile_ingest_cursor(session_id=session_id, history=snapshot)
+            self._ingest_cursor_reconciled.add(session_id)
+
         last_idx = self._last_seen_message_idx.get(session_id, 0)
         if last_idx >= len(snapshot):
             # No new messages — idempotent no-op. Matches the spec AC
@@ -845,6 +873,173 @@ class _IngestMixin:
                     session_id,
                     len(window),
                 )
+
+    # ------------------------------------------------------------------
+    # Restart cursor reconciliation — v0.1.3 fix (issue #130, Defect 1)
+    # ------------------------------------------------------------------
+
+    def _reconcile_ingest_cursor(
+        self,
+        *,
+        session_id: str,
+        history: List[Dict[str, Any]],
+    ) -> None:
+        """Reconcile the diff cursor against the durable store on rebind.
+
+        v0.1.3 fix for issue #130, Defect 1. ``_last_seen_message_idx``
+        is a process-local dict that is never persisted. On a gateway
+        restart the engine rebinds a session whose transcript already
+        lives in the ``messages`` store, but the cursor resets to 0.
+        The next ``post_llm_call`` then re-diffs the whole replayed
+        ``conversation_history`` and re-ingests every row with a fresh
+        ``seq`` — ``messages`` has only ``UNIQUE(conversation_id, seq)``,
+        no UNIQUE on ``identity_hash``, and :meth:`_ingest_single`
+        assigns ``seq = get_max_seq() + 1`` with no dedup lookup — so
+        the transcript silently duplicates.
+
+        This method derives the correct cursor from the durable store.
+        It runs once per session per process (gated by the
+        ``_ingest_cursor_reconciled`` set on the shell) on the FIRST
+        ingest, where the live message list is finally available
+        (``on_session_start`` does not receive it, and its
+        ``session_id`` can differ from the ingest ``session_id``).
+
+        **Replay-evidence gate.** Setting the cursor to the stored
+        message count unconditionally would lose data: if the first
+        post-restart turn delivers only newly-arrived delta messages
+        (not a full replay), the cursor would skip past them. So this
+        method walks the incoming ``history`` and counts the longest
+        leading run of persistable messages whose ``(db_role, content)``
+        identity matches the stored rows in ``seq`` order. Only that
+        proven-replay prefix advances the cursor; a genuinely-new first
+        turn (zero stored-tail match) leaves the cursor at 0 and its
+        messages ingest normally. This mirrors the hermes-lcm
+        replay-evidence guard (commit 17578a0, #113) reimplemented for
+        this ``session_id``-keyed, store-based architecture (the
+        hermes-lcm reference is ``engine.py:2545``
+        ``_reconcile_ingest_cursor_from_store``, commits 79629c2 + 17578a0).
+
+        Idempotency invariant: when the cursor already has an entry for
+        ``session_id`` (the common no-restart per-turn path — the dict
+        survives within one process), this is a no-op. Reconciliation
+        only matters on the first ingest of a fresh process.
+
+        Args:
+            session_id: The session identifier being ingested.
+            history: The live ``conversation_history`` snapshot the
+                hook passed (already coerced to a list by the caller).
+        """
+        # Already tracked in-process — nothing to reconcile. The cursor
+        # dict is authoritative once a session has been ingested at
+        # least once in this process; reconciliation is purely a
+        # cold-start (post-restart) repair.
+        if session_id in self._last_seen_message_idx:
+            return
+
+        # No incoming history → no replay evidence → leave the cursor
+        # unset (defaults to 0 via ``.get``). An empty first turn is a
+        # no-op ingest anyway.
+        if not history:
+            return
+
+        store = self._conversation_store
+        if store is None:
+            # Defense in depth — ``_do_ingest_history_diff`` already
+            # guarded this. A None store means no durable transcript to
+            # reconcile against; leave the cursor at its 0 default.
+            return
+
+        # Look up the conversation WITHOUT creating it. A brand-new
+        # session (no restart) has no row yet → nothing to reconcile,
+        # and we must not insert a spurious empty conversation here.
+        conversation = store.get_conversation_by_session_id(session_id)
+        if conversation is None:
+            return
+        conversation_id = conversation.conversation_id
+
+        stored_count = store.get_message_count(conversation_id)
+        if stored_count <= 0:
+            # Conversation row exists but holds no messages — treat as
+            # a fresh session. Cursor stays at 0.
+            return
+
+        # Pull the stored transcript in ``seq`` order and reduce each
+        # row to its ``(role, content)`` identity. ``get_messages``
+        # returns every row ordered ascending by ``seq`` — it does NOT
+        # filter ``suppressed_at`` — so the identity list lines up 1:1
+        # with ``get_message_count`` above and with the seq sequence
+        # the ingest path assigns. That consistency is what lets the
+        # prefix walk below match the replayed history positionally.
+        stored = store.get_messages(conversation_id)
+        stored_identities = [(m.role, m.content) for m in stored]
+        if not stored_identities:
+            return
+
+        # Walk the incoming history. For each message that passes the
+        # same persistable-role / failed-empty-assistant gates
+        # :meth:`_ingest_single` applies, compute its storage identity
+        # and require it to match the next stored row in ``seq`` order.
+        # The cursor is the index in the RAW ``history`` list just past
+        # the last proven-replay message — non-persistable messages
+        # interleaved in the replay (which ingest would skip) are
+        # carried along so the cursor still points at a real list slot.
+        matched = 0  # count of stored rows proven replayed
+        cursor = 0  # index into raw ``history``
+        for idx, message in enumerate(history):
+            if matched >= len(stored_identities):
+                # Every stored row is accounted for; the remainder of
+                # ``history`` is genuinely new and must ingest.
+                break
+            if not isinstance(message, dict):
+                # Non-dict entries are skipped by ``_ingest_single``;
+                # absorb into the replay prefix and keep scanning.
+                cursor = idx + 1
+                continue
+            if not _has_persistable_role(message):
+                cursor = idx + 1
+                continue
+            if _is_failed_empty_assistant(message):
+                cursor = idx + 1
+                continue
+            identity = (
+                _to_db_role(message.get("role")),
+                _extract_message_content(message.get("content")),
+            )
+            if identity != stored_identities[matched]:
+                # Replay diverges from the durable transcript here —
+                # everything from this index on is genuinely new. Stop;
+                # the cursor already points past the matched prefix.
+                break
+            matched += 1
+            cursor = idx + 1
+
+        if matched <= 0:
+            # No replay evidence — the incoming history shares no
+            # leading prefix with the stored transcript. Leave the
+            # cursor at its 0 default so these messages ingest. This is
+            # the data-loss guard from hermes-lcm #113: a one-message
+            # delta that happens to repeat content is persisted rather
+            # than silently dropped.
+            logger.debug(
+                "[lcm] cursor reconciliation session=%s: no replay "
+                "evidence (stored=%d, history_len=%d); cursor stays 0",
+                session_id,
+                stored_count,
+                len(history),
+            )
+            return
+
+        self._last_seen_message_idx[session_id] = cursor
+        logger.info(
+            "[lcm] cursor reconciliation session=%s: matched %d/%d "
+            "stored messages against replayed history (cursor 0 -> %d, "
+            "history_len=%d) — restart re-ingestion prevented",
+            session_id,
+            matched,
+            len(stored_identities),
+            cursor,
+            len(history),
+        )
 
     # ------------------------------------------------------------------
     # handle_tool_call ingest entry path — issue 03-03 (ADR-009 Option C)
