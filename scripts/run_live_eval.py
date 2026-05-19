@@ -839,11 +839,28 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: The API keys the live-eval suite is gated on (ADR-028 §live markers).
+#: A module-level literal so the *names* are never derived from the
+#: environment — only the boolean presence check below reads ``os.environ``.
+REQUIRED_API_KEYS: tuple[str, ...] = ("VOYAGE_API_KEY", "ANTHROPIC_API_KEY")
+
+
 def _missing_api_keys(env: dict[str, str]) -> list[str]:
-    """Return the names of the required API keys that are absent/blank."""
+    """Return the names of the required API keys that are absent/blank.
+
+    The returned list contains only entries of :data:`REQUIRED_API_KEYS`
+    — literal key *names*, never the secret *values*. The secret value is
+    read solely for the truthiness check (``env.get(name)``) and is
+    discarded immediately; it never escapes this function. This keeps the
+    auth-skip log line (which prints the returned names) free of any
+    sensitive data.
+    """
     missing: list[str] = []
-    for name in ("VOYAGE_API_KEY", "ANTHROPIC_API_KEY"):
-        if not env.get(name, "").strip():
+    for name in REQUIRED_API_KEYS:
+        # The value is consumed only by `not ... .strip()` and dropped.
+        present = bool(env.get(name, "").strip())
+        if not present:
+            # Append the literal constant, not anything env-derived.
             missing.append(name)
     return missing
 
@@ -858,14 +875,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """
     args = _parse_args(argv)
 
-    missing = _missing_api_keys(dict(os.environ))
-    if missing:
+    # `missing` only ever holds entries of REQUIRED_API_KEYS (literal key
+    # *names*), never secret values — see _missing_api_keys. The branch is
+    # gated on whether any are absent; the log message is built from the
+    # REQUIRED_API_KEYS literal so no environment-derived value reaches
+    # the logging path at all.
+    if _missing_api_keys(dict(os.environ)):
         print(
-            f"[live-eval] SKIP — required API key(s) not set: "
-            f"{', '.join(missing)}. The live-eval suite is gated on "
-            f"VOYAGE_API_KEY + ANTHROPIC_API_KEY (ADR-028 §live markers). "
-            f"Exiting {EX_CONFIG} (EX_CONFIG) so the workflow records a "
-            f"clean skip rather than a failure.",
+            f"[live-eval] SKIP — one or more required API keys are not set "
+            f"({' + '.join(REQUIRED_API_KEYS)}). The live-eval suite is "
+            f"gated on these (ADR-028 §live markers). Exiting {EX_CONFIG} "
+            f"(EX_CONFIG) so the workflow records a clean skip rather than "
+            f"a failure.",
             file=sys.stderr,
         )
         return EX_CONFIG
