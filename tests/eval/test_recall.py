@@ -268,14 +268,12 @@ class TestAggregation:
             ),
             QueryRecord(query_id="q4", query_text="no ground truth", stratum="fts-easy"),
         )
-        adapter = _DictAdapter(
-            {
-                "q1": ["sum_a", "sum_x", "sum_y"],
-                "q2": ["sum_x", "sum_b", "sum_y", "sum_z", "sum_c"],
-                "q3": ["sum_x", "sum_y", "sum_z"],
-                "q4": ["sum_x"],
-            }
-        )
+        adapter = _DictAdapter({
+            "q1": ["sum_a", "sum_x", "sum_y"],
+            "q2": ["sum_x", "sum_b", "sum_y", "sum_z", "sum_c"],
+            "q3": ["sum_x", "sum_y", "sum_z"],
+            "q4": ["sum_x"],
+        })
         report = await run_recall_eval(queries, adapter, opts=RecallEvalOptions(k_values=[1, 5]))
 
         # Per-stratum: q4 is skipped, so fts-easy has n=1 (q1 only).

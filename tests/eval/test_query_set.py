@@ -321,9 +321,7 @@ class TestTransactionRollback:
     the Nth row and asserting empty table)."
     """
 
-    def test_partial_write_rolled_back_on_nth_row_failure(
-        self, db: sqlite3.Connection
-    ) -> None:
+    def test_partial_write_rolled_back_on_nth_row_failure(self, db: sqlite3.Connection) -> None:
         """Inject a PK collision on the 2nd query row → whole INSERT rolls back.
 
         ``register_query_set`` namespaces a row's PK as
@@ -482,9 +480,7 @@ class TestContentSignatureOrderIndependence:
         assert loaded is not None
         assert len(loaded.queries) == 2
 
-    def test_expected_ids_order_does_not_affect_signature(
-        self, db: sqlite3.Connection
-    ) -> None:
+    def test_expected_ids_order_does_not_affect_signature(self, db: sqlite3.Connection) -> None:
         """The per-query signature sorts ``expected_summary_ids`` —
         ``("s1","s2")`` and ``("s2","s1")`` are the same content."""
         identity = QuerySetIdentity(name="sig", version=1)
