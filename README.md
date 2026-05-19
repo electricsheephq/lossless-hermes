@@ -107,8 +107,7 @@ quality and autonomous drill-down, not on the absence of any host-side history.
 
 ## Install
 
-`lossless-hermes` is a Hermes plugin. Install Hermes first, then install the plugin into the
-**same Python environment**.
+`lossless-hermes` is a Hermes plugin. Install Hermes first, then install the plugin.
 
 ### 1 · Install Hermes
 
@@ -121,27 +120,71 @@ curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scri
 Hermes is not published to PyPI, so the plugin does **not** pin `hermes-agent` as a
 dependency — operators install it separately.
 
-### 2 · Install the plugin
+### 2 · Install the plugin — directory mode (recommended)
+
+Directory mode is the primary distribution model ([ADR-034](./docs/adr/034-plugin-distribution-directory-mode.md)).
+The plugin is installed as a directory under `~/.hermes/plugins/`, which is where the
+Hermes `plugins` CLI (`hermes plugins list` / `install` / `enable`) looks — so a
+directory install is discoverable and manageable through that CLI.
+
+Clone the repository directly into the Hermes plugins directory:
 
 ```bash
-# Recommended (uv-managed environment)
+git clone https://github.com/electricsheephq/lossless-hermes \
+  ~/.hermes/plugins/lossless-hermes
+```
+
+Then install the plugin's runtime dependencies into the **same Python environment Hermes
+runs in** (a directory plugin has no pip dependency chain, so this step is explicit):
+
+```bash
+pip install 'httpx[socks]==0.28.1' sqlite-vec==0.1.9 pydantic==2.12.5 pyyaml==6.0.3 tenacity==9.1.4
+```
+
+Or, from an existing checkout, use the installer — it symlinks the checkout into
+`~/.hermes/plugins/lossless-hermes/` and installs the pinned dependency set:
+
+```bash
+git clone https://github.com/electricsheephq/lossless-hermes
+cd lossless-hermes
+./scripts/install.sh
+# Profile-scoped install:
+HERMES_PROFILE=myprofile ./scripts/install.sh
+# If Hermes runs in a venv, point the installer at its interpreter:
+PYTHON=~/.hermes/.venv/bin/python ./scripts/install.sh
+```
+
+The Hermes directory loader reads [`plugin.yaml`](./plugin.yaml) at the package root to
+discover the plugin. After installing, restart Hermes and run `hermes plugins list` — the
+plugin appears as `lossless-hermes`.
+
+### 2b · Install the plugin — pip / entry-point mode (secondary)
+
+The plugin can also be installed as a pip package; it registers a
+`hermes_agent.plugins` entry point that Hermes loads at startup.
+
+```bash
+# uv-managed environment
 uv pip install lossless-hermes
 
-# Or with pip
+# or with pip
 pip install lossless-hermes
 ```
 
-For development against a checkout:
+> **Note — a pip install is invisible to `hermes plugins list`.** The Hermes `plugins`
+> CLI scans `~/.hermes/plugins/` (and the repo-bundled plugin directory); it does **not**
+> enumerate `importlib.metadata` entry points. A pip-installed copy runs and works, but it
+> will **not** appear in `hermes plugins list` and cannot be managed with
+> `hermes plugins install` / `enable`. Use directory mode (above) if you want the plugin
+> visible to that CLI. Do not install both ways at once in the same environment.
+
+For development against a checkout, an editable pip install also works:
 
 ```bash
 git clone https://github.com/electricsheephq/lossless-hermes
 cd lossless-hermes
 uv pip install -e ".[dev]"
 ```
-
-The plugin is discovered through the `hermes_agent.plugins` entry-point group declared in
-[`pyproject.toml`](./pyproject.toml) — no manual steps beyond installing into the same
-environment as Hermes.
 
 ## Quickstart
 

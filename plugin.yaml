@@ -1,0 +1,47 @@
+# Directory-mode plugin manifest for lossless-hermes.
+#
+# Per ADR-034, directory mode is the PRIMARY distribution model: the plugin
+# is installed as a directory under ~/.hermes/plugins/lossless-hermes/, which
+# is where the Hermes `plugins` CLI (`hermes plugins list/install/enable`)
+# scans. Hermes core's plugin loader (`hermes_cli/plugins.py` — `_parse_manifest`
+# / `_discover_directory`) reads this file at startup; it must sit at the
+# package root alongside pyproject.toml so one checkout serves both the
+# directory-plugin path and the secondary pip/entry-point path.
+#
+# Field reference — what Hermes core's `_parse_manifest` consumes:
+#   name           plugin display name. For a flat plugin at
+#                  ~/.hermes/plugins/<dir>/ the registry KEY is the directory
+#                  name; `plugins.enabled` matches on key OR name. Keep this
+#                  equal to the install directory name (`lossless-hermes`) so
+#                  the allowlist entry in README/quickstart resolves either way.
+#   version        informational; kept in sync with pyproject.toml [project].version.
+#   description    informational; kept in sync with pyproject.toml.
+#   author         informational; kept in sync with pyproject.toml [project].authors.
+#   kind           one of {standalone, backend, exclusive, platform,
+#                  model-provider}; an unknown value is coerced to standalone.
+#                  lossless-hermes is a standalone context-engine plugin.
+#   provides_hooks informational hook list surfaced by `hermes plugins`. The
+#                  authoritative registration happens in `register(ctx)`
+#                  (src/lossless_hermes/__init__.py); this list mirrors it.
+#
+# NOTE on naming (ADR-034): the manifest/plugin name is `lossless-hermes`;
+# the runtime context-engine name is `lcm` (see LCMEngine.name). Operators
+# select the engine with `context.engine: lcm` and opt the plugin in via
+# `plugins.enabled: [lossless-hermes]`.
+name: lossless-hermes
+version: 0.1.3
+description: Lossless Context Management plugin for hermes-agent
+author: Electric Sheep HQ
+kind: standalone
+
+# Lifecycle hooks the plugin registers. Mirrors the four register_hook()
+# calls in src/lossless_hermes/__init__.py:register():
+#   post_llm_call   per-turn ingest seam        (ADR-009)
+#   pre_llm_call    recall-policy injection     (ADR-014)
+#   on_session_end  per-turn defense-in-depth   (ADR-009 Consequences)
+#   subagent_stop   Epic 06 forward-compat seam (ADR-012)
+provides_hooks:
+  - post_llm_call
+  - pre_llm_call
+  - on_session_end
+  - subagent_stop
