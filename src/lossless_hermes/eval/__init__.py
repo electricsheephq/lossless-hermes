@@ -13,6 +13,9 @@ Ports the subset of ``lossless-claw/src/eval/`` needed by the
 * :mod:`lossless_hermes.eval.run` — eval-run recording into
   ``lcm_eval_run`` + drift comparison against the most-recent prior
   run.
+* :mod:`lossless_hermes.eval.drift` — drift-detection thresholds +
+  per-stratum drift surface layered on top of ``run.py``'s flat
+  :class:`~lossless_hermes.eval.run.DriftSummary`.
 
 The operator-facing entry point is
 :func:`lossless_hermes.operator.eval_runner.run_eval` which composes
@@ -33,6 +36,13 @@ the wiring is a Group F concern that reuses the synthesis llm-adapter
 (``#09-07`` / ``#09-08`` callers).
 """
 
+from lossless_hermes.eval.drift import (
+    PerStratumDrift,
+    StratumDriftAggregate,
+    drift_threshold,
+    is_drifted,
+    per_stratum_drift,
+)
 from lossless_hermes.eval.judge import (
     JudgeCall,
     JudgeCallArgs,
@@ -84,6 +94,7 @@ __all__ = [
     "JudgeCallResult",
     "JudgeEntry",
     "PerJudgeScore",
+    "PerStratumDrift",
     "QualityOverall",
     "QualityReport",
     "QualityResult",
@@ -96,11 +107,15 @@ __all__ = [
     "RecallSearchAdapter",
     "RecallStratumAggregate",
     "Stratum",
+    "StratumDriftAggregate",
     "compute_drift",
     "decode_query_set_id",
+    "drift_threshold",
     "encode_query_set_id",
     "get_query_set",
+    "is_drifted",
     "list_query_sets",
+    "per_stratum_drift",
     "record_eval_run",
     "register_query_set",
     "run_quality_eval",
