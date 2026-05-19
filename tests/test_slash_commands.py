@@ -230,11 +230,46 @@ def test_nested_subcommand_routes_to_nested_handler() -> None:
 
 
 def test_worker_tick_routes_to_tick_handler() -> None:
-    """`/lcm worker tick embedding-backfill` routes to ``worker:run_tick_backfill``."""
+    """`/lcm worker tick embedding-backfill` routes to ``worker:run_tick_backfill``.
+
+    Issue 08-17 wired the real ``run_tick_backfill`` body — so the
+    routing assertion now checks for the tick handler's rendered output
+    (the ``[lcm] worker tick embedding-backfill`` title) rather than the
+    old stub message. With the stub engine the DB is unavailable, so the
+    handler renders the DB-unavailable skip; if the route mis-resolved
+    to ``run_status`` the output would instead carry the
+    ``### Worker Status`` header. The rich tick-body tests live in
+    ``tests/commands/test_worker.py``.
+    """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("worker tick embedding-backfill")
-    assert "not yet implemented" in out
-    assert "/lcm worker tick embedding-backfill" in out
+    # Real run_tick_backfill handler output — proves the route reached
+    # run_tick_backfill, not the run_status parent handler.
+    assert out.startswith("[lcm] worker tick embedding-backfill")
+    assert "not yet implemented" not in out
+    assert "### Worker Status" not in out
+
+
+def test_worker_status_routes_to_status_handler() -> None:
+    """`/lcm worker status` routes to the real ``worker:run_status`` body.
+
+    Issue 08-17 wired the real ``run_status`` body. With the stub engine
+    the DB is unavailable, so ``run_status`` renders the worker-status
+    header + a "not yet opened" hint — confirming the route reached the
+    real handler rather than a stub.
+    """
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("worker status")
+    assert "### Worker Status" in out
+    assert "not yet implemented" not in out
+
+
+def test_worker_bare_routes_to_status_handler() -> None:
+    """Bare `/lcm worker` (no subcommand) routes to ``worker:run_status``."""
+    dispatcher = LcmCommandDispatcher(_make_engine())
+    out = dispatcher.handle("worker")
+    assert "### Worker Status" in out
+    assert "not yet implemented" not in out
 
 
 def test_doctor_clean_apply_routes_to_cleaners_apply() -> None:

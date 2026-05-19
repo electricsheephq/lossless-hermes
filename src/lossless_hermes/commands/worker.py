@@ -50,10 +50,11 @@ path in ``plugin/commands.py`` is all it takes.
 
 Owner-gating is **upstream** — Hermes's ``SlashAccessPolicy`` gates the
 ``allow_admin_from`` config BEFORE this handler runs. The handler does
-NOT check owner status itself (the AC mandates
-``grep -n "is_owner" worker.py`` returns 0 lines). The dispatcher table
-(08-01) marks ``worker tick embedding-backfill`` as ``owner_gated=True``;
-that flag drives the upstream gate and the ``(admin)`` marker in
+NOT check owner status itself — the issue 08-17 AC mandates that a
+grep for the owner-check token in this module returns 0 lines, so no
+owner-status probe appears anywhere below. The dispatcher table (08-01)
+marks ``worker tick embedding-backfill`` as ``owner_gated=True``; that
+flag drives the upstream gate and the ``(admin)`` marker in
 ``/lcm help``. ``worker`` / ``worker status`` are NOT gated.
 
 See:
