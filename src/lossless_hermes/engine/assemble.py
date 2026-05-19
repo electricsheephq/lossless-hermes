@@ -182,6 +182,23 @@ class _AssembleMixin:
         _experimental_always_on_via_compress: bool
         _last_experimental_warn_ts: float
         ignore_session_patterns: List[re.Pattern[str]]
+        # v0.1.2 fix (issue #130, Defect 2). The diff-ingest cursor is
+        # initialized on the shell; :meth:`preassemble` resets the
+        # per-session entry after a substitution shortens the live
+        # list. ``_reset_ingest_cursor_after_compaction`` is owned by
+        # the sibling :class:`_CompactMixin` — MRO resolves the
+        # ``self.`` call at runtime (the same pattern by which
+        # :class:`_CompactMixin.compress` calls ``self._assemble``).
+        _last_seen_message_idx: Dict[str, int]
+
+        def _reset_ingest_cursor_after_compaction(
+            self,
+            *,
+            original: List[Dict[str, Any]],
+            result: List[Dict[str, Any]],
+            session_id: str,
+            source: str,
+        ) -> None: ...
 
     # ------------------------------------------------------------------
     # _on_pre_llm_call — recall-policy injection (03-10, unchanged)
@@ -331,12 +348,30 @@ class _AssembleMixin:
             else:
                 effective_budget = _DEFAULT_TOKEN_BUDGET
 
-            return self._assemble(
+            substituted = self._assemble(
                 session_id=session_id,
                 messages=messages,
                 token_budget=effective_budget,
                 prompt=None,
             )
+
+            # v0.1.2 fix (issue #130, Defect 2): when the substitution
+            # produced a SHORTER list, reset the diff-ingest cursor to
+            # the new length. ``preassemble`` is the Option B (production)
+            # path that REPLACES the live message list; without the
+            # reset the cursor stays past ``len(substituted)`` and
+            # ``_IngestMixin._do_ingest_history_diff`` early-returns
+            # forever, silently halting ingest. ``session_id`` is
+            # already non-empty here (the ``if not session_id`` guard
+            # above returned early). The helper is owned by
+            # :class:`_CompactMixin`; ``self.`` resolves it via the MRO.
+            self._reset_ingest_cursor_after_compaction(
+                original=messages,
+                result=substituted,
+                session_id=session_id,
+                source="preassemble",
+            )
+            return substituted
         except Exception as err:  # pragma: no cover — wrapper invariant
             # Catch-all: substitution failure on any internal layer
             # MUST NOT crash the agent loop. Log + fall back to live

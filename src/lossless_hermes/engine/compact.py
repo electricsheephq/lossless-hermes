@@ -148,6 +148,11 @@ class _CompactMixin:
     compression_count: int
     context_length: int
     _compression_history: Deque[Tuple[int, int]]
+    # v0.1.2 fix (issue #130, Defect 2) — the diff-ingest cursor.
+    # Initialized in :meth:`LCMEngine.__init__`. :meth:`compress` resets
+    # the per-session entry after a compaction shortens the live list so
+    # the next ingest does not early-return forever.
+    _last_seen_message_idx: Dict[str, int]
     # 02-09 — Circuit-breaker state-machine map. Initialized in
     # :meth:`LCMEngine.__init__`. 04-07 reads via
     # :meth:`_get_circuit_breaker_state` (the configured-defaults
@@ -429,6 +434,23 @@ class _CompactMixin:
             after = before  # Approximate; not load-bearing.
             self._compression_history.append((before, after))
             self.compression_count += 1
+
+            # v0.1.2 fix (issue #130, Defect 2): when the substitution
+            # produced a SHORTER list, reset the diff-ingest cursor to
+            # the new length. Otherwise the cursor — still pointing at
+            # the pre-substitution length — stays permanently past
+            # ``len(substituted)`` and ``_do_ingest_history_diff``
+            # early-returns forever, silently stopping ingest. The
+            # session_id is already non-empty here (the ``if not
+            # session_id`` guard above returned early), so the reset
+            # always applies on a genuine shortening.
+            self._reset_ingest_cursor_after_compaction(
+                original=messages,
+                result=substituted,
+                session_id=session_id,
+                source="compress (experimental)",
+            )
+
             logger.debug(
                 "[lcm] compress (experimental always-on substitution): "
                 "session=%s budget=%d input_msgs=%d output_msgs=%d",
@@ -463,6 +485,25 @@ class _CompactMixin:
         # no-op fire. Useful while Epic 04 is still in flight (a real
         # compaction would produce richer telemetry); for now this
         # confirms the surface is reached.
+        # v0.1.2 fix (issue #130, Defect 2): the Epic-04 fallthrough.
+        # At 03-09 this branch is a passthrough (``result is messages``,
+        # same length) so the reset is a guarded no-op — the length
+        # guard inside :meth:`_reset_ingest_cursor_after_compaction`
+        # skips it. The call is wired NOW so that when Epic 04 fills
+        # this branch with the real overflow-recovery algorithm (which
+        # WILL return a shortened list), the post-compaction cursor
+        # reset is already in place and ingest cannot silently stall.
+        # The session_id is inferred from the message list (Hermes's
+        # ``compress`` ABC signature does not pass it); a failed
+        # inference makes the reset skip — see the helper's caveat.
+        fallthrough_session_id = self._infer_session_id(messages)
+        self._reset_ingest_cursor_after_compaction(
+            original=messages,
+            result=messages,
+            session_id=fallthrough_session_id,
+            source="compress (overflow-recovery)",
+        )
+
         logger.debug(
             "[lcm] compress called (no-op): %d messages, current_tokens=%s, focus_topic=%s",
             len(messages),
@@ -471,6 +512,95 @@ class _CompactMixin:
         )
 
         return messages
+
+    # ------------------------------------------------------------------
+    # Compaction cursor reset — v0.1.2 fix (issue #130, Defect 2)
+    # ------------------------------------------------------------------
+
+    def _reset_ingest_cursor_after_compaction(
+        self,
+        *,
+        original: List[Dict[str, Any]],
+        result: List[Dict[str, Any]],
+        session_id: str,
+        source: str,
+    ) -> None:
+        """Reset the diff-ingest cursor after a compaction shortens the list.
+
+        v0.1.2 fix for issue #130, Defect 2. The diff-ingest cursor
+        ``_last_seen_message_idx[session_id]`` is an absolute index into
+        the live message list. When :meth:`compress` or
+        :meth:`_AssembleMixin.preassemble` substitutes a SHORTER list
+        for the live one (compaction folds older turns into hierarchical
+        summaries), the cursor — left pointing at the old, longer length
+        — becomes permanently ``>= len(new_list)``. The next
+        ``post_llm_call`` then hits the ``last_idx >= len(snapshot)``
+        early-return in :meth:`_IngestMixin._do_ingest_history_diff` and
+        returns without ingesting — *forever*. Ingest silently stops.
+
+        The fix: after any compaction branch that returns a shortened
+        list, set the cursor to ``len(result)`` so the next ingest
+        diffs only messages appended *after* the compaction boundary.
+        hermes-lcm reference: ``engine.py:908`` (commit 4bc6b9c, #1).
+
+        **session_id caveat (issue #130 scope note).** Our cursor is
+        ``session_id``-keyed, but Hermes's ``compress`` / ``preassemble``
+        ABC signatures do NOT pass ``session_id`` — the callers infer it
+        via :meth:`_AssembleMixin._infer_session_id`. When inference
+        fails (returns ``""``), this method SKIPS the reset entirely:
+        writing ``_last_seen_message_idx[""] = N`` would (a) not fix the
+        real session's desync and (b) plant a bogus empty-string key. A
+        skipped reset is recoverable on a later turn once a session_id
+        resolves; a wrong-key write is not.
+
+        **Length guard.** The reset only fires when ``result`` is
+        strictly shorter than ``original``. A passthrough (the 03-09
+        ``compress`` fallthrough returns ``messages`` unchanged; Epic 04
+        fills in real shortening later) leaves the cursor untouched —
+        resetting to an unchanged length would be a no-op at best and,
+        if the cursor were legitimately behind, would skip un-ingested
+        messages. Mirrors the hermes-lcm ``compressed != original``
+        guard (commit 79629c2).
+
+        Args:
+            original: The live message list handed to the compaction
+                entry point.
+            result: The list the compaction entry point returns. When
+                ``len(result) < len(original)`` the cursor is reset.
+            session_id: Session id resolved by the caller via
+                :meth:`_AssembleMixin._infer_session_id`. Empty string
+                → reset skipped (see the caveat above).
+            source: Free-form attribution for the log breadcrumb
+                (``"compress"`` / ``"preassemble"``).
+        """
+        # session_id caveat — skip rather than plant a bogus key.
+        if not session_id:
+            logger.debug(
+                "[lcm] %s: compaction cursor reset skipped — no "
+                "session_id inferred (original=%d, result=%d)",
+                source,
+                len(original),
+                len(result),
+            )
+            return
+
+        # Length guard — only a genuine shortening desyncs the cursor.
+        if len(result) >= len(original):
+            return
+
+        previous = self._last_seen_message_idx.get(session_id)
+        self._last_seen_message_idx[session_id] = len(result)
+        logger.info(
+            "[lcm] %s session=%s: compaction shortened live list "
+            "%d -> %d; ingest cursor reset %s -> %d (issue #130 — "
+            "post-compaction ingest desync prevented)",
+            source,
+            session_id,
+            len(original),
+            len(result),
+            previous if previous is not None else "unset",
+            len(result),
+        )
 
     # ------------------------------------------------------------------
     # 04-07 — Circuit-breaker integration
