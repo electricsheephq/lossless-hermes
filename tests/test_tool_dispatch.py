@@ -100,15 +100,20 @@ def test_tool_dispatch_is_dict() -> None:
     assert isinstance(TOOL_DISPATCH, dict)
 
 
-def test_tool_dispatch_empty_at_06_02() -> None:
-    """The registry is empty until per-tool ports land (06-07..06-14).
+def test_tool_dispatch_holds_only_adr035_diagnostic_tools() -> None:
+    """The registry holds exactly the two ADR-035 diagnostic tools.
 
-    A non-empty registry would mean a per-tool issue accidentally
-    landed before its prerequisites — fail fast at CI time.
+    The seven ported ``lcm_*`` tools' dispatch wiring still has not
+    landed (per-tool dispatch issues 06-07..06-14 register
+    ``handle_lcm_<tool>`` — none has). The only entries are the two
+    read-only model-callable diagnostic tools added by ADR-035 (issue
+    #135): ``lcm_status`` and ``lcm_doctor``. Any other entry would
+    mean a per-tool issue landed before its prerequisites — fail fast.
     """
-    assert TOOL_DISPATCH == {}, (
-        f"TOOL_DISPATCH should be empty at 06-02 (per-tool ports land "
-        f"in 06-07..06-14), got {sorted(TOOL_DISPATCH)}"
+    assert set(TOOL_DISPATCH) == {"lcm_status", "lcm_doctor"}, (
+        f"TOOL_DISPATCH should hold exactly the two ADR-035 diagnostic "
+        f"tools (lcm_status, lcm_doctor); the seven ported tools' "
+        f"dispatch wiring lands in 06-07..06-14. Got {sorted(TOOL_DISPATCH)}"
     )
 
 
@@ -531,8 +536,15 @@ def test_token_gate_routes_through_middleware_for_gated_tool() -> None:
             TOOL_DISPATCH["lcm_grep"] = previous
 
     assert gate_calls == ["lcm_grep"]
-    # The handler still ran.
-    assert captured == {"runtime_ctx": captured.get("runtime_ctx"), "session_key": None}
+    # The handler still ran. Per ADR-035, _dispatch_tool_call also
+    # passes the engine to the handler as ``ctx`` (the diagnostic tools
+    # read the DB + session state off it); handlers that don't need it
+    # absorb it via **kwargs.
+    assert captured == {
+        "runtime_ctx": captured.get("runtime_ctx"),
+        "session_key": None,
+        "ctx": engine,
+    }
 
 
 def test_token_gate_bypassed_for_non_gated_tool() -> None:
