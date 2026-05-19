@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-`lossless-hermes` is a faithful port of the LCM v4.1 TypeScript codebase (`lossless-claw` `pr-613` @ `1f07fbd`) to a Hermes-Agent plugin. The closest neighbor is `stephenschoettler/hermes-lcm`, an independent Python plugin written from the LCM paper that ships today but covers ~50–60% of v4.1 feature surface. We differentiate on **byte-compat OpenClaw migration**, **Voyage embeddings + hybrid search** (the +52.5pp Eva recall lift), **Wave-N audit-fix preservation**, and **schema-diff CI** that prevents drift from the canonical LCM SQLite shape.
+`lossless-hermes` is a faithful port of the LCM v4.1 TypeScript codebase (`lossless-claw` `pr-613` @ `1f07fbd`) to a Hermes-Agent plugin. The closest neighbor is `stephenschoettler/hermes-lcm`, an independent Python plugin written from the LCM paper that ships today but covers ~50–60% of v4.1 feature surface. We differentiate on **byte-compat OpenClaw migration**, **Voyage embeddings + hybrid search** (which *targets* the +52.5pp Eva recall lift — a TS-baseline figure not yet reproduced in the Python port; see [`docs/benchmarks/voyage-recall-2026-q2.md`](./benchmarks/voyage-recall-2026-q2.md)), **Wave-N audit-fix preservation**, and **schema-diff CI** that prevents drift from the canonical LCM SQLite shape.
 
 ---
 
@@ -124,9 +124,9 @@ A separate path that searches the host-tracked session DB (Hermes's `state.db`).
 
 Two-sentence form:
 
-> `lossless-hermes` is the LCM v4.1 algorithm ported verbatim from `lossless-claw` TypeScript, preserving 12 waves of audit fixes, the byte-compat OpenClaw migration path, and the full Voyage embeddings stack that delivers a +52.5pp recall lift on the Eva benchmark.
+> `lossless-hermes` is the LCM v4.1 algorithm ported verbatim from `lossless-claw` TypeScript, preserving 12 waves of audit fixes, the byte-compat OpenClaw migration path, and the full Voyage embeddings stack that *targets* a +52.5pp recall lift on the Eva benchmark (a TS-baseline figure not yet reproduced in the Python port).
 >
-> If you want a simpler shipping-today Hermes-LCM plugin without embeddings, see [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm); if you need byte-compat OpenClaw migration, +52.5pp recall, and the audit-trail-preserving port, you want this.
+> If you want a simpler shipping-today Hermes-LCM plugin without embeddings, see [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm); if you need byte-compat OpenClaw migration, the Voyage embeddings option (targeting the +52.5pp recall lift — a TS-baseline figure not yet reproduced in Python), and the audit-trail-preserving port, you want this.
 
 Three-sentence form (for "Why not just fork hermes-lcm?" in FAQ):
 

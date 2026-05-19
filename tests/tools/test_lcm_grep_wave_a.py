@@ -64,6 +64,12 @@ class _Ctx:
     ``voyage`` defaults to ``None`` because Wave-A tests don't exercise
     Voyage. The Wave-B tests construct a stand-in and set it on this
     field — see ``tests/tools/test_lcm_grep_wave_b.py``.
+
+    ``embeddings_enabled`` defaults to ``True`` (ADR-033): the existing
+    Wave-A/-B tests exercise the *post-opt-in* hybrid/semantic behavior
+    (missing-key path, vec0-degrade, rerank fallbacks). The ADR-033
+    opt-in-gate tests explicitly construct a ``_Ctx`` with
+    ``embeddings_enabled=False`` to assert the off-by-default refusal.
     """
 
     conn: sqlite3.Connection
@@ -71,6 +77,7 @@ class _Ctx:
     conversation_store: ConversationStore
     timezone: str
     voyage: object | None = None  # VoyageClient | None — duck-typed
+    embeddings_enabled: bool = True  # ADR-033 — see class docstring
 
 
 @pytest.fixture
@@ -249,13 +256,42 @@ class TestSchema:
         assert sk["items"]["enum"] == ["leaf", "condensed"]
 
     def test_description_verbatim_markers(self) -> None:
-        """The tool description carries the canonical model-routing
-        prose verbatim from TS lines 196-204."""
+        """The tool description carries the canonical model-routing prose.
+
+        ADR-033 (issue #133): the description is no longer byte-verbatim
+        from TS lines 196-204 — the ``hybrid`` "PRIMARY for Type B" steer
+        is demoted. The structural markers (FIVE modes, the token-budget
+        cap, the Type C verbatim steer) survive; the "Type B" primacy
+        phrase does not. See :func:`test_description_demotes_hybrid_primary`
+        below for the ADR-033 negative assertions.
+        """
         desc = LCM_GREP_SCHEMA["description"]
         assert "FIVE modes" in desc
         assert "LCM_TOOL_RESULT_TOKEN_BUDGET" in desc
-        assert "Type B topic-anchored queries" in desc
         assert "Type C verbatim/citation queries" in desc
+        # ADR-033: topic-anchored queries are still mentioned, but as the
+        # `full_text` + drilldown standard path — not a hybrid-primary steer.
+        assert "topic-anchored queries" in desc
+
+    def test_description_demotes_hybrid_primary(self) -> None:
+        """ADR-033 (#133): the description no longer advertises `hybrid`
+        as PRIMARY, and presents the keyless FTS path as the standard.
+
+        This is the load-bearing behavior change — the tool schema drives
+        the agent's mode selection, so the absence of the "PRIMARY for
+        Type B" steer and the presence of the `full_text` + drilldown
+        steer are the assertions that pin ADR-033's Consequences.
+        """
+        desc = LCM_GREP_SCHEMA["description"]
+        # The demoted claim: hybrid is no longer "PRIMARY for Type B".
+        assert "PRIMARY for Type B" not in desc
+        assert "Type B topic-anchored queries" not in desc
+        # hybrid/semantic are described as opt-in, available only when
+        # embeddings are enabled — no primacy claim.
+        assert "available only when embeddings are enabled" in desc
+        assert "opt-in capability" in desc
+        # The honest default steer for topic-anchored queries.
+        assert "`full_text` followed by lcm_describe / lcm_expand_query" in desc
 
 
 # ===========================================================================
