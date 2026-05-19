@@ -4,11 +4,11 @@
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
-Lossless Context Management plugin for **[Hermes-agent](https://github.com/NousResearch/hermes-agent)**, ported from [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) (TypeScript/OpenClaw) to Python/Hermes. **v0.1 is a green-CI scaffolding release** — the plugin registers and loads, but the context engine is a no-op passthrough. Real LCM behavior (storage, ingest/assembly, compaction, embeddings, tools, entities, ops, eval) lands incrementally across Epics 01–09 — see [`ROADMAP.md`](./ROADMAP.md).
+Lossless Context Management plugin for **[Hermes-agent](https://github.com/NousResearch/hermes-agent)**, ported from [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) (TypeScript/OpenClaw) to Python/Hermes. **v0.1.0 is feature-complete** — it ports LCM v4.1's lossless conversation pyramid (raw messages → leaf summaries → condensed summaries), per-turn ingest and always-on context assembly, compaction, Voyage hybrid retrieval, 7 agent tools, entity coreference + synthesis, and the full `/lcm` operator command surface. Existing OpenClaw LCM users can migrate their `lcm.db` without data loss — see [OpenClaw migration](#openclaw-migration) below.
 
-## Status: 🟡 Wave 1 — Epic 00 Scaffolding (in progress)
+## Status: ✅ v0.1.0 — feature-complete
 
-Phase 1 (architecture & planning) is complete. Architecture, decisions, risks, and the full epic/issue breakdown live under [`docs/`](./docs/) and [`epics/`](./epics/). Phase 2 (execution) is underway — current wave and last merged PR are tracked in [`STATUS.md`](./STATUS.md).
+All 122 port issues across Epics 00–09 are merged; the CI matrix is green on `{macOS, ubuntu} × {Python 3.11, 3.12, 3.13}`. Architecture, decisions, risks, and the epic/issue breakdown live under [`docs/`](./docs/) and [`epics/`](./epics/); release state is tracked in [`STATUS.md`](./STATUS.md). Two features are deliberately deferred to v0.2.0 — see [Deferred to v0.2.0](#deferred-to-v020).
 
 ## Install
 
@@ -75,9 +75,25 @@ Verify the plugin registers:
 hermes
 ```
 
-A startup log line confirms `lossless-hermes` is loaded and the context engine is `lcm`. The v0.1 engine is a no-op passthrough (it returns the conversation unchanged), so a session works exactly as it would without the plugin — that is the deliberate scaffolding-release behavior.
+A startup log line confirms `lossless-hermes` is loaded and the context engine is `lcm`. From the first turn, LCM ingests messages into its SQLite pyramid, assembles context on every `pre_llm_call`, and exposes the `/lcm` command surface (`/lcm help` lists all subcommands).
 
-For plugin-specific configuration (Voyage keys, model choices, worker intervals, compaction thresholds), the namespace is `lossless_hermes:` (snake_case — see [Naming convention](#naming-convention) below). The full schema lands with Epic 02 (engine skeleton) and is wired up in [issue 00-07](./epics/00-scaffolding/issues/00-07-config-skeleton.md).
+For plugin-specific configuration (Voyage keys, model choices, worker intervals, compaction thresholds), the namespace is `lossless_hermes:` (snake_case — see [Naming convention](#naming-convention) below). Voyage hybrid retrieval is opt-in: without `VOYAGE_API_KEY` the engine runs FTS5-only and degrades gracefully (no embeddings backfill, no semantic recall).
+
+```yaml
+lossless_hermes:
+  voyage_api_key: "${VOYAGE_API_KEY}"   # optional — enables hybrid retrieval
+```
+
+## OpenClaw migration
+
+Existing OpenClaw LCM users can carry their conversation history into Hermes without data loss. The on-disk SQLite schema is byte-compatible (per [ADR-025](./docs/adr/025-openclaw-migration.md) and [spike 003](./docs/spike-results/003-identity-hash.md) — `identity_hash` does not diverge):
+
+```bash
+cp ~/.openclaw/lcm.db "$HERMES_HOME/lossless-hermes/lcm.db"
+lossless-hermes import-openclaw
+```
+
+`import-openclaw` runs the migration ladder idempotently, refuses to overwrite an existing destination without `--force`, and sample-validates `identity_hash` on migrated rows. See `lossless-hermes import-openclaw --help` for `--source`, `--force`, and `--validate-rows` options.
 
 ## Platform support
 
@@ -112,23 +128,34 @@ Three names refer to "this plugin." They are deliberately distinct (per [ADR-023
 
 Operators type the **snake_case** form in `config.yaml`; they only see the **hyphenated** form when running `pip install` or `pip uninstall`. Both forms appear in the Hermes startup banner so the mapping is visible at runtime.
 
-## What v0.1 does NOT do
+## What v0.1.0 ships
 
-This is a scaffolding release. The engine is a no-op passthrough. The following land incrementally — there is no `/lcm` command, no recall, no embeddings, no entity extraction in v0.1:
+Feature-complete parity with LCM v4.1 (minus the two deferrals below):
 
-| Feature | Lands in |
+| Capability | Where |
 |---|---|
-| 27-table SQLite schema, migrations, FTS5 + sqlite-vec wiring | [Epic 01 — Storage](./epics/01-storage/) |
-| `ContextEngine` round-trips messages through `compress()` | [Epic 02 — Engine skeleton](./epics/02-engine-skeleton/) |
-| Per-turn ingest + always-on assembly via `pre_llm_call` / `post_llm_call` hooks | [Epic 03 — Ingest + assembly](./epics/03-ingest-assembly/) |
-| Compaction (leaf summaries, condensed summaries, pyramid maintenance) | [Epic 04 — Compaction](./epics/04-compaction/) |
-| Voyage embeddings + hybrid retrieval (FTS5 ∪ vec0, +52.5pp recall lift) | [Epic 05 — Embeddings](./epics/05-embeddings/) |
-| 7 agent tools (`lcm_grep`, `lcm_describe`, `lcm_recall`, …) | [Epic 06 — Tools](./epics/06-tools/) |
-| Entity coref pipeline + synthesis | [Epic 07 — Entity + synthesis](./epics/07-entity-synthesis/) |
-| `/lcm health`, `/lcm doctor`, `/lcm import-openclaw`, ~25 subcommands | [Epic 08 — CLI + ops](./epics/08-cli-ops/) |
-| Drift CI gating, recall eval suite | [Epic 09 — Eval](./epics/09-eval/) |
+| SQLite schema, migration ladder, FTS5 + sqlite-vec wiring (schema-diff byte-compatible with OpenClaw LCM) | [Epic 01 — Storage](./epics/01-storage/) |
+| `LCMEngine` (`ContextEngine` ABC) round-trips messages; `/lcm` slash-command surface | [Epic 02 — Engine](./epics/02-engine-skeleton/) |
+| Per-turn ingest + always-on context assembly via `pre_llm_call` / `post_llm_call` hooks | [Epic 03 — Ingest + assembly](./epics/03-ingest-assembly/) |
+| Compaction — leaf summaries, condensed summaries, anti-thrashing, circuit breaker | [Epic 04 — Compaction](./epics/04-compaction/) |
+| Voyage embeddings + hybrid retrieval (FTS5 ∪ vec0, RRF, rerank-2.5) with graceful degradation | [Epic 05 — Embeddings](./epics/05-embeddings/) |
+| 7 agent tools — `lcm_grep`, `lcm_describe`, `lcm_get_entity`, `lcm_search_entities`, `lcm_expand`, `lcm_synthesize_around`, `lcm_compact` | [Epic 06 — Tools](./epics/06-tools/) |
+| Entity coreference pipeline + tier-aware synthesis (dispatch, cache, invalidation, audit) | [Epic 07 — Entity + synthesis](./epics/07-entity-synthesis/) |
+| `/lcm` operator commands — `status`, `health`, `purge`, `backup`, `reconcile`, `doctor`, `worker`, `rotate`, `eval`, `help` — plus the `lossless-hermes import-openclaw` CLI | [Epic 08 — CLI + ops](./epics/08-cli-ops/) |
+| Recall eval suite, per-stratum drift detection, `live-eval` CI gating, Voyage recall benchmark | [Epic 09 — Eval](./epics/09-eval/) |
 
-If you install lossless-hermes today and notice there's no `/lcm` command — that's expected. The plugin is doing what v0.1 promises: loading cleanly as a no-op so the integration surface is exercised before the engine ships.
+Every Wave-N audit fix from LCM's 12 review waves is ported verbatim with `# LCM Wave-N` provenance comments (per [ADR-029](./docs/adr/029-wave-fix-provenance.md)).
+
+### Deferred to v0.2.0
+
+Two LCM v4.1 features are intentionally out of scope for v0.1.0, per accepted ADRs:
+
+| Deferred | Reason |
+|---|---|
+| `lcm_expand_query` tool + `prepareSubagentSpawn` / `subagentEnded` sub-agent lifecycle | [ADR-012](./docs/adr/012-subagent-defer.md) — sub-agent delegation deferred |
+| PR #628 stub-tier substitution | [ADR-030](./docs/adr/030-pr-628-stub-tier-deferred.md) |
+
+Dropped entirely (no Hermes equivalent): transcript-GC, JSONL session-file rotation, auto-rotate session files — Hermes uses a SQLite session store, not JSONL.
 
 ## Source of truth
 
