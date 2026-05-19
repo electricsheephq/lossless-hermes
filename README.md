@@ -90,7 +90,7 @@ always recover the detail. In normal operation you never think about compaction 
 |---|---|
 | **Lossless by construction** | Every message is persisted; compaction only ever *adds* a summary layer. Drill-down is exact, not approximate. |
 | **Recall lives in the engine** | The agent expands compacted history through first-class LCM tools during the active turn — not via a bolted-on, separate cross-session search step. |
-| **The complete LCM feature port** | Full summary DAG, hybrid retrieval, entity coreference, tier-aware synthesis, and a 10-subcommand operator surface — the whole of LCM v4.1, not a subset. |
+| **The complete LCM feature port** | Full summary DAG, hybrid retrieval, entity coreference, tier-aware synthesis, and a full `/lcm` operator surface — the whole of LCM v4.1, not a subset. |
 | **Drop-in for OpenClaw LCM users** | The on-disk SQLite schema is byte-compatible; an existing `lcm.db` migrates with [one command](#migrating-from-openclaw), no data loss. |
 | **Degrades gracefully** | No `VOYAGE_API_KEY`? Retrieval runs FTS-only. `sqlite-vec` unavailable? The engine still runs. Optional dependencies stay optional. |
 | **Built with provenance** | Every scar-tissue fix from LCM's 12 upstream audit waves is ported verbatim with `# LCM Wave-N` comments; decisions are recorded as [ADRs](./docs/adr/). |
@@ -246,12 +246,14 @@ All operator commands are reachable as `/lcm <subcommand>` from within a Hermes 
 | `/lcm health` | Detailed subsystem health — embeddings, workers, synthesis cache, eval recall |
 | `/lcm doctor` | Scan for broken / truncated summaries; `doctor apply` repairs, `doctor clean` removes |
 | `/lcm purge` | Soft-suppress leaves matching criteria (dry-run by default) |
-| `/lcm reconcile` | Merge legacy session keys into one logical session |
+| `/lcm reconcile-session-keys` | Merge legacy session keys into one logical session |
 | `/lcm worker` | Inspect background-worker state, or force an embedding-backfill tick |
 | `/lcm backup` | Timestamped backup of the LCM SQLite database |
-| `/lcm rotate` | Compact the current session in place, preserving the tail |
-| `/lcm eval` | Recall + drift evaluation harness |
+| `/lcm rotate` | Back up the database, clear the assemble-snapshot cache, WAL-checkpoint, and stamp the last-rotate time |
 | `/lcm help` | List every subcommand |
+
+> The recall + drift **evaluation harness** ships in `src/lossless_hermes/eval/` and runs
+> via the `live-eval` CI workflow; the `/lcm eval` slash-command wiring is not yet landed.
 
 ## Migrating from OpenClaw
 
