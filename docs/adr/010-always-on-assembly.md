@@ -1,10 +1,10 @@
 # ADR-010: Always-on assembly substitution mechanism
 
-**Status:** Proposed (depends on upstream Hermes PR merge)
+**Status:** Superseded by ADR-032
 **Date:** 2026-05-13
 **Confidence:** 60% (because outcome hinges on upstream maintainer acceptance)
 **Supersedes:** —
-**Superseded by:** —
+**Superseded by:** ADR-032
 
 ## Context
 
