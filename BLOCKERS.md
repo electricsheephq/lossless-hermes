@@ -15,6 +15,15 @@
 **Status:** open
 **Resolution:** _(pending v0.1.0 release-gate review)_ — 09-08 executor side **complete** (PR `port/09-08-benchmark`): the `v41-test-corpus` Python port, the benchmark harness (`scripts/benchmark_voyage_recall.py`), and the published report (`docs/benchmarks/voyage-recall-2026-q2.md`) are all landed + verified; the `fts_only` baseline is **measured offline** (paraphrastic recall@5 = 0.0%, the FTS-only weakness the hybrid arm addresses). The `hybrid` arm + the live +52.5pp confirmation are a single documented operator-gated command in the report's "Live hybrid run PENDING" section, gated on `VOYAGE_API_KEY`. The harness is exercised end-to-end by `tests/benchmarks/test_voyage_recall_benchmark.py` with the Voyage seam mocked. This matches the recommended action exactly — release-gate item 7 is now satisfiable as "harness reproduces; live run documented + pending key," and the maintainer can close B-001 at the v0.1.0 gate review.
 
+### B-002 — 2026-05-19 — Integration soak (24h+) requires a live Hermes deployment
+**Raised by:** project-lead session, Wave 6 / v0.1.0 release gate
+**Blocks:** v0.1.0 release-gate verification item 11 ("Integration soak: 24h+ run with healthy memory/token/embedding throughput"). Does NOT block any code issue — all 122 port issues are merged, CI matrix green.
+**Question:** The plan's release gate calls for a 24h+ integration soak inside a running Hermes runtime — monitoring memory, token usage, embedding backfill, schema integrity, and an OpenClaw migration round-trip on a real 2.6GB Eva DB. An autonomous in-session run cannot host a 24h live process, and no real Eva DB or `VOYAGE_API_KEY` is provisioned in this environment.
+**Recommended action:** Accept as a documented post-tag operator/maintainer step, same pattern as B-001. v0.1.0 ships with: full CI matrix green on `{macOS, ubuntu} × {3.11, 3.12, 3.13}`, ~4050 offline tests, schema-diff byte-compat gate green, and 28 offline `import-openclaw` tests (argparse, refusal, dry-run, migration, identity-hash sample-validation, idempotency, fixture round-trip). The soak is runtime-validation of an already-CI-verified codebase, not a code gap. Recommend the maintainer run the soak against a staging Hermes deployment after the tag and before any production rollout; track residual findings as v0.2.0 issues.
+**Decision required:** Claude (autonomous) — gate-keeper role.
+**Status:** open
+**Resolution:** _(pending v0.1.0 release-gate review — recommend accepting as an operator-gated item; ships v0.1.0 with the offline test+CI evidence above)_
+
 ## Resolved (archive after 30 days)
 
 _(none yet)_
