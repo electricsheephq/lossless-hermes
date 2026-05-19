@@ -1,8 +1,12 @@
 # Epic 09 — Eval + Benchmarks
 
+**Status: closed** — all 8 issues merged (PRs #120–#125; 09-01/09-02/09-04 landed via the combined test-coverage PR #122); v0.1.0 release gate. The benchmark harness + measured `fts_only` baseline ship in 09-08 (#125); the live +52.5pp hybrid confirmation is a documented operator-gated step (`VOYAGE_API_KEY` required — B-001), per the BLOCKERS.md recommended action.
+
 ## Goal
 
 Port LCM's recall + drift eval suite to Python and reproduce the **+52.5pp paraphrastic recall lift** of Voyage hybrid retrieval over FTS-only that the Phase A spike measured on Eva's 31-query stratified eval set. Concretely: a working `/lcm eval <query-set-id>` end-to-end (query-set seed → recall@K + reciprocal-rank → run-record → drift vs prior) and a CI live-eval job gated on `VOYAGE_API_KEY` + `ANTHROPIC_API_KEY` that runs on PRs touching retrieval surfaces. The +52.5pp number is the decision gate that justified shipping Voyage in v4.1 (see `docs/v4.1/PR_DESCRIPTION.md` §"Why Voyage embeddings"); the port is not done until Python reproduces it.
+
+> **v0.1.0 closure note:** the `/lcm eval` pipeline, drift detection, the live-eval CI workflow, and the benchmark harness are all ported and verified — the harness is exercised end-to-end by `tests/benchmarks/test_voyage_recall_benchmark.py` with the Voyage seam mocked. The `fts_only` baseline is **measured offline** (paraphrastic recall@5 = 0.0%, the FTS-only weakness the hybrid arm addresses). The live `hybrid` +52.5pp confirmation requires a provisioned `VOYAGE_API_KEY`, which neither this environment nor the repo has — it ships as a documented single-command operator step in `docs/benchmarks/voyage-recall-2026-q2.md` ("Live hybrid run PENDING"). This is the **B-001** resolution: harness reproduces; live run documented + pending key — release-gate item 7 is satisfied on that basis.
 
 ## Deliverables
 

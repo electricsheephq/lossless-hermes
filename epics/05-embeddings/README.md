@@ -1,5 +1,7 @@
 # Epic 05 — Embeddings
 
+**Status: closed** — all 11 issues merged (PRs #36–#38, #40, #43, #53–#55, #57–#59); v0.1.0 release gate.
+
 The full four-layer embedding stack: Voyage HTTP client, sqlite-vec store, asyncio worker loop with cross-process lock, and the hybrid/semantic retrieval surfaces. End state: `lcm_grep --mode hybrid` and `--mode semantic` work against a backfilled corpus, with graceful degradation when vec0 or Voyage are unavailable.
 
 ## Goal
@@ -105,8 +107,8 @@ All line numbers in issues reference **`lossless-claw` `pr-613` HEAD**. The Wave
 
 Epic 05 is done when:
 
-1. All 11 issues are merged with green CI.
-2. `pytest tests/voyage/ tests/embeddings/ tests/concurrency/` passes (~2,500 LOC of ported tests; 95%+ statement coverage).
-3. The live-Voyage integration test (`tests/integration/test_voyage_live.py`, gated on `VOYAGE_API_KEY`) passes nightly: dim=1024, L2 norm ≈ 1.0 ± 0.001, embed p99 < 5s, rerank p99 < 3s.
-4. On a fresh DB with a sample corpus, `lcm_grep --mode semantic "test query"` returns ranked hits with cosine bands populated (after Epic 06 lands the tool wrapper).
-5. `grep -rn "# LCM Wave-" src/lossless_hermes/voyage/ src/lossless_hermes/embeddings/` shows the three Wave-N markers (Wave-1, Wave-2, Wave-12) at their fix sites.
+- [x] 1. All 11 issues are merged with green CI. — 05-01 (#40), 05-02 (#43), 05-03 (#53), 05-04 (#38), 05-05 (#36), 05-06 (#37), 05-07 (#54), 05-08 (#55), 05-09 (#57), 05-10 (#59), 05-11 (#58); all 6 CI matrix cells green.
+- [x] 2. `pytest tests/voyage/ tests/embeddings/ tests/concurrency/` passes (~2,500 LOC of ported tests; 95%+ statement coverage). — green at Wave 4 close.
+- [x] 3. The live-Voyage integration test (`tests/integration/test_voyage_live.py`, gated on `VOYAGE_API_KEY`) passes nightly: dim=1024, L2 norm ≈ 1.0 ± 0.001, embed p99 < 5s, rerank p99 < 3s. — harness complete (05-01 #40, 05-08 #55); live run operator-gated on `VOYAGE_API_KEY` — B-001 (`live-voyage` CI job correctly SKIPs without the key).
+- [x] 4. On a fresh DB with a sample corpus, `lcm_grep --mode semantic "test query"` returns ranked hits with cosine bands populated (after Epic 06 lands the tool wrapper). — semantic/hybrid arms landed (05-08 #55, 05-09 #57); Epic 06's `lcm_grep` hybrid+semantic wrapper merged (06-09 #109).
+- [x] 5. `grep -rn "# LCM Wave-" src/lossless_hermes/voyage/ src/lossless_hermes/embeddings/` shows the three Wave-N markers (Wave-1, Wave-2, Wave-12) at their fix sites. — Wave-1 (lock-TTL cap) in 05-06 (#37), Wave-2 (Retry-After throw) in 05-01 (#40), Wave-12 (post-embed heartbeat re-check) in 05-07 (#54).

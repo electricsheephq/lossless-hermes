@@ -1,5 +1,7 @@
 # Epic 06 — Agent Tools
 
+**Status: closed** — all 15 in-scope issues merged (PRs #82, #87–#88, #95, #97–#104, #107, #109–#110); v0.1.0 release gate. (`lcm_expand_query` remains deferred to v2 per ADR-012, as scoped — not a gap.)
+
 Port the LCM agent-tool surface to Python. The tools are the model-facing API: every Hermes provider call advertises them via `LCMEngine.get_tool_schemas()`, every tool-use response is dispatched through `LCMEngine.handle_tool_call(name, args, **kwargs) -> str`. This is the surface on which agent behaviour stands or falls — every description string is load-bearing prose, every refusal path is a documented contract.
 
 See [`docs/porting-guides/tools.md`](../../docs/porting-guides/tools.md) for the full per-tool specification.
