@@ -108,8 +108,8 @@ def _resolve_db_path(engine: Any) -> Path:
     so this is hardening, not an attack-surface fix; it keeps the path a
     DB-bring-up code path can reason about and matches the omission
     ``hermes-lcm`` closed in their #161 (see issue #65 + the
-    architecture-review comment, and ``tests/test_path_resolution.py`` /
-    ``tests/test_path_containment.py`` for the regression coverage).
+    architecture-review comment, and ``tests/test_path_resolution.py``
+    for the regression coverage).
 
     Args:
         engine: The :class:`LCMEngine` instance (typed ``Any`` to avoid a
