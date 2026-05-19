@@ -5,6 +5,37 @@ All notable changes to `lossless-hermes` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-05-19
+
+Patch release. Fixes two production bugs surfaced by an architecture review
+against the sibling project `hermes-lcm`.
+
+### Fixed
+
+- **Mid-session model switch no longer crashes.** Hermes-agent's
+  `run_agent.py` calls `context_compressor.update_model(...)` at seven
+  sites; two of them — the LM-Studio context preload and the in-place
+  `/model` switch — pass an extra `api_mode=` keyword. The `ContextEngine`
+  ABC's default `update_model` does not declare `api_mode`, and `LCMEngine`
+  did not override the method, so every `/model` switch raised
+  `TypeError: update_model() got an unexpected keyword argument 'api_mode'`.
+  `LCMEngine` now overrides `update_model` to absorb `api_mode` (plus a
+  `**kwargs` forward-compat sink) and delegates the `context_length` /
+  `threshold_tokens` recalculation to the ABC default.
+- **Recall-policy prompt no longer advertises an unregistered tool.** The
+  `LOSSLESS_RECALL_POLICY_PROMPT` text — injected into the model's context
+  every turn via the `pre_llm_call` hook — named `lcm_expand_query` in the
+  escalation ladder, a dedicated usage block, the scope-selection rules, and
+  the precision flow. Per [ADR-012](./docs/adr/012-subagent-defer.md) that
+  tool is deferred to v0.2.0 and is not registered, so the model was told
+  every turn to call a tool absent from its tool list. Every reference is
+  rewritten to route deep recall through `lcm_describe`'s one-hop
+  `expandChildren` / `expandMessages` flags (the registered path). The
+  byte-verbatim tool-schema descriptions in `tools/grep.py` / `describe.py` /
+  `expand.py` are intentionally left unchanged — their `lcm_expand_query`
+  mentions are a deliberate, [ADR-016](./docs/adr/016-typebox-translation.md)-tested
+  state and are secondary follow-up hints inside already-registered tools.
+
 ## [0.1.0] — 2026-05-19
 
 First release. `lossless-hermes` is a feature-complete Python port of
@@ -63,4 +94,5 @@ First release. `lossless-hermes` is a feature-complete Python port of
   step (`docs/benchmarks/voyage-recall-2026-q2.md`).
 - Native Windows is out of scope; use WSL2.
 
+[0.1.1]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.1
 [0.1.0]: https://github.com/electricsheephq/lossless-hermes/releases/tag/v0.1.0
