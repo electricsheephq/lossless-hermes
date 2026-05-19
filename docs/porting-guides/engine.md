@@ -179,7 +179,7 @@ What makes this file the heart of the system: it owns the **decision logic** for
 - **Returns:** `{ changed, bytesFreed, rewrittenEntries, reason? }`.
 - **Python mapping:** **No direct equivalent — split into two pieces:**
   - **Deferred-debt consumption** → **background asyncio task** started at engine init. Polls `compactionMaintenanceStore` every N seconds, calls `consumeDeferredCompactionDebt`. Alternatively: fire on `pre_llm_call` (consume any pending debt before the next turn). Pick one, document the trade-off.
-  - **Transcript GC** → **DROP** entirely. Hermes has no JSONL transcript to GC. The session.db has its own retention.
+  - **Transcript GC** → **DROP** entirely. **[Reason corrected 2026-05-19, issue #137 / review slice S8:** the original reason here — "Hermes has no JSONL transcript to GC" — is **wrong**. Transcript-GC is not JSONL-specific: the sibling `hermes-lcm` runs a transcript-GC that rewrites SQLite rows, and Hermes's `session.db` is rewritable. The drop is still correct, but because `lossless-hermes` has **no inline oversized-tool-result bloat to collect** (LCM storage already keeps large payloads out of the message rows), so a transcript-GC pass would reclaim nothing. The `session.db` also has its own retention.**]**
 - **Confidence:** 70% — `maintain` is the messiest method to remap because OpenClaw's host-driven scheduling doesn't have a Hermes equivalent.
 
 ### prepareSubagentSpawn(params), onSubagentEnded(params)

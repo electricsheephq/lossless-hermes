@@ -6,6 +6,29 @@
 **Supersedes:** —
 **Superseded by:** —
 
+> **Errata (2026-05-19, issue [#137](https://github.com/electricsheephq/lossless-hermes/issues/137)):**
+> This ADR states in two places (§Decision, §Consequences) that the ingest
+> dedup guard rests on a `UNIQUE` constraint on `messages.identity_hash`.
+> **The shipped schema does not have that constraint.** The schema in
+> `src/lossless_hermes/db/migration.py` is **authoritative**, and it defines:
+> - on the `messages` table: `UNIQUE (conversation_id, seq)` — the only
+>   `UNIQUE` constraint on that table — and `identity_hash TEXT` as a plain,
+>   nullable column;
+> - `messages_conv_identity_hash_idx` — a **plain (non-unique)**
+>   `CREATE INDEX` on `(conversation_id, identity_hash)`.
+>
+> There is **no `UNIQUE` index or constraint on `identity_hash`** in the
+> shipped schema. References below to an "`identity_hash` UNIQUE constraint"
+> are inaccurate and should be read as "the plain `identity_hash` index plus
+> the application-level dedup lookup." The dedup guard therefore relies on the
+> code-path check (an explicit existence query before insert), not on a
+> database uniqueness constraint — which has correctness implications under
+> concurrent ingest. This errata is informational; the schema is not changed
+> here. See issue [#130](https://github.com/electricsheephq/lossless-hermes/issues/130)
+> ("Ingest cursor not persisted — gateway restart silently duplicates the
+> whole transcript") for the related ingest-deduplication hardening, which is
+> where any decision to *add* a real `UNIQUE` index on `identity_hash` belongs.
+
 ## Context
 
 LCM's `ingest()` / `ingestBatch()` (TS `src/engine.ts:5899–6134`) must observe every new message that lands in the Hermes conversation. In OpenClaw, the host runtime explicitly called `engine.ingest({ message })` at every message-append site. Hermes has no such call. The `ContextEngine` ABC (`agent/context_engine.py`) exposes lifecycle methods (`update_from_response`, `should_compress`, `compress`, `on_session_start`, `on_session_end`, `on_session_reset`) but **no per-message ingest hook**.
@@ -59,7 +82,7 @@ Chosen: **Option B (primary) + Option C (safety net)**
 
 Register `post_llm_call` as the per-turn ingest hook. Diff `conversation_history[last_seen_message_idx[session_id]:]` and ingest each new message via `_ingest_batch`. Update `last_seen_message_idx[session_id]` to `len(conversation_history)` after a successful ingest.
 
-Additionally, inside `ContextEngine.handle_tool_call(name, args, **kwargs)`, run the same diff routine using `kwargs["messages"]` before dispatching the LCM tool. This catches tool-only turns that call an LCM tool. The two paths share the dedup guard (Wave-4 P0 fix: atomic transaction + `identity_hash` UNIQUE constraint), so double-firing is a no-op.
+Additionally, inside `ContextEngine.handle_tool_call(name, args, **kwargs)`, run the same diff routine using `kwargs["messages"]` before dispatching the LCM tool. This catches tool-only turns that call an LCM tool. The two paths share the dedup guard (Wave-4 P0 fix: atomic transaction + an `identity_hash` dedup check), so double-firing is a no-op. **[Errata — see top of doc:** the shipped schema has **no** `UNIQUE` constraint on `identity_hash`; the dedup guard is an application-level existence check, not a DB uniqueness constraint. The only `UNIQUE` on `messages` is `UNIQUE (conversation_id, seq)`.**]**
 
 ## Rationale
 
@@ -74,7 +97,7 @@ This option drops ~1500 LOC of TS bootstrap/JSONL-replay code from the port (eng
 - **Per-turn latency:** Slightly higher than per-append ingest. Each turn now does one batched ingest instead of N per-message ingests. For typical 1–5 messages per turn this is a wash; for tool-heavy turns (10–20 tool calls) the batch is more efficient.
 - **Coverage gap for interrupted turns:** Ctrl-C mid-turn means `post_llm_call` does NOT fire (`run_agent.py:15407` gates on `final_response and not interrupted`). The next turn's `post_llm_call` will re-snapshot from the new `last_seen_message_idx` and pick up the interrupted-turn messages on the NEXT successful ingest. There may be a window during which the interrupted partial-turn is unreachable to LCM (no assemble can substitute it). Mitigation: also hook `on_session_end` (per-turn fire at `run_agent.py:15525`) to flush a final snapshot.
 - **State invariant:** `last_seen_message_idx[session_id]` MUST be reset on `on_session_reset` (`/new` or `/reset`) and on session-replacement to avoid index drift. Engine owns this.
-- **Identity hash invariant:** `identity_hash` is computed per message and is the UNIQUE constraint on `messages.identity_hash`. Round-trip byte-identical with the Node implementation (spike 003), so re-ingest is safe.
+- **Identity hash invariant:** `identity_hash` is computed per message and round-trips byte-identical with the Node implementation (spike 003), so re-ingest is safe. **[Errata — see top of doc:** this bullet originally claimed `identity_hash` "is the UNIQUE constraint on `messages.identity_hash`." It is **not** — the shipped schema (`db/migration.py`, authoritative) has only a plain index `messages_conv_identity_hash_idx` on `(conversation_id, identity_hash)` and the table-level `UNIQUE (conversation_id, seq)`. Re-ingest safety rests on the application-level dedup check, not on a database `UNIQUE` constraint; see issue #130.**]**
 
 ## Open questions / 5% uncertainty
 

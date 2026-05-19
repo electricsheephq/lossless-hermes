@@ -177,9 +177,22 @@ Per ADRs:
 - **`lcm_expand_query` tool** — deferred to v2 ([ADR-012](./docs/adr/012-subagent-defer.md))
 - **#628 stub-tier substitution** — deferred to v0.2.0 ([ADR-030](./docs/adr/030-pr-628-stub-tier-deferred.md))
 - **`prepareSubagentSpawn` / `subagentEnded` lifecycle** — deferred ([ADR-012](./docs/adr/012-subagent-defer.md))
-- **Transcript-GC (`rewriteTranscriptEntries`)** — dropped (Hermes has no JSONL to rewrite)
+- **Transcript-GC (`rewriteTranscriptEntries`)** — dropped (no inline oversized-tool-result bloat to collect; see note below — the reason is *not* "Hermes has no JSONL")
 - **Auto-rotate session files** — dropped (Hermes uses SQLite session.db, not JSONL)
 - **Themes / procedures / intentions / purge_rebuild_queue tables** — removed in LCM's first-principles pass; not ported
+
+> **Note on the transcript-GC drop reason (corrected 2026-05-19 — review slice S8):**
+> The transcript-GC drop is **correct**, but the reason previously stated —
+> "Hermes has no JSONL to rewrite" — is **wrong**. Transcript-GC is not
+> JSONL-specific: the sibling `hermes-lcm` runs a transcript-GC that rewrites
+> **SQLite rows**, so a SQLite-backed host is perfectly capable of being
+> transcript-GC'd, and Hermes *does* have a rewritable store (`session.db`).
+> The actual reason the drop is correct for `lossless-hermes` is that there is
+> **no inline oversized-tool-result bloat to collect** — LCM's own storage
+> already keeps large payloads out of the message rows, so a transcript-GC
+> pass would have nothing to reclaim. The drop stands; only the stated
+> rationale is corrected. (GitHub issue
+> [electricsheephq/lossless-hermes#137](https://github.com/electricsheephq/lossless-hermes/issues/137).)
 
 ## v0.2.0 scope (next release after v0.1.0)
 

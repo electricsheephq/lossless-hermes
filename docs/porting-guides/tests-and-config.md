@@ -252,7 +252,7 @@ Three categories: **LCM-controlled** (overrides `LcmConfig` fields, 49 vars), **
 | `LCM_CONTEXT_THRESHOLD` | `contextThreshold` | `0.75` | 0–1 |
 | `LCM_FRESH_TAIL_COUNT` | `freshTailCount` | `64` | |
 | `LCM_FRESH_TAIL_MAX_TOKENS` | `freshTailMaxTokens` | (undefined) | |
-| `LCM_PROMPT_AWARE_EVICTION_ENABLED` | `promptAwareEviction` | `false` | **opt-in only** (breaks pyramid invariant — see config.ts comment) |
+| `LCM_PROMPT_AWARE_EVICTION_ENABLED` | `promptAwareEviction` | `false` | **opt-in only** (breaks summary-DAG invariant — see config.ts comment) |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `newSessionRetainDepth` | `2` | |
 | `LCM_LEAF_MIN_FANOUT` | `leafMinFanout` | `8` | |
 | `LCM_CONDENSED_MIN_FANOUT` | `condensedMinFanout` | `4` | |

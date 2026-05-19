@@ -5,7 +5,7 @@
 
 ## One-paragraph summary
 
-`lossless-hermes` is a **Python port** of [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) — a Lossless Context Management plugin — from its native TypeScript/OpenClaw runtime to the Python/Hermes-agent runtime. It is distributed as a Hermes plugin (entry-point group `hermes_agent.plugins`) that registers a `ContextEngine` subclass plus a `/lcm` slash command. The plugin owns its own SQLite database at `$HERMES_HOME/lossless-hermes/lcm.db` (27 tables, FTS5 + sqlite-vec), maintains a lossless pyramid (raw messages → leaf summaries → condensed summaries) of conversation history, and exposes 7 agent tools (deferring `lcm_expand_query` to v2 per [ADR-012](./docs/adr/012-subagent-defer.md)) for recall, synthesis, and entity lookup.
+`lossless-hermes` is a **Python port** of [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) — a Lossless Context Management plugin — from its native TypeScript/OpenClaw runtime to the Python/Hermes-agent runtime. It is distributed as a Hermes plugin (entry-point group `hermes_agent.plugins`) that registers a `ContextEngine` subclass plus a `/lcm` slash command. The plugin owns its own SQLite database at `$HERMES_HOME/lossless-hermes/lcm.db` (27 tables, FTS5 + sqlite-vec), maintains a lossless **depth-aware summary DAG** (raw messages → leaf summaries → condensed summaries) of conversation history, and exposes 7 agent tools (deferring `lcm_expand_query` to v2 per [ADR-012](./docs/adr/012-subagent-defer.md)) for recall, synthesis, and entity lookup.
 
 ## Why this exists
 
@@ -16,7 +16,7 @@
 
 ## What "lossless" means
 
-Raw `messages` rows and `summaries.kind='leaf'` rows are **never byte-deleted** during normal operation. The pyramid is built on top, not in place of. Operator deletes are soft (`suppressed_at` column, filtered through 10+ read paths). Agent-visible recall via `lcm_grep --mode verbatim` always returns the original message text.
+Raw `messages` rows and `summaries.kind='leaf'` rows are **never byte-deleted** during normal operation. The depth-aware summary DAG is built on top, not in place of. Operator deletes are soft (`suppressed_at` column, filtered through 10+ read paths). Agent-visible recall via `lcm_grep --mode verbatim` always returns the original message text.
 
 ## High-level system diagram
 
@@ -109,7 +109,7 @@ Raw `messages` rows and `summaries.kind='leaf'` rows are **never byte-deleted** 
 ### LCM internal data contract
 
 - **Identity:** `identity_hash = sha256(role + 0x00 + content)` — byte-identical TS/Go/Python (verified by [spike 003](./docs/spike-results/003-identity-hash.md))
-- **Pyramid invariant:** `messages` and `summaries.kind='leaf'` are append-only + soft-suppress; `summaries.kind='condensed'` may be superseded by deeper passes
+- **Summary-DAG invariant:** `messages` and `summaries.kind='leaf'` are append-only + soft-suppress; `summaries.kind='condensed'` may be superseded by deeper passes
 - **Context manifest:** `context_items` row sequence drives what the assembler sees
 - **Embedding contract:** only `summaries.kind='leaf'` are embedded (Voyage `voyage-4-large`, 1024-dim, into per-model `vec0` virtual tables)
 - **Cache contract:** `lcm_synthesis_cache` keyed by 7-tuple `(session_key, range_start, range_end, leaf_fingerprint, grep_filter, tier_label, prompt_id)` per [Wave-10 P1 fix](./docs/adr/029-wave-fix-provenance.md)
