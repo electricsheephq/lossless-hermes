@@ -107,20 +107,29 @@ from lossless_hermes.tools import get_tool_schemas
 # Skip marker — actions/setup-python macOS builds lack enable_load_extension
 # ---------------------------------------------------------------------------
 # Mirrors ``tests/test_handle_tool_call_ingest.py`` and
-# ``tests/test_engine_ingest.py``: the (b)/(c) assertions run
-# ``handle_tool_call`` on top of ``on_session_start``'s opened DB, which
-# needs a full ``open_lcm_db`` connection (sqlite-vec loads via
-# ``enable_load_extension``). Apple's system Python ships without
-# ``--enable-loadable-sqlite-extensions``; the engine-fixture tests skip
-# there. The pure-registry assertion (a) and ``test_lcm_expand_deferred``
-# do NOT need the DB — they are split out so they always run.
+# ``tests/test_engine_ingest.py``: assertions (b) and (c) run
+# ``handle_tool_call`` on the ``engine`` fixture, which calls
+# ``on_session_start`` and so needs a full ``open_lcm_db`` connection
+# (sqlite-vec loads via ``enable_load_extension``). Apple's system Python
+# ships without ``--enable-loadable-sqlite-extensions``, and the engine
+# hard-raises a ``RuntimeError`` at construction on such a build — so the
+# ``engine``-fixtured tests skip there.
+#
+# Tests that do NOT use the ``engine`` fixture run on every platform:
+#   * assertion (a) — a pure ``TOOL_DISPATCH`` registry check.
+#   * ``test_lcm_expand_deferred`` / ``test_advertised_surface_*`` —
+#     pure ``get_tool_schemas()`` / registry checks.
+#   * ``test_crash_hardening_*`` — use a **bare** ``LCMEngine()`` (no
+#     ``on_session_start``); the crash-hardening seam in
+#     ``_dispatch_tool_call`` is DB-independent.
 _skip_no_extension_loading = pytest.mark.skipif(
     not hasattr(sqlite3.Connection, "enable_load_extension"),
     reason=(
         "actions/setup-python on macOS ships a CPython build without "
-        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load. The "
-        "engine-fixtured dispatch assertions skip here (the registry-only "
-        "assertion still runs)."
+        "--enable-loadable-sqlite-extensions; sqlite-vec cannot load and "
+        "the engine hard-raises at construction. The engine-fixtured "
+        "dispatch assertions skip here (the registry-only and bare-engine "
+        "tests still run)."
     ),
 )
 
@@ -316,9 +325,7 @@ def test_handle_tool_call_returns_str_and_never_raises(
     json.loads(result)
 
 
-def test_crash_hardening_converts_handler_exception_to_tool_error(
-    engine: LCMEngine,
-) -> None:
+def test_crash_hardening_converts_handler_exception_to_tool_error() -> None:
     """A handler that raises is converted to a structured tool-error.
 
     Directly exercises PR-0 deliverable (1): register a deliberately
@@ -327,11 +334,18 @@ def test_crash_hardening_converts_handler_exception_to_tool_error(
     invariant that makes the #156 incremental adapter rollout safe (an
     un-adapted / mis-wired tool degrades to "tool said no", not a turn
     crash).
+
+    Uses a **bare** ``LCMEngine()`` (no ``on_session_start``) — the
+    crash-hardening lives in ``_dispatch_tool_call`` and never touches
+    the DB, so this test needs no opened-DB fixture and therefore runs
+    on every platform (it does NOT carry ``_skip_no_extension_loading``).
+    Mirrors ``tests/test_tool_dispatch.py``'s bare-engine pattern.
     """
 
     def _boom(_args: dict[str, Any], **_kwargs: Any) -> str:
         raise RuntimeError("simulated handler crash")
 
+    engine = LCMEngine()
     sentinel = object()
     previous: Any = TOOL_DISPATCH.get("lcm_status", sentinel)
     TOOL_DISPATCH["lcm_status"] = _boom
@@ -354,9 +368,7 @@ def test_crash_hardening_converts_handler_exception_to_tool_error(
     )
 
 
-def test_crash_hardening_converts_typeerror_signature_mismatch(
-    engine: LCMEngine,
-) -> None:
+def test_crash_hardening_converts_typeerror_signature_mismatch() -> None:
     """A signature-mismatch ``TypeError`` is converted, not escaped.
 
     The #156 root cause: the ported handlers have strict keyword-only
@@ -367,11 +379,16 @@ def test_crash_hardening_converts_typeerror_signature_mismatch(
     test registers a handler with exactly that too-strict shape and
     confirms PR-0's wrapper catches the ``TypeError`` — so the
     incremental adapter rollout cannot crash a turn.
+
+    Uses a **bare** ``LCMEngine()`` (no ``on_session_start``) for the
+    same reason as the sibling test above — the crash-hardening seam is
+    DB-independent, so this runs on every platform.
     """
 
     def _too_strict(_args: dict[str, Any]) -> str:  # no **kwargs sink
         return "{}"  # pragma: no cover — never reached; the call TypeErrors
 
+    engine = LCMEngine()
     sentinel = object()
     previous: Any = TOOL_DISPATCH.get("lcm_doctor", sentinel)
     TOOL_DISPATCH["lcm_doctor"] = _too_strict  # type: ignore[assignment]
