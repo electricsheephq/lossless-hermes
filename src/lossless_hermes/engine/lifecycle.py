@@ -85,14 +85,14 @@ logger = logging.getLogger("lossless_hermes.engine.lifecycle")
 
 
 def _resolve_db_path(engine: Any) -> Path:
-    """Return the absolute path to ``lcm.db`` for ``engine``.
+    """Return the absolute, fully-resolved path to ``lcm.db`` for ``engine``.
 
     Resolves per ADR-002 §"Option A: ``$HERMES_HOME/lossless-hermes/``":
 
     1. If ``engine.config.database_path`` is a non-empty string, use it
-       verbatim (operators may override the canonical location via
-       env / ``config.yaml``; the resolver in :mod:`db.config` already
-       fills in the default for production callers).
+       (operators may override the canonical location via env /
+       ``config.yaml``; the resolver in :mod:`db.config` already fills
+       in the default for production callers). ``~`` is expanded.
     2. Otherwise, fall back to
        ``engine.hermes_home / "lossless-hermes" / "lcm.db"`` — the
        ADR-002 canonical path. This branch fires when the engine was
@@ -100,18 +100,37 @@ def _resolve_db_path(engine: Any) -> Path:
        where ``database_path`` defaults to ``""`` per
        :class:`LcmConfig` §"Top-level scalars".
 
+    Both branches end in :meth:`Path.resolve` so the returned path is
+    always absolute and free of ``..`` traversal segments / symlink
+    indirection — the path is canonicalized before it reaches
+    :func:`open_lcm_db`'s ``mkdir -p``. ``database_path`` and
+    ``hermes_home`` are operator-config-controlled (not attacker input),
+    so this is hardening, not an attack-surface fix; it keeps the path a
+    DB-bring-up code path can reason about and matches the omission
+    ``hermes-lcm`` closed in their #161 (see issue #65 + the
+    architecture-review comment, and ``tests/test_path_resolution.py``
+    for the regression coverage).
+
     Args:
         engine: The :class:`LCMEngine` instance (typed ``Any`` to avoid a
             circular import from the lifecycle mixin module back into
             the shell class).
 
     Returns:
-        Absolute :class:`pathlib.Path` to the ``lcm.db`` file.
+        Absolute, fully-resolved :class:`pathlib.Path` to the ``lcm.db``
+        file.
     """
     configured = (engine.config.database_path or "").strip()
     if configured:
-        return Path(configured).expanduser()
-    return Path(engine.hermes_home) / "lossless-hermes" / "lcm.db"
+        # issue #65: ``.resolve()`` collapses ``..`` segments and
+        # symlink indirection so an operator-supplied relative or
+        # non-canonical ``database_path`` becomes a stable absolute path.
+        return Path(configured).expanduser().resolve()
+    # issue #65: same ``.resolve()`` on the canonical-fallback branch —
+    # ``hermes_home`` is itself operator-controlled (env / constructor),
+    # so the canonical path is canonicalized for consistency with the
+    # configured-override branch above.
+    return (Path(engine.hermes_home) / "lossless-hermes" / "lcm.db").resolve()
 
 
 class _LifecycleMixin:
