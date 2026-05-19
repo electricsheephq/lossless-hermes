@@ -5,8 +5,9 @@ branch ``pr-613``, 1179 LOC TS). The TypeBox-declared schema lives at TS
 lines 43-125; the handler body at lines 191-440 (the ``execute`` closure);
 ``runVerbatimLcmGrep`` at lines 947-1161; ``runHybridLcmGrep`` at lines
 474-760; ``runSemanticLcmGrep`` at lines 776-935. All are translated
-structurally verbatim per ADR-016 (description prose byte-identical from
-TS source).
+structurally verbatim per ADR-016. **Exception (ADR-033):** the tool
+``description`` prose is deliberately edited away from the verbatim TS
+source — see :data:`LCM_GREP_DESCRIPTION` and the "ADR-033" section below.
 
 What this tool does
 -------------------
@@ -25,14 +26,30 @@ single schema:
    Bypasses the store layer and runs a custom FTS5/LIKE query against
    ``messages`` so the local ``sanitize_fts5_pattern`` rewrites apply
    (TS lines 154-178).
-4. ``hybrid`` — FTS5 + Voyage semantic + Voyage rerank-2.5. PRIMARY for
-   topic-anchored queries. Wraps :func:`run_hybrid_search` from issue
-   05-09 with a tool-side FTS adapter that goes through
+4. ``hybrid`` — FTS5 + Voyage semantic + Voyage rerank-2.5. **Opt-in /
+   off by default** (ADR-033): offered only when ``embeddings_enabled``
+   is set. Wraps :func:`run_hybrid_search` from issue 05-09 with a
+   tool-side FTS adapter that goes through
    :meth:`SummaryStore.search_summaries`.
 5. ``semantic`` — pure-vector KNN over Voyage-embedded summaries (no
-   rerank, cheaper than hybrid). Wraps :func:`run_semantic_search` from
-   issue 05-08; scoped to summaries only because semantic doesn't index
-   raw messages.
+   rerank, cheaper than hybrid). **Opt-in / off by default** (ADR-033),
+   same as ``hybrid``. Wraps :func:`run_semantic_search` from issue
+   05-08; scoped to summaries only because semantic doesn't index raw
+   messages.
+
+ADR-033 — embeddings opt-in / off by default
+---------------------------------------------
+
+Per [ADR-033](../../docs/adr/033-embeddings-default-posture.md) (Accepted,
+issue #133), ``hybrid`` and ``semantic`` are an **opt-in** capability that
+is **off by default**. The handler refuses both modes with an
+operator-actionable error unless :attr:`GrepContext.embeddings_enabled`
+is ``True`` (the engine sources this from ``LcmConfig.embeddings_enabled``).
+The keyless-functional default retrieval path is ``full_text`` / ``regex``
+/ ``verbatim`` + the ``lcm_describe`` / ``lcm_expand_query`` drill-down
+chain. ADR-033 also demotes the ``hybrid`` "PRIMARY" claim from the tool
+``description`` — that prose change is the documented exception to ADR-016's
+verbatim rule (the verbatim-lint fixture is re-snapshotted to match).
 
 Wave-12 F5 invariant — middleware-not-decorator
 -----------------------------------------------
@@ -69,6 +86,8 @@ a narrow ``GrepContext`` Protocol that exposes:
 * ``conversation_store: ConversationStore`` — for regex / full_text
   searches over ``messages`` AND for the conversation-scope resolver.
 * ``timezone: str`` — passed through to the timestamp formatter.
+* ``embeddings_enabled: bool`` — ADR-033 opt-in flag; when ``False``
+  (the default) ``hybrid`` / ``semantic`` modes are refused.
 
 References
 ----------
@@ -77,7 +96,11 @@ References
 * Porting guide: ``docs/porting-guides/tools.md`` §"lcm_grep".
 * Issue spec: ``epics/06-tools/06-08-lcm-grep-regex-fulltext.md``.
 * [ADR-016](../../docs/adr/016-typebox-translation.md) — TypeBox
-  hand-translate policy (description prose byte-identical).
+  hand-translate policy (description prose byte-identical; ADR-033
+  supersedes this for the ``lcm_grep`` description specifically).
+* [ADR-033](../../docs/adr/033-embeddings-default-posture.md) —
+  embeddings opt-in / off by default; demotes the ``hybrid`` "PRIMARY"
+  prose. Issue #133.
 * [ADR-029](../../docs/adr/029-wave-fix-provenance.md) — Wave-12 F5
   (middleware-not-decorator), Wave-12 N3 (truncation regex pin).
 * TS test fixture: ``test/lcm-grep-verbatim-mode.test.ts`` (435 LOC).
@@ -148,19 +171,36 @@ __all__ = (
 # strings at lines 43-125. The mechanical TypeBox → dict translation uses
 # the helpers in `_typebox.py`.
 
+# ADR-033: this description is DELIBERATELY edited away from the verbatim
+# TS source. ADR-033 (Accepted, 2026-05-19, issue #133) supersedes ADR-016's
+# "match-TS-verbatim" default *for this specific prose*: it demotes the
+# `hybrid` "PRIMARY for Type B" claim (the +52.5pp lift it rested on was
+# never measured here, and hybrid hard-fails keyless) and makes the keyless-
+# functional FTS5 + drill-down chain the standard steer. The verbatim-lint
+# fixture (tests/fixtures/lcm_v4.1_tool_descriptions.json) is re-snapshotted
+# in the same change so `test_descriptions_verbatim.py` passes — that
+# re-snapshot IS the intended workflow for a deliberate ADR-driven prose
+# change. See ADR-033 §Consequences (first bullet) for the exact mandate.
 LCM_GREP_DESCRIPTION: Final[str] = (
     "Search compacted conversation history with FIVE modes (`mode` parameter): "
     "(1) `regex` — literal or regex pattern over summary content; "
     "(2) `full_text` — FTS5 keyword search; queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics; "
-    "(3) `hybrid` — FTS5 + Voyage semantic + rerank (PRIMARY for Type B topic-anchored queries: 'have we ever discussed X', 'what work has been done on Y' — handles paraphrases like 'merge mess' → 'rebase blew up'); "
-    "(4) `semantic` — pure-vector KNN over summaries via Voyage embed (no rerank, cheaper than hybrid). Use for paraphrastic exploration where keyword precision doesn't matter; "
+    "(3) `hybrid` — FTS5 + Voyage semantic + rerank; available only when embeddings are enabled (opt-in: set `embeddings_enabled` and provision a Voyage API key) — handles paraphrases like 'merge mess' → 'rebase blew up'; "
+    "(4) `semantic` — pure-vector KNN over summaries via Voyage embed (no rerank, cheaper than hybrid); available only when embeddings are enabled. Use for paraphrastic exploration where keyword precision doesn't matter; "
     "(5) `verbatim` — returns FULL untruncated source messages (PRIMARY for Type C verbatim/citation queries: 'what exactly did X say about Y', 'quote me the original wording'). "
+    "For topic-anchored queries ('have we ever discussed X', 'what work has been done on Y'), the standard path is `full_text` followed by lcm_describe / lcm_expand_query drilldown — this works with no external dependencies. `hybrid` and `semantic` are an opt-in capability and are not offered unless embeddings are enabled. "
     "Optional `summaryKinds` filter (mode='semantic' / 'hybrid' only) scopes hits to ['leaf'] or ['condensed'] — useful when you want fresh source leaves vs higher-level rollups. "
     "Returns matching snippets with summary/message IDs for follow-up with lcm_describe (one-hop) or lcm_expand_query (multi-hop drilldown). "
     "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn."
 )
-"""Verbatim from ``lcm-grep-tool.ts:196-204``. Per ADR-016 §Consequences
-this is the load-bearing model-facing prose that drives tool selection."""
+"""Model-facing prose that drives tool selection.
+
+ADR-033 (issue #133): originally verbatim from ``lcm-grep-tool.ts:196-204``
+per ADR-016 §Consequences, this prose is now **deliberately edited** — the
+``hybrid`` "PRIMARY for Type B" steer is demoted and ``hybrid``/``semantic``
+are described as an opt-in capability (available only when embeddings are
+enabled). ADR-016's verbatim rule yields to ADR-033 for this specific
+string; the verbatim-lint fixture is re-snapshotted in the same change."""
 
 
 LCM_GREP_SCHEMA: Final[dict[str, Any]] = tool_schema(
@@ -387,6 +427,14 @@ class GrepContext(Protocol):
       (TS lines 626-627 ``voyageMaxRetries`` / ``voyageTimeoutMs``). The
       grep tool never constructs its own client; it consumes whatever the
       engine wired at session-start.
+    * ``embeddings_enabled``: ADR-033 opt-in flag. The engine sources
+      this from :attr:`LcmConfig.embeddings_enabled` (default ``False``).
+      When ``False``, :func:`handle_lcm_grep` refuses ``mode='hybrid'``
+      and ``mode='semantic'`` *before* touching Voyage or vec0, with an
+      operator-actionable error pointing at the ``full_text`` default.
+      This gate is checked first — even an operator with a valid Voyage
+      key gets the modes only after explicitly opting in (ADR-033
+      §Open-Q2: "both-required is the most explicit").
     """
 
     conn: sqlite3.Connection
@@ -394,6 +442,7 @@ class GrepContext(Protocol):
     conversation_store: ConversationStore
     timezone: str
     voyage: Optional[VoyageClient]
+    embeddings_enabled: bool
 
 
 @dataclass
@@ -456,6 +505,9 @@ def handle_lcm_grep(
     * Invalid timestamp: ``{"error": "<key> must be a valid ISO timestamp."}``.
     * ``since >= before``: ``{"error": "`since` must be earlier than `before`."}``.
     * No conversation scope: ``{"error": "No LCM conversation found..."}``.
+    * ``mode='hybrid'`` / ``'semantic'`` w/ ``ctx.embeddings_enabled``
+      False: ``{"error": "<mode> mode is disabled..."}`` (ADR-033 — the
+      opt-in gate; checked before the Voyage / vec0 paths below).
     * ``mode='hybrid'`` w/ no VoyageClient OR auth-class VoyageError:
       ``{"error": "Voyage API key is missing or invalid..."}`` (TS line 631).
     * ``mode='semantic'`` w/ vec0 missing:
@@ -564,6 +616,18 @@ def handle_lcm_grep(
         ]
         if cleaned:
             summary_kinds_param = cleaned
+
+    # ----- Embeddings opt-in gate (ADR-033) ---------------------------------
+    # ADR-033 (issue #133): `hybrid` and `semantic` are opt-in and OFF by
+    # default. Refuse both modes here — BEFORE the dispatch helpers touch
+    # the Voyage client or vec0 — unless the operator explicitly enabled
+    # embeddings. This is checked ahead of the missing-Voyage-key path so a
+    # keyless install never even reaches the hard-fail: the agent gets one
+    # coherent "opt-in required" message instead. An operator who set a
+    # Voyage key for another purpose still gets the modes only after
+    # flipping `embeddings_enabled` (ADR-033 §Open-Q2 — both-required).
+    if mode in ("hybrid", "semantic") and not ctx.embeddings_enabled:
+        return _format_embeddings_disabled_error(mode)
 
     # ----- Hybrid mode (TS lines 291-302) -----------------------------------
     if mode == "hybrid":
@@ -864,6 +928,37 @@ def _hit_provenance_tag(hit: Any) -> str:
     if hit.from_fts:
         return "[from FTS only]"
     return "[from semantic only]"
+
+
+def _format_embeddings_disabled_error(mode: str) -> str:
+    """Operator-facing error prose for a disabled-embeddings ``mode`` (ADR-033).
+
+    ADR-033 makes ``hybrid`` / ``semantic`` opt-in and OFF by default. When
+    :attr:`GrepContext.embeddings_enabled` is ``False`` the handler refuses
+    both modes *before* it would touch Voyage or vec0 — so the agent never
+    reaches the keyless hard-fail path by default. The message is
+    structured like the missing-Voyage-key prose: it names the requested
+    mode, states the opt-in requirement, and gives the working fallback
+    (``full_text``) so the agent can retry in one hop.
+
+    Args:
+        mode: The disabled mode the caller requested — ``"hybrid"`` or
+            ``"semantic"``.
+
+    Returns:
+        A :func:`tool_result`-encoded JSON string with an ``error`` key.
+    """
+    return tool_result(
+        {
+            "error": (
+                f"{mode} mode is disabled. Semantic retrieval (hybrid / semantic) "
+                f"is opt-in and off by default (ADR-033) — an operator enables it "
+                f"by setting `embeddings_enabled` in the `lossless_hermes:` config "
+                f"and provisioning a Voyage API key. Use mode='full_text' for "
+                f"keyword search, then lcm_describe / lcm_expand_query to drill down."
+            ),
+        },
+    )
 
 
 def _format_voyage_missing_error(detail: Optional[str] = None) -> str:

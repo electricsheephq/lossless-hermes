@@ -66,6 +66,15 @@ Test-only env vars (``LCM_TEST_VEC0_PATH``, ``REAL_HOME``, ``HOME``,
 
 ### Hermes-specific deviations from TS
 
+* ``embeddings_enabled`` (ADR-033) is a Hermes-only field with **no TS
+  equivalent**. It gates whether ``lcm_grep``'s ``hybrid`` / ``semantic``
+  retrieval modes are offered as a standard path; default ``False``
+  (opt-in / off by default). Env aliases: ``HERMES_EMBEDDINGS_ENABLED``
+  (primary) / ``LCM_EMBEDDINGS_ENABLED`` (legacy), strict ``"true"``
+  semantics. Distinct from ``LCM_DISABLE_SEMANTIC`` (an opt-*out*
+  consumed directly by ``operator/semantic_infra.py``, not ``LcmConfig``)
+  — ADR-033 makes the *default* posture off, so an opt-*in* flag is the
+  primary knob.
 * ``transcript_gc_enabled`` is kept for back-compat (operators
   migrating LCM configs see no surprise) but documented as a no-op on
   Hermes (transcript GC was OpenClaw-specific).
@@ -652,6 +661,20 @@ class LcmConfig(BaseModel):
         default_factory=DynamicLeafChunkTokensConfig,
     )
 
+    # --- Embeddings opt-in (ADR-033) -------------------------------------------
+    # ADR-033: the `hybrid` / `semantic` retrieval modes of `lcm_grep` are
+    # opt-in and OFF by default. With this flag false (the default), those
+    # modes are not offered as a standard path — the keyless-functional
+    # FTS5 (`full_text` / `regex` / `verbatim`) + `lcm_describe` /
+    # `lcm_expand_query` drill-down chain is the default retrieval posture.
+    # An operator turns embeddings on explicitly by setting this flag true
+    # AND provisioning a Voyage key (per ADR-022); a key alone does not
+    # silently enable the modes (ADR-033 §Open-Q2 — "both-required is the
+    # most explicit and avoids surprising an operator who set a Voyage key
+    # for another purpose"). The ~3,500-LOC embeddings stack stays in the
+    # tree — this is a posture flag, not a deletion (ADR-033 §Consequences).
+    embeddings_enabled: bool = False
+
     # --- Voyage credentials (per ADR-022, tier-1 of the three-tier resolver) ---
     voyage_api_key: str | None = None
 
@@ -1144,6 +1167,23 @@ def resolve_lcm_config_with_diagnostics(
     else:
         resolved_act = False
 
+    # Embeddings opt-in — ADR-033. Strict "true" semantics (opt-in flag, like
+    # prompt_aware_eviction / agent_compaction_tool_enabled above — NOT the
+    # ``!== "false"`` variant). Default OFF: `hybrid`/`semantic` are not a
+    # standard retrieval path until an operator explicitly opts in.
+    emb_en_env = _read_env(
+        env,
+        hermes_name="HERMES_EMBEDDINGS_ENABLED",
+        lcm_name="LCM_EMBEDDINGS_ENABLED",
+    )
+    emb_en_pc = _to_bool(_pc_get(pc, "embeddingsEnabled", "embeddings_enabled"))
+    if emb_en_env is not None:
+        resolved_emb_enabled = emb_en_env == "true"
+    elif emb_en_pc is not None:
+        resolved_emb_enabled = emb_en_pc
+    else:
+        resolved_emb_enabled = False
+
     # Auto-rotate enabled — TS uses ``!== "false"`` (any non-"false" ⇒ true).
     ars_en_env = _read_env(
         env,
@@ -1610,6 +1650,8 @@ def resolve_lcm_config_with_diagnostics(
             "enabled": resolved_dlct_enabled,
             "max": resolved_dynamic_max,
         },
+        # ADR-033 — embeddings opt-in flag; default OFF.
+        "embeddings_enabled": resolved_emb_enabled,
         "voyage_api_key": _to_str(pc.get("voyageApiKey")) or _to_str(pc.get("voyage_api_key")),
         # Issue 03-09 — ADR-010 Option A experimental fallback. Resolver
         # accepts both snake_case + camelCase from YAML; bool coercion
@@ -1852,6 +1894,7 @@ _RECOGNIZED_PLUGIN_CONFIG_KEYS: frozenset[str] = frozenset({
     "fallback_providers",
     "cache_aware_compaction",
     "dynamic_leaf_chunk_tokens",
+    "embeddings_enabled",  # ADR-033 — embeddings opt-in flag
     "voyage_api_key",
     "workers",
     # Issue 03-09 — ADR-010 Option A experimental fallback
@@ -1901,6 +1944,7 @@ _RECOGNIZED_PLUGIN_CONFIG_KEYS: frozenset[str] = frozenset({
     "fallbackProviders",
     "cacheAwareCompaction",
     "dynamicLeafChunkTokens",
+    "embeddingsEnabled",  # ADR-033 — embeddings opt-in flag (camelCase alias)
     "voyageApiKey",
     # Issue 03-09 — ADR-010 Option A experimental fallback (camelCase alias)
     "experimentalAlwaysOnViaCompress",

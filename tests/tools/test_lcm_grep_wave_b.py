@@ -172,6 +172,11 @@ class _Ctx:
     ``voyage`` is a :class:`_StubVoyage` (or ``None`` for the missing-key
     tests). Real :class:`VoyageClient` is not constructed — the stub
     duck-types it.
+
+    ``embeddings_enabled`` defaults to ``True`` (ADR-033): Wave-B tests
+    exercise the *post-opt-in* hybrid/semantic dispatch. The off-by-default
+    refusal is covered by the dedicated ADR-033 gate tests, which pass
+    ``embeddings_enabled=False`` explicitly.
     """
 
     conn: sqlite3.Connection
@@ -179,6 +184,7 @@ class _Ctx:
     conversation_store: ConversationStore
     timezone: str = "UTC"
     voyage: object | None = None
+    embeddings_enabled: bool = True  # ADR-033 — see class docstring
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +401,159 @@ class TestMissingVoyageKey:
         assert "semantic mode requires it" in result["error"]
         assert "mode='regex'" in result["error"]
         assert "mode='full_text'" in result["error"]
+
+
+# ===========================================================================
+# ADR-033 (#133) — embeddings opt-in gate: hybrid/semantic OFF by default
+# ===========================================================================
+
+
+class TestEmbeddingsOptInGate:
+    """ADR-033: ``hybrid`` / ``semantic`` are opt-in and OFF by default.
+
+    With ``ctx.embeddings_enabled`` False (the production default), both
+    modes are refused with an operator-actionable error — and crucially,
+    the refusal happens *before* the missing-Voyage-key path, so a keyless
+    install gets one coherent "opt-in required" message instead of the
+    hard-fail-then-recover behavior ADR-033 set out to remove.
+    """
+
+    def test_hybrid_refused_when_embeddings_disabled(
+        self,
+        db_no_vec0: sqlite3.Connection,
+        conv_id_no_vec0: int,
+        deps: LcmDependencies,
+    ) -> None:
+        """``mode='hybrid'`` with ``embeddings_enabled=False`` → disabled error."""
+        del conv_id_no_vec0
+        store = ConversationStore(db_no_vec0, fts5_available=True)
+        sstore = SummaryStore(db_no_vec0, fts5_available=True, trigram_tokenizer_available=False)
+        # voyage is a stub here — proves the gate fires even WITH a usable
+        # client, because the flag (not the key) is what is missing.
+        ctx = _Ctx(
+            conn=db_no_vec0,
+            summary_store=sstore,
+            conversation_store=store,
+            voyage=_StubVoyage(),
+            embeddings_enabled=False,
+        )
+        result = _call({"pattern": "race", "mode": "hybrid"}, ctx=ctx, deps=deps)
+        assert "hybrid mode is disabled" in result["error"]
+        # Names the opt-in mechanism (ADR-033) and the working fallback.
+        assert "embeddings_enabled" in result["error"]
+        assert "ADR-033" in result["error"]
+        assert "mode='full_text'" in result["error"]
+
+    def test_semantic_refused_when_embeddings_disabled(
+        self,
+        db_no_vec0: sqlite3.Connection,
+        conv_id_no_vec0: int,
+        deps: LcmDependencies,
+    ) -> None:
+        """``mode='semantic'`` with ``embeddings_enabled=False`` → disabled error."""
+        del conv_id_no_vec0
+        store = ConversationStore(db_no_vec0, fts5_available=True)
+        sstore = SummaryStore(db_no_vec0, fts5_available=True, trigram_tokenizer_available=False)
+        ctx = _Ctx(
+            conn=db_no_vec0,
+            summary_store=sstore,
+            conversation_store=store,
+            voyage=_StubVoyage(),
+            embeddings_enabled=False,
+        )
+        result = _call({"pattern": "race", "mode": "semantic"}, ctx=ctx, deps=deps)
+        assert "semantic mode is disabled" in result["error"]
+        assert "embeddings_enabled" in result["error"]
+        assert "ADR-033" in result["error"]
+        assert "mode='full_text'" in result["error"]
+
+    def test_gate_fires_before_missing_voyage_key_path(
+        self,
+        db_no_vec0: sqlite3.Connection,
+        conv_id_no_vec0: int,
+        deps: LcmDependencies,
+    ) -> None:
+        """ADR-033 ordering: the disabled-embeddings gate is checked BEFORE
+        the missing-Voyage-key check.
+
+        A keyless install (``voyage=None``) with embeddings off must get the
+        "disabled / opt-in" message — NOT the "VOYAGE_API_KEY missing"
+        message. This is the whole point of ADR-033: the agent never even
+        reaches the keyless hard-fail path by default.
+        """
+        del conv_id_no_vec0
+        store = ConversationStore(db_no_vec0, fts5_available=True)
+        sstore = SummaryStore(db_no_vec0, fts5_available=True, trigram_tokenizer_available=False)
+        ctx = _Ctx(
+            conn=db_no_vec0,
+            summary_store=sstore,
+            conversation_store=store,
+            voyage=None,  # keyless
+            embeddings_enabled=False,  # and not opted in
+        )
+        for mode in ("hybrid", "semantic"):
+            result = _call({"pattern": "race", "mode": mode}, ctx=ctx, deps=deps)
+            # The ADR-033 disabled message, not the TS missing-key message.
+            assert f"{mode} mode is disabled" in result["error"]
+            assert "VOYAGE_API_KEY" not in result["error"]
+            assert f"{mode} mode requires it" not in result["error"]
+
+    def test_enabled_flag_bypasses_gate_and_reaches_voyage_path(
+        self,
+        db_no_vec0: sqlite3.Connection,
+        conv_id_no_vec0: int,
+        deps: LcmDependencies,
+    ) -> None:
+        """With ``embeddings_enabled=True`` the gate is a no-op: dispatch
+        proceeds to the real hybrid/semantic path.
+
+        Proven here via the keyless (``voyage=None``) downstream behavior —
+        the opted-in-but-keyless install correctly reaches the
+        missing-Voyage-key error (TS line 631 / 825), confirming the
+        ADR-033 gate did NOT short-circuit.
+        """
+        del conv_id_no_vec0
+        store = ConversationStore(db_no_vec0, fts5_available=True)
+        sstore = SummaryStore(db_no_vec0, fts5_available=True, trigram_tokenizer_available=False)
+        ctx = _Ctx(
+            conn=db_no_vec0,
+            summary_store=sstore,
+            conversation_store=store,
+            voyage=None,
+            embeddings_enabled=True,  # opted in
+        )
+        hybrid = _call({"pattern": "race", "mode": "hybrid"}, ctx=ctx, deps=deps)
+        assert "hybrid mode requires it" in hybrid["error"]
+        assert "is disabled" not in hybrid["error"]
+        semantic = _call({"pattern": "race", "mode": "semantic"}, ctx=ctx, deps=deps)
+        assert "semantic mode requires it" in semantic["error"]
+        assert "is disabled" not in semantic["error"]
+
+    def test_non_embedding_modes_unaffected_when_embeddings_disabled(
+        self,
+        db_no_vec0: sqlite3.Connection,
+        conv_id_no_vec0: int,
+        deps: LcmDependencies,
+    ) -> None:
+        """The gate touches ONLY hybrid/semantic — ``regex`` / ``full_text``
+        / ``verbatim`` run normally with embeddings off (ADR-033 invariant:
+        the keyless FTS path is always functional and always the default).
+        """
+        del conv_id_no_vec0
+        store = ConversationStore(db_no_vec0, fts5_available=True)
+        sstore = SummaryStore(db_no_vec0, fts5_available=True, trigram_tokenizer_available=False)
+        ctx = _Ctx(
+            conn=db_no_vec0,
+            summary_store=sstore,
+            conversation_store=store,
+            voyage=None,
+            embeddings_enabled=False,
+        )
+        for mode in ("regex", "full_text", "verbatim"):
+            result = _call({"pattern": "race", "mode": mode}, ctx=ctx, deps=deps)
+            # No error key — the FTS-family modes complete (empty corpus is
+            # fine; the point is they are NOT gated).
+            assert "error" not in result, f"mode={mode} should not be gated"
 
 
 # ===========================================================================

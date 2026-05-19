@@ -1066,6 +1066,121 @@ class TestLcmConfigValidation:
 
 
 # ===========================================================================
+# 5b. embeddings_enabled — ADR-033 opt-in flag (Hermes-only, no TS mirror)
+# ===========================================================================
+
+
+class TestEmbeddingsEnabledFlag:
+    """``embeddings_enabled`` — the ADR-033 (issue #133) opt-in flag.
+
+    Per ADR-033, ``lcm_grep``'s ``hybrid`` / ``semantic`` retrieval modes
+    are opt-in and **OFF by default**. This flag is the config knob; it has
+    **no TS equivalent** (so it is intentionally absent from
+    ``_TS_PARITY_TABLE``). Resolution follows the strict-``"true"`` boolean
+    convention of ``prompt_aware_eviction`` / ``agent_compaction_tool_enabled``
+    — env var > plugin config > hardcoded ``False``.
+    """
+
+    def test_default_is_false(self) -> None:
+        """ADR-033 core: with no env / plugin config, embeddings are OFF.
+
+        This is the load-bearing default — a keyless install gets the
+        FTS-first posture, not the hybrid-primary one.
+        """
+        config = resolve_lcm_config({}, {})
+        assert config.embeddings_enabled is False
+
+    def test_model_default_is_false(self) -> None:
+        """The pydantic model default itself (not just the resolver) is False."""
+        assert LcmConfig().embeddings_enabled is False
+
+    def test_plugin_config_snake_case_enables(self) -> None:
+        """``embeddings_enabled: true`` under ``lossless_hermes:`` opts in."""
+        config = resolve_lcm_config({}, {"embeddings_enabled": True})
+        assert config.embeddings_enabled is True
+
+    def test_plugin_config_camel_case_enables(self) -> None:
+        """The camelCase alias ``embeddingsEnabled`` is also accepted."""
+        config = resolve_lcm_config({}, {"embeddingsEnabled": True})
+        assert config.embeddings_enabled is True
+
+    def test_hermes_env_var_enables(self) -> None:
+        """``HERMES_EMBEDDINGS_ENABLED=true`` opts in; no warning fires."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning fails this test
+            config = resolve_lcm_config({"HERMES_EMBEDDINGS_ENABLED": "true"}, {})
+        assert config.embeddings_enabled is True
+
+    def test_lcm_env_var_enables_with_deprecation_warning(self) -> None:
+        """The legacy ``LCM_EMBEDDINGS_ENABLED`` alias works but warns."""
+        with pytest.warns(
+            DeprecationWarning,
+            match="LCM_EMBEDDINGS_ENABLED.*HERMES_EMBEDDINGS_ENABLED",
+        ):
+            config = resolve_lcm_config({"LCM_EMBEDDINGS_ENABLED": "true"}, {})
+        assert config.embeddings_enabled is True
+
+    def test_env_strict_true_semantics(self) -> None:
+        """Only the exact string ``"true"`` enables — like the other opt-in
+        flags (``prompt_aware_eviction``). ``"1"`` / ``"yes"`` / ``"True"``
+        do NOT enable via env (strict, not the ``!= "false"`` variant)."""
+        for non_true in ("false", "1", "yes", "TRUE", "True", "", "on"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                config = resolve_lcm_config({"HERMES_EMBEDDINGS_ENABLED": non_true}, {})
+            assert config.embeddings_enabled is False, (
+                f"env value {non_true!r} should NOT enable embeddings"
+            )
+
+    def test_env_overrides_plugin_config(self) -> None:
+        """Env var beats plugin config (standard precedence) — env can both
+        force-on and force-off relative to a plugin-config value."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            # Plugin config says on, env says off → env wins.
+            off = resolve_lcm_config(
+                {"HERMES_EMBEDDINGS_ENABLED": "false"},
+                {"embeddings_enabled": True},
+            )
+            # Plugin config says off, env says on → env wins.
+            on = resolve_lcm_config(
+                {"HERMES_EMBEDDINGS_ENABLED": "true"},
+                {"embeddings_enabled": False},
+            )
+        assert off.embeddings_enabled is False
+        assert on.embeddings_enabled is True
+
+    def test_voyage_key_alone_does_not_enable(self) -> None:
+        """ADR-033 §Open-Q2 "both-required": a Voyage key WITHOUT the flag
+        does not silently enable embeddings.
+
+        An operator who set ``VOYAGE_API_KEY`` (or the inline
+        ``voyage_api_key`` config) for another purpose must still flip
+        ``embeddings_enabled`` explicitly — the key is not an implicit
+        opt-in.
+        """
+        config = resolve_lcm_config(
+            {"VOYAGE_API_KEY": "vk-present"},
+            {"voyage_api_key": "vk-also-present"},
+        )
+        assert config.embeddings_enabled is False
+
+    def test_recognized_plugin_config_key(self) -> None:
+        """``embeddings_enabled`` is in the recognized-keys allowlist — it
+        does NOT trip the ``extra='forbid'`` unknown-key rejection."""
+        # Would raise ValidationError if the key were unrecognized.
+        config = resolve_lcm_config({}, {"embeddings_enabled": False})
+        assert config.embeddings_enabled is False
+
+    def test_invalid_plugin_config_value_falls_to_default(self) -> None:
+        """A non-bool-coercible plugin value falls through to the False
+        default rather than crashing the resolver (matches the resolver's
+        tolerance for other booleans)."""
+        config = resolve_lcm_config({}, {"embeddings_enabled": "not-a-bool"})
+        assert config.embeddings_enabled is False
+
+
+# ===========================================================================
 # 6. Env-var alias deprecation warnings (Phase 1 policy)
 # ===========================================================================
 

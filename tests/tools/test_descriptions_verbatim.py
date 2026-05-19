@@ -35,6 +35,23 @@ And per [issue 06-15](../../epics/06-tools/06-15-tool-descriptions-verbatim.md):
 > A converter or paraphrasing pass silently destroys this. ADR-016
 > codifies hand-translation; this test pins the result.
 
+ADR-033 exception — the ``lcm_grep`` description is deliberately non-verbatim
+---------------------------------------------------------------------------
+
+[ADR-033](../../docs/adr/033-embeddings-default-posture.md) (Accepted, issue
+#133) **supersedes ADR-016's verbatim rule for the ``lcm_grep`` description
+string specifically.** ADR-033 demotes the ``hybrid`` "PRIMARY" steer (the
++52.5pp lift it rested on was never measured here; hybrid hard-fails keyless)
+and marks ``hybrid``/``semantic`` opt-in. The fixture's ``lcm_grep`` entry and
+its ``_DESCRIPTION_SHA256`` row were **re-snapshotted** from the new
+ADR-033-edited Python prose — that re-snapshot IS the intended workflow for a
+*deliberate* ADR-driven prose change (distinct from accidental converter
+drift, which this lint still catches for every tool, ``lcm_grep`` included
+once re-pinned). The fixture's ``_extracted_from.lcm_grep`` records this
+deviation. Every *other* tool description remains byte-verbatim from the TS
+source — the lint is unchanged for them. A future TS bump that touches
+``lcm_grep`` must reconcile with ADR-033, not silently re-pull the old prose.
+
 Test taxonomy
 -------------
 
@@ -350,7 +367,14 @@ def test_no_missing_tools_registered() -> None:
 
 
 _DESCRIPTION_SHA256: Final[dict[str, str]] = {
-    "lcm_grep": "4e87da8b813ef3f188000b7dc210a5f2ce3de3eefe50dec0f37eafef48a431f0",
+    # ADR-033 (issue #133): re-snapshotted. The `lcm_grep` description was
+    # deliberately edited away from the verbatim TS source — the `hybrid`
+    # "PRIMARY" steer is demoted and hybrid/semantic are marked opt-in.
+    # ADR-033 (Accepted) supersedes ADR-016's verbatim rule for this one
+    # string; re-pinning the snapshot here is the intended workflow for a
+    # deliberate ADR-driven prose change. Pre-ADR-033 hash was
+    # 4e87da8b813ef3f188000b7dc210a5f2ce3de3eefe50dec0f37eafef48a431f0.
+    "lcm_grep": "ed54b50789952db2735dcc94d3adb0d53250bc7bf34a1143f15e4a87b08f8182",
     "lcm_describe": "c53732f75dce0bc8f617a3af8e48cdee6c81c0067c2c391c90c479d385d83d99",
     "lcm_expand": "2bc548c1da6a5563afac650741185f574a57cfca63d8d3ce748f2593808ddbb7",
     "lcm_synthesize_around": "3a45f21fff4913fddb8a37693b288bb9bc2452fc87da879f7b14dc55199b7ec2",
