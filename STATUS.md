@@ -6,15 +6,17 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W6 COMPLETE — v0.1.0 released** — ALL 122 port issues merged (Epics 00–09); the 12-item release-gate checklist passed (9 PASS, 3 operator-gated + documented). v0.1.0 tagged. |
-| **Current milestone** | M1–M11 ✅. M0 doc set → M11 v0.1.0 release all done. M6 — `fts_only` baseline measured offline; live +52.5pp hybrid confirmation operator-gated (B-001, accepted). M12 (v0.2.0 — `lcm_expand_query`, #628 stub-tier) is the future track. |
-| **Last merged PR** | [#141](https://github.com/electricsheephq/lossless-hermes/pull/141) `docs: ADRs 035-036 + review-confirmed doc corrections` |
-| **Last commit on main** | `42ff9b5` |
-| **Total PRs merged** | Waves 0–6 complete (all 122 port issues + release-gate docs + chores + fix-forwards); post-v0.1.0 patch + docs PRs #138–#141 also merged. See `gh pr list --state merged` for the exact count. |
-| **Open PRs** | `fix/v0.1.2-durability` in flight — issue #144 P0 data-durability fix. |
-| **Total tests** | 4067 passing (`pytest -m 'not live'`, +8 cross-session durability regression tests added by the v0.1.2 fix); 6 OS×Python matrix cells. |
+| **Current wave** | **Post-v0.1.0 hardening — architecture review against `hermes-lcm` complete** — v0.1.0 shipped (all 122 port issues, Epics 00–09); a 2-wave / 12-slice + production-scars review against the sibling project `stephenschoettler/hermes-lcm` ran, found 4 confirmed bugs, and shipped them as **v0.1.1 / v0.1.2 / v0.1.3**. v0.2.0 architecture work (ADRs 032–036) is recorded; implementation is GitHub-issue-tracked. |
+| **Current milestone** | M1–M11 ✅ (v0.1.0). M6 — `fts_only` baseline measured offline; live +52.5pp hybrid confirmation operator-gated (B-001). **Post-release patch line: v0.1.1 → v0.1.2 → v0.1.3 shipped.** M12 (v0.2.0) is the next track. |
+| **Last merged PR** | [#142](https://github.com/electricsheephq/lossless-hermes/pull/142) `fix: v0.1.3 — ingest-cursor restart reconciliation + compaction desync` |
+| **Last commit on main** | `a34edec` |
+| **Latest release** | **v0.1.3** — see `gh release list`. v0.1.0/v0.1.1 are superseded (do not persist context across a session close — v0.1.2 fixes that; upgrade). |
+| **Total PRs merged** | Waves 0–6 (all 122 port issues) + the architecture-review series #126/#138–#142/#145 (README rewrite, ADRs 032–036, doc corrections, 4 bug-fix patches). |
+| **Open PRs** | None. |
+| **Total tests** | 4080 passing (`pytest -m 'not live'`); 6 OS×Python matrix cells. |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
-| **Open blockers** | None — B-001 (live +52.5pp benchmark) and B-002 (24h soak / Eva-DB round-trip) resolved at the release-gate review: accepted as documented operator-gated v0.1.0 items. See [`BLOCKERS.md`](./BLOCKERS.md). |
+| **Open blockers** | None. B-001/B-002 resolved at the v0.1.0 release-gate (operator-gated, accepted). The architecture review's findings are all either fixed (v0.1.1–v0.1.3) or issue-tracked for v0.2.0 — see below. |
+| **Architecture review (vs `hermes-lcm`)** | 12 slices + 2 production-scars audits, all 95%-gated. **Fixed:** #128 model-switch crash, #129 recall-policy tool ref (v0.1.1); #144 durability P0 (v0.1.2); #130 ingest-cursor (v0.1.3). **v0.2.0 issue-tracked:** #131 base64 guard, #132–#136 ADRs 032–036, #137 doc-corrections (done), #143 `/lcm eval` stub, #146 telemetry-txn. |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -100,4 +102,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-19 (v0.1.0 RELEASED — all 122 issues merged, 111 PRs, release-gate checklist passed, tagged on `8b71b12`. Next track: v0.2.0 — `lcm_expand_query` + #628 stub-tier.)_
+_Last refreshed: 2026-05-19 (post-v0.1.0 hardening — `hermes-lcm` architecture review complete; v0.1.1/v0.1.2/v0.1.3 shipped 4 confirmed bug fixes; ADRs 032–036 merged; v0.2.0 implementation issue-tracked. Last commit `a34edec`.)_
