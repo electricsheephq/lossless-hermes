@@ -213,14 +213,20 @@ def test_nested_subcommand_routes_to_nested_handler() -> None:
     """`/lcm doctor apply` routes to ``doctor:run_apply`` not ``doctor:run_scan``.
 
     Issue 08-01 implements longest-prefix matching so multi-token
-    subcommands route to dedicated handler functions. The
-    ``doctor apply`` stub's "not yet implemented" message echoes the
-    full canonical path.
+    subcommands route to dedicated handler functions. Issue 08-07 wired
+    the real ``run_apply`` body (per-conversation summary repair) — so
+    the routing assertion now checks for the doctor-apply handler's
+    rendered output ("Lossless Hermes Doctor Apply") rather than the old
+    stub message. ``run_scan`` (the bare ``/lcm doctor`` handler) is
+    still a stub; if ``doctor apply`` mis-routed to it, the output would
+    instead say "not yet implemented".
     """
     dispatcher = LcmCommandDispatcher(_make_engine())
     out = dispatcher.handle("doctor apply")
-    assert "not yet implemented" in out
-    assert "/lcm doctor apply" in out
+    # Real run_apply handler output — proves the route reached run_apply,
+    # not the run_scan stub.
+    assert "Lossless Hermes Doctor Apply" in out
+    assert "not yet implemented" not in out
 
 
 def test_worker_tick_routes_to_tick_handler() -> None:
