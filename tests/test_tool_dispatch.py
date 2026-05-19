@@ -100,11 +100,11 @@ def test_tool_dispatch_is_dict() -> None:
     assert isinstance(TOOL_DISPATCH, dict)
 
 
-def test_tool_dispatch_holds_diagnostic_and_pr1_pr2_adapted_tools() -> None:
-    """The registry holds the ADR-035 diagnostics + the #156 PR-1/PR-2 adapters.
+def test_tool_dispatch_holds_all_eight_adapted_tools() -> None:
+    """The registry holds the full 8-tool dispatch surface (#156 closed).
 
-    The dispatch-adapter layer (issue #156) wires the ported ``lcm_*``
-    tools incrementally. After #156 PR-2 the registry holds:
+    The dispatch-adapter layer (issue #156) wired the ported ``lcm_*``
+    tools incrementally; #164 PR-2 finished it. The registry holds:
 
     * the two read-only model-callable diagnostic tools added by ADR-035
       (issue #135): ``lcm_status`` / ``lcm_doctor``;
@@ -112,12 +112,17 @@ def test_tool_dispatch_holds_diagnostic_and_pr1_pr2_adapted_tools() -> None:
       ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``;
     * the Tier-3 ``lcm_compact`` wired by #156 PR-2 (its
       ``CompactContext`` shim implements two methods —
-      ``get_agent_compaction_gate_state`` + ``compact``).
+      ``get_agent_compaction_gate_state`` + ``compact``);
+    * ``lcm_synthesize_around``, wired by #164 PR-2 — it was deferred
+      from #156 PR-3 because its ``build_llm_call`` factory needs a
+      summarizer surface ``LCMEngine`` did not expose. #164 PR-2 built
+      that surface (``engine._summarizer`` at ``on_session_start``) and
+      landed the adapter, closing #156 at 8/8 dispatch coverage.
 
-    ``lcm_synthesize_around`` is still absent (it lands in #156 PR-3)
-    and ``lcm_expand`` is deferred per ADR-037. Any other entry — or
-    ``lcm_synthesize_around`` appearing early — means a tool was wired
-    before its prerequisites; fail fast.
+    ``lcm_expand`` is deferred per ADR-037 — absent from both
+    ``TOOL_DISPATCH`` and ``TOOL_SCHEMAS``. Any other entry, or a
+    missing one, means a tool was wired before its prerequisites or
+    dropped; fail fast.
     """
     assert set(TOOL_DISPATCH) == {
         "lcm_status",
@@ -127,11 +132,13 @@ def test_tool_dispatch_holds_diagnostic_and_pr1_pr2_adapted_tools() -> None:
         "lcm_describe",
         "lcm_grep",
         "lcm_compact",
+        "lcm_synthesize_around",
     }, (
         "TOOL_DISPATCH should hold the two ADR-035 diagnostic tools plus "
-        "the four #156 PR-1 adapters (lcm_get_entity, lcm_search_entities, "
-        "lcm_describe, lcm_grep) plus the #156 PR-2 adapter (lcm_compact); "
-        f"lcm_synthesize_around lands in #156 PR-3. Got {sorted(TOOL_DISPATCH)}"
+        "the six #156 dispatch-adapter tools (lcm_get_entity, "
+        "lcm_search_entities, lcm_describe, lcm_grep, lcm_compact, "
+        "lcm_synthesize_around) — 8/8 coverage, #156 closed. "
+        f"Got {sorted(TOOL_DISPATCH)}"
     )
 
 

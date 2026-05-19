@@ -72,7 +72,7 @@ import sqlite3
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Final, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, Final, List, Optional, Set, Tuple
 
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.hermes_bridge import ContextEngine
@@ -100,6 +100,17 @@ from .compact import _CompactMixin
 from .ingest import _IngestMixin
 from .lifecycle import _LifecycleMixin
 from .session_locks import SessionLockRegistry
+
+if TYPE_CHECKING:  # pragma: no cover — type-only imports
+    # The summarizer surface (#164 PR-2). These are referenced only in
+    # ``__init__`` annotations — the actual ``HermesSummarizerDeps`` /
+    # ``LcmSummarizer`` construction is lazy, inside
+    # ``on_session_start`` (``lifecycle.py``). ``from __future__ import
+    # annotations`` makes every annotation a string, so a TYPE_CHECKING
+    # import is sufficient and avoids any future engine <-> summarize
+    # import-cycle risk.
+    from lossless_hermes.compaction import SummarizeFn
+    from lossless_hermes.summarize import LcmSummarizer, SummarizerDeps
 
 __all__ = [
     "APPLE_SYSTEM_PYTHON_MSG",
@@ -348,16 +359,24 @@ TOOL_DISPATCH["lcm_doctor"] = _handle_lcm_doctor
 # registrations live here — the documented ``TOOL_DISPATCH`` wiring site,
 # mirroring ``lcm_status`` / ``lcm_doctor`` above.
 #
-# PR-1 wired four tools; #156 PR-2 adds ``lcm_compact`` (the 2-method
-# ``CompactContext`` shim — see ``_adapters._CompactCtx``);
-# ``lcm_synthesize_around`` ships in PR-3, and ``lcm_expand`` is deferred
-# per ADR-037.
+# #156 PR-1 wired four tools; #156 PR-2 added ``lcm_compact`` (the
+# 2-method ``CompactContext`` shim — see ``_adapters._CompactCtx``).
+# The 8th tool, ``lcm_synthesize_around``, was deferred from #156 PR-3
+# because its ``build_llm_call`` factory needs a summarizer surface on
+# ``LCMEngine`` that did not exist — it is wired here, by #164 PR-2,
+# now that ``on_session_start`` constructs ``engine._summarizer``.
+# Landing it closes #156: dispatch coverage is 8/8 (the 6 ported tools
+# + ``lcm_status`` / ``lcm_doctor``). ``lcm_expand`` stays deferred per
+# ADR-037 — it is the only ported tool with no dispatch entry, and it
+# is intentionally absent from ``TOOL_SCHEMAS`` too, so coverage of the
+# *advertised* surface is total.
 from lossless_hermes.tools._adapters import (
     _adapt_lcm_compact,
     _adapt_lcm_describe,
     _adapt_lcm_get_entity,
     _adapt_lcm_grep,
     _adapt_lcm_search_entities,
+    _adapt_lcm_synthesize_around,
 )
 
 TOOL_DISPATCH["lcm_get_entity"] = _adapt_lcm_get_entity
@@ -365,6 +384,7 @@ TOOL_DISPATCH["lcm_search_entities"] = _adapt_lcm_search_entities
 TOOL_DISPATCH["lcm_describe"] = _adapt_lcm_describe
 TOOL_DISPATCH["lcm_grep"] = _adapt_lcm_grep
 TOOL_DISPATCH["lcm_compact"] = _adapt_lcm_compact
+TOOL_DISPATCH["lcm_synthesize_around"] = _adapt_lcm_synthesize_around
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +521,37 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         self._summary_store: Optional[SummaryStore] = None
         self._telemetry_store: Optional[CompactionTelemetryStore] = None
         self._maintenance_store: Optional[CompactionMaintenanceStore] = None
+
+        # ------------------------------------------------------------------
+        # Summarizer surface (#164 PR-2)
+        # ------------------------------------------------------------------
+        # The summarizer cascade — :class:`SummarizerDeps` + an
+        # :class:`LcmSummarizer` built from it — constructed in
+        # ``on_session_start`` (the config-scoped construction point;
+        # see ``lifecycle.py``). All three default to ``None`` here and
+        # are populated once the DB opens.
+        #
+        # * ``deps`` — the public :class:`SummarizerDeps` handle. The
+        #   ``getattr(engine, "deps", None)`` probe in ``commands/doctor.py``
+        #   reads this exact name; ``/lcm doctor apply`` activates its real
+        #   summarizer path once it is non-``None``.
+        # * ``summarize`` — the bound :class:`LcmSummarizer.summarize`
+        #   callable. This is the :data:`~lossless_hermes.compaction.SummarizeFn`
+        #   shape (``(text, aggressive=False, options=None) -> str``)
+        #   that ``CompactionEngine.compact_full_sweep`` and the
+        #   ``lcm_synthesize_around`` ``build_llm_call`` factory consume.
+        #   The ``getattr(engine, "summarize", None)`` probe in
+        #   ``commands/doctor.py`` reads this exact name.
+        # * ``_summarizer`` — the underlying :class:`LcmSummarizer`
+        #   object. The ``build_llm_call`` factory needs the object (not
+        #   just the bound method) to read ``.candidates`` for the
+        #   Wave-12 F8 audit-honest model name.
+        #
+        # Config-scoped (not session-scoped): built once per DB-open and
+        # nulled on ``on_session_end`` for symmetry with the stores.
+        self.deps: Optional[SummarizerDeps] = None
+        self.summarize: Optional[SummarizeFn] = None
+        self._summarizer: Optional[LcmSummarizer] = None
 
         # ``current_session_id`` — most-recent Hermes session_id seen by
         # ``on_session_start``. Used by Epic 08 ``/lcm`` handlers to resolve
