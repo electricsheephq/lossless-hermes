@@ -6,14 +6,17 @@ Proves three things:
    via ``__eq__`` (the AC pair from issue 00-04: ``AnyOf(int) == 42`` and
    ``ContainsString("hello") == "hello world"``).
 2. The implemented fixtures from ``conftest.py`` (``tmp_home``,
-   ``db_in_memory``) wire up and yield real values.
-3. The placeholder fixtures (``db_with_vec0``, ``fake_voyage``,
-   ``fake_llm``, ``test_corpus``) are discoverable and raise
-   ``NotImplementedError`` with a pointer to the epic that will port them
-   — i.e., the shape is locked even though the body waits.
+   ``db_in_memory``, ``test_corpus``) wire up and yield real values.
+3. The still-placeholder fixtures (``db_with_vec0``, ``fake_voyage``,
+   ``fake_llm``) are discoverable and raise ``NotImplementedError`` with
+   a pointer to the epic that will port them — i.e., the shape is locked
+   even though the body waits.
 
-Once Epics 01/03/04/05 land, the placeholder assertions here should be
-replaced with real fixture usage in the relevant test files.
+``test_corpus`` was filled by issue 09-08 (the Voyage-recall benchmark
+named the ``v41-test-corpus`` port as its own prerequisite); its smoke
+assertion below is now positive rather than a ``NotImplementedError``
+check. The remaining placeholder assertions should likewise flip to
+real fixture usage as the relevant epics land.
 """
 
 from __future__ import annotations
@@ -144,7 +147,7 @@ def test_db_in_memory_yields_open_connection(db_in_memory: sqlite3.Connection) -
 
 @pytest.mark.parametrize(
     "fixture_name",
-    ["db_with_vec0", "fake_voyage", "fake_llm", "test_corpus"],
+    ["db_with_vec0", "fake_voyage", "fake_llm"],
 )
 def test_placeholder_fixture_raises_not_implemented(
     request: pytest.FixtureRequest, fixture_name: str
@@ -155,7 +158,25 @@ def test_placeholder_fixture_raises_not_implemented(
     This is what 'shape locked, body pending' means in practice:
     the fixture is registered with conftest, can be `getfixturevalue`'d,
     and fails with a useful pointer rather than ``fixture 'X' not found``.
+
+    Note: ``test_corpus`` was on this list until issue 09-08 ported the
+    ``v41-test-corpus`` fixture and filled the conftest body. It is now
+    covered by :func:`test_corpus_fixture_seeds_real_rows` below.
     """
 
     with pytest.raises(NotImplementedError, match=r"Epic"):
         request.getfixturevalue(fixture_name)
+
+
+def test_corpus_fixture_seeds_real_rows(test_corpus: dict[str, object]) -> None:
+    """``test_corpus`` is now a real fixture (filled by issue 09-08).
+
+    It ports ``v41-test-corpus.ts`` and seeds the synthetic corpus into
+    the yielded ``db_in_memory`` connection. The smoke check here is
+    minimal — the fixture's own exhaustive coverage lives in
+    ``tests/fixtures/test_test_corpus.py``.
+    """
+
+    assert test_corpus["leaf_count"] == 54
+    assert test_corpus["condensed_count"] == 2
+    assert test_corpus["entity_count"] == 4
