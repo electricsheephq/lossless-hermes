@@ -845,24 +845,33 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 REQUIRED_API_KEYS: tuple[str, ...] = ("VOYAGE_API_KEY", "ANTHROPIC_API_KEY")
 
 
+def _api_keys_present(env: dict[str, str]) -> bool:
+    """Whether every key in :data:`REQUIRED_API_KEYS` is set and non-blank.
+
+    The only thing this function does with a secret value is collapse it
+    to a single :class:`bool` (present-and-non-blank, or not). The secret
+    *content* is destroyed at that point — ``bool(value.strip())`` keeps
+    one bit, not the string — so nothing downstream of this call can log
+    or leak the value. Returning a bare ``bool`` (rather than a list
+    derived from the environment) keeps the auth-skip branch and its log
+    line clear of any environment-tainted data.
+    """
+    for name in REQUIRED_API_KEYS:
+        # `bool(...)` collapses the secret to one bit; the string is gone.
+        if not bool(env.get(name, "").strip()):
+            return False
+    return True
+
+
 def _missing_api_keys(env: dict[str, str]) -> list[str]:
     """Return the names of the required API keys that are absent/blank.
 
-    The returned list contains only entries of :data:`REQUIRED_API_KEYS`
-    — literal key *names*, never the secret *values*. The secret value is
-    read solely for the truthiness check (``env.get(name)``) and is
-    discarded immediately; it never escapes this function. This keeps the
-    auth-skip log line (which prints the returned names) free of any
-    sensitive data.
+    Thin diagnostic wrapper over :func:`_api_keys_present`, kept for
+    tests and for callers that want the specific missing names. The
+    returned list contains only entries of :data:`REQUIRED_API_KEYS`
+    (literal key *names*), never secret values.
     """
-    missing: list[str] = []
-    for name in REQUIRED_API_KEYS:
-        # The value is consumed only by `not ... .strip()` and dropped.
-        present = bool(env.get(name, "").strip())
-        if not present:
-            # Append the literal constant, not anything env-derived.
-            missing.append(name)
-    return missing
+    return [name for name in REQUIRED_API_KEYS if not bool(env.get(name, "").strip())]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -875,12 +884,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """
     args = _parse_args(argv)
 
-    # `missing` only ever holds entries of REQUIRED_API_KEYS (literal key
-    # *names*), never secret values — see _missing_api_keys. The branch is
-    # gated on whether any are absent; the log message is built from the
-    # REQUIRED_API_KEYS literal so no environment-derived value reaches
-    # the logging path at all.
-    if _missing_api_keys(dict(os.environ)):
+    # Auth gate. `_api_keys_present` returns a bare bool — the secret
+    # values are collapsed to one bit inside it and never escape. The
+    # branch condition and the log message are therefore both free of
+    # any environment-tainted data; the message is built purely from the
+    # REQUIRED_API_KEYS literal.
+    if not _api_keys_present(dict(os.environ)):
         print(
             f"[live-eval] SKIP — one or more required API keys are not set "
             f"({' + '.join(REQUIRED_API_KEYS)}). The live-eval suite is "
