@@ -262,6 +262,29 @@ lossless_hermes:
 > require a `VOYAGE_API_KEY` for query embeddings; without one, those modes return a clear
 > operator-facing error pointing back to the FTS modes.
 
+### Pinning the summarization model — `auxiliary.lcm_summary` (optional)
+
+LCM's summarization and synthesis calls (compaction leaf/condensed passes, `lcm_synthesize_around`)
+go through Hermes's auxiliary LLM client under the task name `lcm_summary`. **This works
+with no configuration** — when no `auxiliary.lcm_summary` entry exists, Hermes falls
+through to its model auto-detection chain.
+
+To *pin* the summarizer's provider, model, and timeout, add an `auxiliary.lcm_summary`
+block to `~/.hermes/config.yaml` — note this lives in the top-level `auxiliary:` namespace,
+**not** the `lossless_hermes:` plugin namespace:
+
+```yaml
+auxiliary:
+  lcm_summary:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60        # seconds
+```
+
+This is the operator-facing knob; `summary_model` / `summary_provider` in the
+`lossless_hermes:` namespace (above) pin the same chain from LCM's side and take
+precedence where both resolve.
+
 ## Agent tools
 
 LCM registers **9 agent tools** so the model can search, recall, and self-diagnose:

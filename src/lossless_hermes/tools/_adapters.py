@@ -32,10 +32,13 @@ dispatch signature. Each adapter:
 4. calls the real ``handle_lcm_<tool>`` with the correct keyword args;
 5. returns its JSON string verbatim.
 
-The PR-1 adapters wire four tools: ``lcm_get_entity``,
-``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``. #156 PR-2 adds
-``lcm_compact``; ``lcm_synthesize_around`` ships in PR-3; ``lcm_expand``
-is deferred per ADR-037.
+#156 PR-1 wired four tools: ``lcm_get_entity``, ``lcm_search_entities``,
+``lcm_describe``, ``lcm_grep``. #156 PR-2 added ``lcm_compact``. The 8th
+tool, ``lcm_synthesize_around``, was blocked on a summarizer surface
+``LCMEngine`` did not expose; it is wired by #164 PR-2 (this is the
+adapter that closes #156 at 8/8 dispatch coverage). ``lcm_expand`` is
+deferred per ADR-037 — absent from both ``TOOL_DISPATCH`` and
+``TOOL_SCHEMAS``, so coverage of the advertised surface is total.
 
 The ``lcm_compact`` shim (#156 PR-2)
 ------------------------------------
@@ -115,13 +118,16 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Optional
+from typing import TYPE_CHECKING, Any, Callable, Final, Optional
 
 from lossless_hermes.compaction import CompactionResult
 from lossless_hermes.db.config import LcmConfig
 from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
+from lossless_hermes.summarize import LcmSummarizeOptions
+from lossless_hermes.synthesis.dispatch import LlmCall, LlmCallArgs, LlmCallResult
 from lossless_hermes.tools._common import tool_result
 from lossless_hermes.tools.compact import (
     GateState,
@@ -133,6 +139,7 @@ from lossless_hermes.tools.describe import handle_lcm_describe
 from lossless_hermes.tools.get_entity import handle_lcm_get_entity
 from lossless_hermes.tools.grep import handle_lcm_grep
 from lossless_hermes.tools.search_entities import handle_lcm_search_entities
+from lossless_hermes.tools.synthesize_around import handle_lcm_synthesize_around
 from lossless_hermes.voyage.client import VoyageClient
 
 if TYPE_CHECKING:  # pragma: no cover — import-cycle dodge, type-only
@@ -146,6 +153,7 @@ __all__ = (
     "_adapt_lcm_get_entity",
     "_adapt_lcm_grep",
     "_adapt_lcm_search_entities",
+    "_adapt_lcm_synthesize_around",
 )
 
 
@@ -226,6 +234,32 @@ class _GrepCtx:
     timezone: str
     voyage: Optional[VoyageClient]
     embeddings_enabled: bool
+
+
+@dataclass(frozen=True)
+class _SynthesizeAroundCtx:
+    """Frozen :class:`~..synthesize_around.SynthesizeAroundContext` (#164 PR-2).
+
+    ``lcm_synthesize_around`` needs a SQL connection, the conversation
+    store, a timezone, and — unlike the four PR-1 attribute-bag
+    contexts — a ``build_llm_call`` *factory* (a :class:`BuildLlmCall`,
+    ``() -> tuple[LlmCall, str]``). :func:`_adapt_lcm_synthesize_around`
+    builds that factory over the engine's summarizer surface (the #164
+    PR-2 ``engine._summarizer`` handle), so the synthesis dispatcher
+    runs through the same configured summarizer chain as compaction.
+
+    ``frozen=True`` keeps it an immutable per-dispatch snapshot — the
+    handler cannot mutate the engine wiring through its ``ctx``.
+    """
+
+    conn: sqlite3.Connection
+    conversation_store: ConversationStore
+    timezone: str
+    # ``BuildLlmCall`` is a structural Protocol (``() -> tuple[LlmCall,
+    # str]``). A plain function value satisfies it; annotate with the
+    # ``Callable`` shape so ``ty`` structurally verifies the dataclass
+    # against ``SynthesizeAroundContext`` at the handler call site.
+    build_llm_call: "Callable[[], tuple[LlmCall, str]]"
 
 
 # ---------------------------------------------------------------------------
@@ -934,4 +968,201 @@ def _adapt_lcm_compact(args: dict[str, Any], **kwargs: Any) -> str:
         # Kwarg rename: _dispatch_tool_call forwards ``runtime_ctx``;
         # handle_lcm_compact's parameter is ``runtime_context``.
         runtime_context=runtime_context,
+    )
+
+
+# ---------------------------------------------------------------------------
+# lcm_synthesize_around — Tier 3, build_llm_call factory over the summarizer
+# (#164 PR-2 — closes #156, 8/8 dispatch coverage)
+# ---------------------------------------------------------------------------
+#
+# ``lcm_synthesize_around`` is the 8th #156 tool. Its handler
+# (``synthesize_around.py:401``) consumes a ``SynthesizeAroundContext``
+# whose ``build_llm_call`` member is a *factory* — ``() ->
+# tuple[LlmCall, str]`` — not a plain collaborator. The factory wires
+# the synthesis dispatcher's async ``LlmCall`` callable to the engine's
+# configured summarizer chain.
+#
+# This is the deferred #156 PR-3 work, unblocked by #164 PR-2's
+# summarizer surface: the factory needs ``engine._summarizer`` (an
+# ``LcmSummarizer``), which did not exist on ``LCMEngine`` until PR-2's
+# ``on_session_start`` construction. With the surface present, the
+# factory is a faithful port of the TS ``buildLlmCallFromSummarizer``
+# helper (``lossless-claw/src/tools/lcm-synthesize-around-tool.ts:608-618``
+# @ ``1f07fbd``) plus the TS handler's own summarizer-resolution at
+# ``lcm-synthesize-around-tool.ts:1019-1037``.
+
+
+def _build_synthesizer_llm_call(engine: LCMEngine) -> tuple[LlmCall, str]:
+    """Build the synthesis dispatcher's ``(LlmCall, model_name)`` pair.
+
+    The :class:`~lossless_hermes.tools.synthesize_around.BuildLlmCall`
+    factory body — a faithful port of TS ``buildLlmCallFromSummarizer``
+    (``lossless-claw/src/tools/lcm-synthesize-around-tool.ts:608-618``)
+    composed with the TS handler's own summarizer wiring (``:1019-1037``).
+
+    The synthesis dispatcher (:func:`~..synthesis.dispatch.dispatch_synthesis`)
+    invokes the returned :class:`~..synthesis.dispatch.LlmCall` once per
+    synthesis pass with a fully-rendered prompt. LCM has no
+    synthesizer-specific model resolver — the TS source reuses the
+    configured *summarizer* chain (it already owns provider/model
+    fallback + auth retries + timeouts), and this port does the same:
+    the returned callable wraps the engine's bound summarizer.
+
+    Two shape bridges the TS source also makes:
+
+    * **sync → async** — :class:`~..synthesis.dispatch.LlmCall` is
+      ``async def __call__`` (the TS source returns a ``Promise``),
+      while :meth:`~..summarize.LcmSummarizer.summarize` is sync (ADR-017).
+      The wrapper is an ``async def`` that calls the sync summarizer
+      directly. The summarizer's own LLM call is sync-blocking; a
+      single call inside the dispatcher's already-isolated event loop
+      (``synthesize_around.py`` runs ``asyncio.run(dispatch_synthesis(...))``
+      on a fresh loop) is acceptable and matches the TS structure —
+      no thread-pool hop is needed.
+    * **is_condensed** — the TS handler passes ``{isCondensed: true}``
+      to the summarizer (``lcm-synthesize-around-tool.ts:1034``);
+      synthesis is a condensed-tier rollup, so this port passes
+      :class:`~..summarize.LcmSummarizeOptions` with ``is_condensed=True``.
+
+    The ``model_name`` (second tuple element) is the Wave-12 F8
+    audit-honesty value — the summarizer's resolved *primary* candidate
+    model, so the synthesis audit row records what actually ran rather
+    than the dispatcher's ``pick_model`` recommendation
+    (``lcm-synthesize-around-tool.ts:1029-1036``). The TS caveat holds:
+    if mid-call provider fallback fires, the recorded model is the
+    primary candidate, not necessarily the one that succeeded — strictly
+    better than recording dispatched intent.
+
+    Args:
+        engine: The :class:`LCMEngine` — its ``_summarizer`` (an
+            :class:`~..summarize.LcmSummarizer`, built at
+            ``on_session_start``) is the chain the factory wraps.
+
+    Returns:
+        A ``(LlmCall, model_name)`` tuple.
+
+    Raises:
+        RuntimeError: When the engine has no summarizer (``on_session_start``
+            not run) or its candidate chain is empty (no
+            ``summary_model`` / ``summary_provider`` configured and no
+            ``LCM_SUMMARY_*`` env). The handler catches this and surfaces
+            the "No summarization model resolved" tool-error
+            (``synthesize_around.py:748-759``) — the same arm the TS
+            source's ``if (!summarizerBuilt)`` guard produces.
+    """
+    summarizer = engine._summarizer
+    if summarizer is None:
+        # on_session_start has not run. The adapter's engine-readiness
+        # guard catches this before the factory is built; the factory
+        # raises defensively so it is self-consistent. The handler's
+        # try/except around ``ctx.build_llm_call()`` converts the raise
+        # into the structured "No summarization model resolved" error.
+        raise RuntimeError(
+            "LCM summarizer is not initialised (on_session_start not run) — "
+            "lcm_synthesize_around cannot resolve a synthesis model."
+        )
+    if not summarizer.candidates:
+        # No (provider, model) candidate resolved. summarizer.summarize()
+        # would itself raise RuntimeError on the first call; fail here,
+        # before any cache row is written, so the handler reports the
+        # clean "No summarization model resolved" tool-error.
+        raise RuntimeError(
+            "[lcm] lcm_synthesize_around: no summary model candidates resolved "
+            "— set summary_model / summary_provider on the LCM config or the "
+            "LCM_SUMMARY_MODEL / LCM_SUMMARY_PROVIDER env."
+        )
+
+    # Wave-12 F8: the primary resolved candidate's model — what the
+    # audit row records.
+    model_name = summarizer.candidates[0].model
+
+    async def _llm_call(call_args: LlmCallArgs) -> LlmCallResult:
+        """Async ``LlmCall`` wrapping the sync summarizer.
+
+        Mirrors the arrow function returned by TS
+        ``buildLlmCallFromSummarizer`` (``lcm-synthesize-around-tool.ts:613-617``).
+        """
+        started_at = time.monotonic()
+        # ``is_condensed=True`` — synthesis is a condensed-tier rollup
+        # (TS ``{isCondensed: true}``). ``aggressive=False`` matches the
+        # TS ``summarizerBuilt.fn(text, false, ...)`` call.
+        output = summarizer.summarize(
+            call_args.prompt,
+            False,
+            LcmSummarizeOptions(is_condensed=True),
+        )
+        latency_ms = (time.monotonic() - started_at) * 1000.0
+        return LlmCallResult(
+            output=output,
+            latency_ms=latency_ms,
+            actual_model=model_name,
+        )
+
+    return _llm_call, model_name
+
+
+def _adapt_lcm_synthesize_around(args: dict[str, Any], **kwargs: Any) -> str:
+    """Dispatch adapter for ``lcm_synthesize_around`` (#164 PR-2, closes #156).
+
+    Builds a :class:`_SynthesizeAroundCtx` and a :class:`LcmDependencies`
+    from the engine and calls
+    :func:`~lossless_hermes.tools.synthesize_around.handle_lcm_synthesize_around`.
+    This is the 8th and final #156 tool — landing it brings dispatch
+    coverage to 8/8.
+
+    The one structural difference from the PR-1 attribute-bag adapters:
+    ``SynthesizeAroundContext.build_llm_call`` is a *factory*, not a
+    plain collaborator. This adapter constructs that factory as a thin
+    closure over :func:`_build_synthesizer_llm_call` — so the handler
+    invokes ``ctx.build_llm_call()`` lazily, only after it has decided
+    a synthesis pass is actually needed (after the window resolves and
+    the cache check misses). Building the factory eagerly here is free
+    (it captures the engine; no LLM call fires until the handler invokes
+    it), and matches the TS source's structure where the tool factory
+    closes over the lazily-resolved engine.
+
+    ``build_llm_call`` raising — engine summarizer unset, or an empty
+    candidate chain — is caught by the handler's own ``try/except``
+    around ``ctx.build_llm_call()`` (``synthesize_around.py:748-759``)
+    and surfaced as the structured "No summarization model resolved"
+    tool-error. So a mis-configured summarizer degrades to a clean
+    tool-error, never an exception escape.
+
+    Args:
+        args: The tool-call ``arguments`` dict (forwarded verbatim).
+        **kwargs: The uniform dispatch kwargs — see
+            :func:`_adapt_lcm_get_entity`.
+
+    Returns:
+        The handler's JSON string, or a structured ``tool_result``
+        error if engine state is not initialised.
+    """
+    engine: LCMEngine = kwargs["ctx"]
+    if engine._db is None:
+        return _engine_not_ready_error("lcm_synthesize_around", "engine._db")
+    if engine._conversation_store is None:
+        return _engine_not_ready_error("lcm_synthesize_around", "engine._conversation_store")
+
+    def _build_llm_call() -> tuple[LlmCall, str]:
+        # Deferred to handler-invocation time — the handler calls this
+        # only once it has resolved a non-empty window and missed the
+        # synthesis cache. Closes over ``engine`` so it reads the live
+        # ``_summarizer``.
+        return _build_synthesizer_llm_call(engine)
+
+    ctx = _SynthesizeAroundCtx(
+        conn=engine._db,
+        conversation_store=engine._conversation_store,
+        timezone=engine.config.timezone,
+        build_llm_call=_build_llm_call,
+    )
+    session_key = _resolve_session_key(engine, kwargs)
+    return handle_lcm_synthesize_around(
+        args,
+        ctx=ctx,
+        deps=_build_deps(engine),
+        session_key=session_key,
+        # The engine is single-session-scoped: session_key == session_id.
+        session_id=session_key,
     )

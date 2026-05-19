@@ -298,12 +298,59 @@ class _LifecycleMixin:
         self._telemetry_store = CompactionTelemetryStore(conn)
         self._maintenance_store = CompactionMaintenanceStore(conn)
 
+        # ------------------------------------------------------------------
+        # Summarizer surface (#164 PR-2)
+        # ------------------------------------------------------------------
+        # Construct the summarizer cascade here — the config-scoped
+        # construction point. ``LcmSummarizer`` depends only on
+        # ``self.config`` (always set in ``__init__``) and the
+        # ``HermesSummarizerDeps`` shim (stateless), so it is built
+        # inside this ``if self._db is None:`` block: it is created
+        # exactly once per DB-open and persists for the process
+        # lifetime, matching the stores' lifecycle. A re-entrant
+        # ``on_session_start`` for a new session on an already-open DB
+        # returns early above (the ``self._db is not None`` guard) and
+        # never reaches here — the summarizer is config-scoped, not
+        # session-scoped, so it must NOT be rebuilt per session.
+        #
+        # Deferred import — ``HermesSummarizerDeps.complete`` lazy-imports
+        # ``agent.auxiliary_client`` (Hermes-less env discipline), but
+        # the *class* import is cheap and pure-Python; keep it deferred
+        # anyway to mirror the rest of this method's import posture and
+        # keep ``import lossless_hermes.engine`` lean.
+        from lossless_hermes.hermes_llm import HermesSummarizerDeps
+        from lossless_hermes.summarize import LcmSummarizer
+
+        self.deps = HermesSummarizerDeps()
+        # ``provider_hint`` / ``model_hint`` feed layer 5 of the
+        # candidate chain (``resolve_summary_candidates``). Layers 1-4
+        # (env vars, ``config.summary_provider`` / ``summary_model``,
+        # legacy OpenClaw keys) already resolve from ``self.config`` +
+        # the environment; the hints are the explicit
+        # ``config.summary_*`` values passed through so an operator who
+        # set only those still gets a resolved candidate. Empty strings
+        # collapse to ``None`` inside the resolver.
+        summarizer = LcmSummarizer(
+            deps=self.deps,
+            config=self.config,
+            provider_hint=self.config.summary_provider or None,
+            model_hint=self.config.summary_model or None,
+        )
+        self._summarizer = summarizer
+        # ``self.summarize`` is the bound ``LcmSummarizer.summarize`` —
+        # the ``SummarizeFn``-shaped callable downstream consumers
+        # (``CompactionEngine.compact_full_sweep``, the
+        # ``lcm_synthesize_around`` ``build_llm_call`` factory) expect.
+        self.summarize = summarizer.summarize
+
         logger.info(
-            "[lcm] on_session_start session_id=%s: DB open at %s (fts5=%s, vec0=%s)",
+            "[lcm] on_session_start session_id=%s: DB open at %s "
+            "(fts5=%s, vec0=%s, summarizer_candidates=%d)",
             session_id,
             db_path,
             features.fts5_available,
             features.vec0_available,
+            len(summarizer.candidates),
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -357,6 +404,18 @@ class _LifecycleMixin:
         self._summary_store = None
         self._telemetry_store = None
         self._maintenance_store = None
+
+        # Clear the summarizer surface (#164 PR-2) symmetrically with the
+        # stores. The summarizer holds no DB handle of its own — its
+        # ``SummarizerDeps`` shim is stateless — but nulling it keeps the
+        # post-close engine state consistent (``getattr(engine, "deps")``
+        # / ``"summarize"`` report ``None`` again, matching the
+        # pre-first-``on_session_start`` shape) so ``/lcm doctor apply``
+        # post-close renders its "unavailable" arm rather than holding a
+        # stale summarizer.
+        self.deps = None
+        self.summarize = None
+        self._summarizer = None
 
         # Clear ``current_session_id`` symmetrically with the DB close.
         # Epic 08 ``/lcm status`` post-close should report "no active

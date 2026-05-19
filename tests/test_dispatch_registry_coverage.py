@@ -11,8 +11,11 @@ never built. Only ``lcm_status`` / ``lcm_doctor`` (PR #155, ADR-035)
 carry a ``**_kwargs`` sink and dispatch today.
 
 This file is the regression test that *would have caught* that gap, and
-the ratchet that keeps it caught as the #156 four-PR sequence
-(PR-0 → PR-3) wires the adapter layer incrementally.
+the ratchet that kept it caught as the #156 four-PR sequence
+(PR-0 → PR-3) plus #164 PR-2 (which finished the 8th adapter) wired the
+adapter layer incrementally. As of #164 PR-2 the ratchet is fully
+discharged — :data:`_NOT_YET_ADAPTED` is empty and dispatch coverage is
+8/8.
 
 What it asserts (parametrized over ``get_tool_schemas()``)
 ----------------------------------------------------------
@@ -34,28 +37,34 @@ For every advertised tool:
 Plus a standalone ``test_lcm_expand_deferred`` pinning the ADR-037
 deferral.
 
-The xfail ratchet (assertions (a) and (b))
-------------------------------------------
+The xfail ratchet (assertions (a) and (b)) — now fully discharged
+-----------------------------------------------------------------
 
-PR-0 (this file) wires NO adapters. The six not-yet-adapted ported
-tools (``lcm_grep``, ``lcm_describe``, ``lcm_get_entity``,
-``lcm_search_entities``, ``lcm_compact``, ``lcm_synthesize_around``)
-therefore fail (a) and (b) — they are in ``TOOL_SCHEMAS`` but not in
-``TOOL_DISPATCH``, and ``handle_tool_call`` returns the unknown-tool
-error for them. Those two assertions are marked ``xfail(strict=True)``
-for those six tools, so:
+The ratchet worked as designed across the rollout. PR-0 wired no
+adapters, so the six not-yet-adapted ported tools (``lcm_grep``,
+``lcm_describe``, ``lcm_get_entity``, ``lcm_search_entities``,
+``lcm_compact``, ``lcm_synthesize_around``) failed (a) and (b) — in
+``TOOL_SCHEMAS`` but not ``TOOL_DISPATCH`` — and were marked
+``xfail(strict=True)``. As each adapter landed, its (a)/(b) assertions
+started passing, the ``strict=True`` xfail became an ``XPASS`` that
+failed the suite, and the same PR removed that tool from
+:data:`_NOT_YET_ADAPTED`:
 
-* **The suite is GREEN at every intermediate merge.** A known-failing
-  assertion under ``xfail`` is a pass.
-* **Each future adapter PR flips one tool.** When PR-1 wires
-  ``lcm_grep``, its (a)/(b) assertions start *passing* — and a
-  ``strict=True`` xfail that passes is an ``XPASS`` that FAILS the
-  suite. That failure is the signal: the adapter landed, so remove
-  ``lcm_grep`` from ``_NOT_YET_ADAPTED`` in the same PR. The ratchet
-  cannot be left half-done.
+* **The suite stayed GREEN at every intermediate merge.** A known-
+  failing assertion under ``xfail`` is a pass.
+* **#156 PR-1** flipped ``lcm_get_entity`` / ``lcm_search_entities`` /
+  ``lcm_describe`` / ``lcm_grep``; **#156 PR-2** flipped ``lcm_compact``;
+  **#164 PR-2** flipped the 8th tool ``lcm_synthesize_around`` (deferred
+  from #156 PR-3 — its ``build_llm_call`` factory needed a summarizer
+  surface ``LCMEngine`` did not expose).
 
-``lcm_status`` and ``lcm_doctor`` already dispatch (PR #155) — they are
-NOT in ``_NOT_YET_ADAPTED`` and must PASS (a)/(b)/(c) now.
+As of #164 PR-2, :data:`_NOT_YET_ADAPTED` is **empty**: all eight
+advertised tools dispatch, so (a)/(b) are hard PASSes for every tool and
+#156 is closed. A tool re-appearing in the set would mean the #156 bug
+regressed.
+
+``lcm_status`` and ``lcm_doctor`` dispatch via PR #155 — they were never
+in ``_NOT_YET_ADAPTED`` and PASS (a)/(b)/(c).
 
 Why assertion (c) is NOT in the ratchet
 ---------------------------------------
@@ -135,47 +144,52 @@ _skip_no_extension_loading = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------------------
-# The not-yet-adapted ratchet set
+# The not-yet-adapted ratchet set — now EMPTY (dispatch coverage is 8/8)
 # ---------------------------------------------------------------------------
 #
-# The ported ``lcm_*`` tools whose dispatch-adapter has NOT landed yet.
-# PR-1..PR-3 of the #156 sequence remove tools from this set as their
-# adapters ship:
+# The ported ``lcm_*`` tools whose dispatch-adapter has not landed yet.
+# The #156 sequence (and #164 PR-2, which finished it) removed tools
+# from this set as their adapters shipped:
 #
-#   * PR-1 → lcm_get_entity, lcm_search_entities, lcm_describe, lcm_grep
-#     (DONE — wired in PR-1, removed from this set)
-#   * PR-2 → lcm_compact (DONE — wired in PR-2, removed from this set)
-#   * PR-3 → lcm_synthesize_around
+#   * #156 PR-1 → lcm_get_entity, lcm_search_entities, lcm_describe,
+#     lcm_grep
+#   * #156 PR-2 → lcm_compact
+#   * #164 PR-2 → lcm_synthesize_around — the 8th tool. It was deferred
+#     from #156 PR-3 because its ``build_llm_call`` factory needs a
+#     summarizer surface ``LCMEngine`` did not expose; #164 PR-2 built
+#     that surface and wired the adapter.
 #
-# When an adapter lands, its (a)/(b) ``xfail(strict=True)`` markers turn
-# into ``XPASS`` and FAIL the suite — the signal to delete the tool from
-# this set in the same PR. ``lcm_expand`` is NOT here: per ADR-037 it is
-# deferred and absent from ``get_tool_schemas()`` entirely (see
-# ``test_lcm_expand_deferred``).
+# This set is now **empty**: every advertised tool has a ``TOOL_DISPATCH``
+# entry, so the (a)/(b) assertions are hard PASSes for all eight tools
+# and #156 is closed. ``lcm_expand`` is NOT — and never was — in this
+# set: per ADR-037 it is deferred and absent from ``get_tool_schemas()``
+# entirely (see ``test_lcm_expand_deferred``), so it is not part of the
+# advertised surface this ratchet covers.
 #
-# #156 PR-1 wired the four Tier-1/2 adapters (``lcm_get_entity``,
-# ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``). #156 PR-2
-# (this PR) wired the Tier-3 ``lcm_compact`` adapter — the 2-method
-# ``CompactContext`` shim — so ``lcm_compact`` is removed from this set
-# and now PASSes (a)/(b) as hard assertions. Coverage is 7/8. Only
-# ``lcm_synthesize_around`` remains here, for PR-3.
-_NOT_YET_ADAPTED: frozenset[str] = frozenset({
-    "lcm_synthesize_around",
-})
+# A non-empty set here again would mean a new ported tool was advertised
+# without its adapter — the #156 bug regressing.
+_NOT_YET_ADAPTED: frozenset[str] = frozenset()
 
 
 # Minimal schema-valid args per tool, for the (b)/(c) ``handle_tool_call``
-# probes. The six un-adapted tools take the ``handler is None`` branch
-# before args are ever inspected, so their args only need to be
-# plausible; ``lcm_status`` / ``lcm_doctor`` have empty-parameter schemas
-# (ADR-035) so ``{}`` is correct for them.
+# probes. All eight tools now dispatch, so each tool's args reach its
+# handler — they must therefore be plausible enough that the handler
+# takes a *structured-error* path (e.g. "no conversation found", "missing
+# prompt") rather than the unknown-tool path. ``lcm_synthesize_around``
+# gets a valid ``window_kind="period"``: on the fresh fixtured engine
+# (no conversation, no summary-model config) the handler returns a
+# structured "No LCM conversation found" error — a clean (b) PASS (not
+# the unknown-tool error) and a clean (c) PASS (a JSON string). ``"recent"``
+# would be an invalid window_kind — still a clean structured error, but
+# a valid mode keeps the probe honest. ``lcm_status`` / ``lcm_doctor``
+# have empty-parameter schemas (ADR-035) so ``{}`` is correct for them.
 _MINIMAL_ARGS: dict[str, dict[str, Any]] = {
     "lcm_grep": {"pattern": "x"},
     "lcm_describe": {"id": "sum_1"},
     "lcm_get_entity": {"name": "x"},
     "lcm_search_entities": {},
     "lcm_compact": {},
-    "lcm_synthesize_around": {"window_kind": "recent"},
+    "lcm_synthesize_around": {"window_kind": "period", "period": "yesterday"},
     "lcm_status": {},
     "lcm_doctor": {},
 }
@@ -193,10 +207,13 @@ def _all_tool_names() -> list[str]:
 def _xfail_if_unadapted(name: str) -> Any:
     """Return a ``pytest.param`` for ``name``, xfail-marked if un-adapted.
 
-    Assertions (a) and (b) are expected to FAIL for a tool still in
-    :data:`_NOT_YET_ADAPTED` (no ``TOOL_DISPATCH`` entry → unknown-tool
-    error). ``strict=True`` makes a landed adapter (assertion starts
-    passing) an ``XPASS`` that fails the suite — the ratchet signal.
+    :data:`_NOT_YET_ADAPTED` is now empty (#156 closed by #164 PR-2), so
+    in practice every tool gets a plain :func:`pytest.param`. The
+    machinery is retained as a regression guard: if a future ported tool
+    is advertised in ``get_tool_schemas()`` before its adapter lands,
+    adding it to :data:`_NOT_YET_ADAPTED` re-arms the ``strict=True``
+    xfail ratchet — a landed adapter then ``XPASS``-fails the suite,
+    forcing the set back to empty.
     """
     if name in _NOT_YET_ADAPTED:
         return pytest.param(
@@ -204,9 +221,9 @@ def _xfail_if_unadapted(name: str) -> Any:
             marks=pytest.mark.xfail(
                 strict=True,
                 reason=(
-                    f"{name}: dispatch-adapter not yet wired (#156 PR-1..PR-3). "
-                    f"When the adapter lands this XPASSes — remove {name!r} "
-                    f"from _NOT_YET_ADAPTED in the same PR."
+                    f"{name}: dispatch-adapter not yet wired. When the "
+                    f"adapter lands this XPASSes — remove {name!r} from "
+                    f"_NOT_YET_ADAPTED in the same PR."
                 ),
             ),
         )
@@ -247,14 +264,15 @@ def test_every_advertised_tool_has_a_dispatch_entry(name: str) -> None:
     """(a) Every ``get_tool_schemas()`` tool is a key in ``TOOL_DISPATCH``.
 
     This is the pure-registry check that pins the #156 invariant: a tool
-    advertised to the model MUST have a dispatch handler. ``xfail`` for
-    the six not-yet-adapted ported tools (the #156 sequence wires them
-    in PR-1..PR-3); a hard pass for ``lcm_status`` / ``lcm_doctor``.
+    advertised to the model MUST have a dispatch handler. With #156
+    closed (#164 PR-2 wired the 8th adapter), this is a hard PASS for
+    all eight advertised tools — :data:`_NOT_YET_ADAPTED` is empty so no
+    parameter is xfail-marked.
     """
     assert name in TOOL_DISPATCH, (
         f"Tool {name!r} is advertised in get_tool_schemas() but has no "
         f"TOOL_DISPATCH entry — this is the #156 bug. Wire its dispatch "
-        f"adapter (see issue #156 PR-1..PR-3)."
+        f"adapter in tools/_adapters.py."
     )
 
 
@@ -273,15 +291,15 @@ def test_advertised_tool_does_not_return_unknown_tool_error(
 
     The behavioural twin of (a): a real fixtured engine dispatches the
     tool by name and the result must NOT be
-    ``{"error": "Unknown LCM tool: ..."}``. ``xfail`` for the six
-    not-yet-adapted ported tools — they hit the ``handler is None``
-    branch and return exactly that error.
+    ``{"error": "Unknown LCM tool: ..."}``. With #156 closed this is a
+    hard PASS for all eight tools — each dispatches to its adapter,
+    which (on the fresh fixtured engine) returns a structured
+    handler-level error, not the unknown-tool error.
 
     Note: a fresh fixtured engine has no LLM response yet, so the
     token-gate degrades to "skip the gate" (``current_token_count`` /
     ``token_budget`` are ``None``) — the result is the dispatch result,
-    never a gate refusal. So the un-adapted tools reliably produce the
-    unknown-tool error (a clean xfail), not an ambiguous refusal.
+    never a gate refusal.
     """
     result = engine.handle_tool_call(name, _MINIMAL_ARGS[name])
     parsed = json.loads(result)
@@ -444,15 +462,21 @@ def test_lcm_expand_deferred() -> None:
 
 
 def test_advertised_surface_is_the_expected_eight_tools() -> None:
-    """``get_tool_schemas()`` advertises exactly the eight expected tools.
+    """The advertised surface AND ``TOOL_DISPATCH`` are exactly the eight tools.
 
-    Pins the post-ADR-037 surface: the six ported tools the #156
-    sequence wires (``lcm_grep``, ``lcm_describe``, ``lcm_get_entity``,
+    Pins the post-ADR-037, post-#156 surface: the six ported tools
+    (``lcm_grep``, ``lcm_describe``, ``lcm_get_entity``,
     ``lcm_search_entities``, ``lcm_compact``, ``lcm_synthesize_around``)
     plus the two ADR-035 diagnostic tools (``lcm_status``,
-    ``lcm_doctor``). ``lcm_expand`` (ADR-037) is excluded. A drift here
-    means a tool was added or dropped without updating this test and
-    ``_NOT_YET_ADAPTED``.
+    ``lcm_doctor``). ``lcm_expand`` (ADR-037) is excluded.
+
+    With #156 closed by #164 PR-2, this asserts the **dispatch surface
+    equals the advertised surface** — ``set(TOOL_DISPATCH)`` is exactly
+    ``{name for s in get_tool_schemas()}``, i.e. 8/8 coverage with no
+    advertised-but-undispatchable tool and no dispatchable-but-unadvertised
+    tool. That set-equality is the strongest form of the #156 invariant.
+    A drift in either set means a tool was added or dropped without
+    updating this test (and, for a new ported tool, ``_NOT_YET_ADAPTED``).
     """
     expected = {
         "lcm_grep",
@@ -469,4 +493,12 @@ def test_advertised_surface_is_the_expected_eight_tools() -> None:
         f"Advertised tool surface drifted. expected={sorted(expected)}, "
         f"actual={sorted(actual)}. If a tool was intentionally added or "
         f"removed, update this test AND _NOT_YET_ADAPTED."
+    )
+    # #156 closed: dispatch coverage is total. Every advertised tool
+    # dispatches, and nothing dispatches that is not advertised.
+    assert set(TOOL_DISPATCH) == expected, (
+        f"TOOL_DISPATCH drifted from the advertised surface. "
+        f"expected={sorted(expected)}, actual={sorted(TOOL_DISPATCH)}. "
+        f"#156 requires dispatch coverage to equal the advertised "
+        f"surface exactly (8/8)."
     )
