@@ -160,14 +160,22 @@ TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 # tool list being stable; adding a new per-tool module appends; the
 # 06-02 dispatch table sees the same order.
 #
+# ADR-037 / issue #156 — ``expand`` is imported but registers NOTHING.
+# ``lcm_expand`` is deferred to post-v0.2.0 (see
+# ``docs/adr/037-lcm-expand-deferred.md``): the ``expand`` module is
+# still imported so ``handle_lcm_expand`` + ``LCM_EXPAND_SCHEMA`` stay
+# available for the future port, but the module deliberately omits the
+# ``TOOL_SCHEMAS.append(LCM_EXPAND_SCHEMA)`` side-effect. The model-facing
+# surface is therefore 8 tools (6 ported + ``lcm_status`` + ``lcm_doctor``),
+# not 9.
+#
 # The two diagnostic tools (``status``, ``doctor``) are appended LAST,
-# after the seven ported ``lcm_*`` tools. Per ADR-035 these are NEW
-# tools (no TS source); keeping them at the tail of the import order
-# keeps the seven-tool ported surface contiguous and the registration
-# order stable for tests.
+# after the ported ``lcm_*`` tools. Per ADR-035 these are NEW tools (no
+# TS source); keeping them at the tail of the import order keeps the
+# ported surface contiguous and the registration order stable for tests.
 from lossless_hermes.tools import compact as _compact  # noqa: F401, E402
 from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
-from lossless_hermes.tools import expand as _expand  # noqa: F401, E402
+from lossless_hermes.tools import expand as _expand  # noqa: F401, E402  # ADR-037: registers nothing — deferred
 from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
 from lossless_hermes.tools import grep as _grep  # noqa: F401, E402
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402

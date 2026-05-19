@@ -81,6 +81,7 @@ from lossless_hermes.store.compaction_telemetry import CompactionTelemetryStore
 from lossless_hermes.store.conversation import ConversationStore
 from lossless_hermes.store.summary import SummaryStore
 from lossless_hermes.tools import get_tool_schemas as _registry_get_tool_schemas
+from lossless_hermes.tools._common import tool_result
 
 from lossless_hermes.plugin.needs_compact_gate import (
     TOKEN_GATE_TOOLS,
@@ -240,38 +241,60 @@ class RuntimeContext:
 # Per the issue spec (``epics/06-tools/06-02-tool-dispatch-table.md``)
 # and the porting guide (``docs/porting-guides/tools.md`` lines 622–688),
 # this is the canonical handler registry consulted by
-# :meth:`LCMEngine.handle_tool_call`. Per-tool issues 06-07 through 06-14
-# register their handler here at import time::
+# :meth:`LCMEngine.handle_tool_call`.
 #
-#     # In tools/grep.py at module scope:
-#     from lossless_hermes.engine import TOOL_DISPATCH
-#     TOOL_DISPATCH["lcm_grep"] = handle_lcm_grep
+# **How tools are wired (issue #156 — corrected).** The earlier plan
+# was for each per-tool dispatch issue (06-07..06-14) to register its
+# handler here at import time from inside the per-tool module. That did
+# NOT happen: Epic 06's per-tool issues delivered the handler bodies +
+# schemas + unit tests but never the **dispatch-adapter layer**, so the
+# seven ported ``lcm_*`` tools had ``TOOL_SCHEMAS`` entries the model
+# could see but no ``TOOL_DISPATCH`` entries — the P0 tracked in
+# [issue #156](https://github.com/electricsheephq/lossless-hermes/issues/156).
+# The ported handlers take strict keyword-only typed ``ctx: XContext``
+# Protocols (plus, for most, a ``deps``) that the engine cannot satisfy
+# directly, so a naive ``TOOL_DISPATCH["lcm_grep"] = handle_lcm_grep``
+# would ``TypeError`` on first call.
 #
-# At 06-02 the registry is EMPTY. The :func:`get_tool_schemas` registry
-# (``lossless_hermes.tools.TOOL_SCHEMAS``) is also empty — per-tool
-# ports populate both atomically as they land.
+# The fix (issue #156, a four-PR sequence PR-0..PR-3) wires the ported
+# tools **centrally via a dispatch-adapter layer** — per-tool adapters
+# that construct the typed context + ``deps`` from the engine and call
+# the real ``handle_lcm_*`` with the correct keyword args, each
+# registered into ``TOOL_DISPATCH`` with the uniform
+# ``adapter(args, **kwargs) -> str`` shape. PR-0 (the safety-net PR)
+# crash-hardens :meth:`_dispatch_tool_call` and is the prerequisite for
+# the incremental adapter rollout.
 #
-# **Why module-level, not class-level**: tests and per-tool ports both
-# need write access. A class attribute would mean every test that
+# **Why module-level, not class-level**: tests and the adapter layer
+# both need write access. A class attribute would mean every test that
 # stubs a handler has to know the subclass shape; a module-level dict
 # keeps the registration site one stable line per tool. Per ADR-TOOLS-03
 # in tools.md, the middleware lives in :meth:`handle_tool_call` (Option
-# B), and the dispatch table is the obvious public seam for per-tool
-# wiring.
+# B), and the dispatch table is the obvious public seam.
 #
-# **The signature**: per the porting guide line 654–687, each handler
-# is called as ``handler(args, **kwargs)`` where kwargs includes
-# ``db``, ``retrieval``, ``voyage``, ``deps``, ``session_key``,
-# ``runtime_ctx``, and ``messages``. The exact kwargs list is finalized
-# when per-tool issues land — at 06-02 the dispatch passes through
-# whatever ``LCMEngine.handle_tool_call`` was called with (plus the
-# resolved ``session_key`` + ``runtime_ctx``). Handlers MUST return a
-# JSON string (per :py:func:`lossless_hermes.tools._common.tool_result`).
+# **The signature**: every registered callable is invoked as
+# ``handler(args, **kwargs)`` where kwargs includes the resolved
+# ``session_key`` + ``runtime_ctx`` (plus ``ctx=<engine>`` and any
+# handler-relevant kwargs the caller passed, e.g. ``messages``). The
+# ported tools' real handlers do NOT take this shape directly — the
+# #156 dispatch adapters bridge the engine-uniform signature to each
+# handler's typed contract. Registered callables MUST return a JSON
+# string (per :py:func:`lossless_hermes.tools._common.tool_result`).
 #
-# **v0.1.0 omission**: per [ADR-012](../../docs/adr/012-subagent-defer.md),
-# ``lcm_expand_query`` is NOT registered in v0.1.0 — only 7 of the 8
-# LCM tools ship. The dispatch entry is left absent (the lookup falls
-# through to the unknown-tool error path).
+# **Deferred tools** (NOT registered, by design):
+# * ``lcm_expand_query`` — per [ADR-012](../../docs/adr/012-subagent-defer.md),
+#   the sub-agent convenience tool is deferred; absent from both
+#   ``TOOL_SCHEMAS`` and ``TOOL_DISPATCH``.
+# * ``lcm_expand`` — per [ADR-037](../../docs/adr/037-lcm-expand-deferred.md)
+#   (issue #156), the sub-agent expansion tool is deferred to a
+#   post-v0.2.0 epic: its ``ExpansionOrchestrator`` / ``Retrieval``
+#   collaborators are Protocol-only with no production implementation,
+#   and it is operationally dead without the ADR-012-deferred
+#   delegation path. Its schema is removed from ``TOOL_SCHEMAS`` (an
+#   unusable tool must not be advertised — that is the #156 bug);
+#   ``handle_lcm_expand`` is retained for the future port.
+# A lookup miss for a deferred tool falls through to the structured
+# unknown-tool error path.
 
 TOOL_DISPATCH: Final[Dict[str, Callable[..., str]]] = {}
 
@@ -284,15 +307,17 @@ TOOL_DISPATCH: Final[Dict[str, Callable[..., str]]] = {}
 # Per [ADR-035](../../docs/adr/035-lcm-status-doctor-model-tools.md),
 # ``lcm_status`` and ``lcm_doctor`` are read-only model tools wrapping
 # the existing ``commands/status.py`` + ``doctor/shared.py`` bodies.
-# They register in the dispatch table here — the documented per-tool
-# wiring site (``TOOL_DISPATCH["<name>"] = handle_<name>``). The seven
-# ported ``lcm_*`` tools' handlers are wired by their own per-tool
-# dispatch issues; these two land with issue #135.
+# They register in the dispatch table here — the documented wiring site
+# (``TOOL_DISPATCH["<name>"] = handle_<name>``). These two land with
+# issue #135 (PR #155); the seven ported ``lcm_*`` tools are wired
+# centrally via the issue-#156 dispatch-adapter layer (see the
+# TOOL_DISPATCH comment block above).
 #
-# Both handlers take the ``handler(args, **kwargs)`` shape
-# :meth:`LCMEngine._dispatch_tool_call` calls them with, and read the
-# engine off the ``ctx`` kwarg (see :meth:`handle_tool_call`, which
-# passes ``ctx=self``). Neither tool is owner-gated (read-only) and
+# Both handlers natively take the ``handler(args, **kwargs)`` shape
+# :meth:`LCMEngine._dispatch_tool_call` calls them with (they carry a
+# ``**_kwargs`` sink), and read the engine off the ``ctx`` kwarg (see
+# :meth:`handle_tool_call`, which passes ``ctx=self``) — which is why
+# they need no adapter. Neither tool is owner-gated (read-only) and
 # neither is in :data:`TOKEN_GATE_TOOLS` (a self-diagnosis tool must
 # stay callable when context is near-full).
 from lossless_hermes.tools.doctor import handle_lcm_doctor as _handle_lcm_doctor
@@ -1297,10 +1322,31 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         Handlers that do not need the engine accept it via ``**kwargs``
         and ignore it.
 
+        Crash-hardening (issue #156, PR-0)
+        ----------------------------------
+        The ``handler(args, **kwargs)`` call is wrapped in a broad
+        ``try/except``. The dispatch-adapter rollout (#156 PR-1..PR-3)
+        wires the seven ported ``lcm_*`` handlers incrementally; until a
+        tool's adapter lands, a direct ``handler(args, **kwargs)`` call
+        against its strict keyword-only typed signature would raise a
+        :class:`TypeError` (no ``runtime_ctx`` param, no ``**kwargs``
+        sink, missing required ``deps``). An exception escaping this
+        method surfaces through Hermes's tool-dispatch loop as a
+        5xx-equivalent — strictly worse than today's structured
+        unknown-tool error. The wrapper converts any handler failure
+        (``TypeError`` from a signature mismatch, or any other
+        ``Exception`` from the handler body) into a structured
+        tool-error string, matching the house pattern in
+        ``tools/status.py`` (``handle_lcm_status``'s ``except
+        Exception``). The ``handler is None`` unknown-tool branch is
+        unchanged.
+
         Returns:
             The tool's JSON-encoded result string. On unknown names,
             the structured ``{"error": "Unknown LCM tool: ..."}`` JSON
-            string per the 06-02 spec AC.
+            string per the 06-02 spec AC. On a handler crash, a
+            structured ``{"error": "LCM tool '<name>' failed: ..."}``
+            string (issue #156).
         """
         handler = TOOL_DISPATCH.get(name)
         if handler is None:
@@ -1309,4 +1355,18 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # read-only diagnostic tools can reach the DB + session state.
         # ``setdefault`` so an explicit caller-supplied ``ctx`` wins.
         kwargs.setdefault("ctx", self)
-        return handler(args, **kwargs)
+        # Issue #156 (PR-0): a handler signature mismatch (TypeError) or
+        # any crash inside the handler body must NOT escape to Hermes's
+        # dispatch loop as an unhandled exception. Convert it to a
+        # structured tool-error string — same posture as
+        # ``handle_lcm_status``'s ``except Exception`` (status.py).
+        try:
+            return handler(args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — dispatch must return text, not raise
+            logger.warning("[lcm] tool %r handler raised during dispatch", name, exc_info=True)
+            return tool_result({
+                "error": (
+                    f"LCM tool {name!r} failed: {exc}. This is an internal "
+                    "dispatch error — check the gateway log."
+                )
+            })
