@@ -886,16 +886,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Auth gate. `_api_keys_present` returns a bare bool — the secret
     # values are collapsed to one bit inside it and never escape. The
-    # branch condition and the log message are therefore both free of
-    # any environment-tainted data; the message is built purely from the
-    # REQUIRED_API_KEYS literal.
+    # skip message below is a fully static string: it deliberately does
+    # NOT interpolate the credential-variable names (which a static
+    # scanner's sensitive-name heuristic would flag) — the workflow YAML
+    # and the module docstring already name the required secrets.
     if not _api_keys_present(dict(os.environ)):
         print(
-            f"[live-eval] SKIP — one or more required API keys are not set "
-            f"({' + '.join(REQUIRED_API_KEYS)}). The live-eval suite is "
-            f"gated on these (ADR-028 §live markers). Exiting {EX_CONFIG} "
-            f"(EX_CONFIG) so the workflow records a clean skip rather than "
-            f"a failure.",
+            "[live-eval] SKIP - the live-eval suite's required API "
+            "credentials are not configured (see the live-eval.yml "
+            "workflow + this script's module docstring for which secrets "
+            "to set; ADR-028 covers the live-test marker gating). "
+            "Exiting 78 (EX_CONFIG) so the workflow records a clean skip "
+            "rather than a failure.",
             file=sys.stderr,
         )
         return EX_CONFIG
