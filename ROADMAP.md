@@ -18,7 +18,7 @@
 | **M4** | Per-turn ingest + assembly running on live conversations | Epic 03 closed | 03 |
 | **M5** | Compaction actually compresses | Epic 04 closed; `/lcm health` shows working pyramid | 04 |
 | **M6** | Embeddings + hybrid retrieval live; +52.5pp lift reproducible | Epic 05 closed | 05 |
-| **M7** | All 7 tools (v0.1.0 set) wired and tested | Epic 06 closed | 06 |
+| **M7** | All 7 tools (v0.1.0 set) wired and tested | Epic 06 closed — but the ported tools' **dispatch wiring was never built** (P0 #156): schemas shipped, `TOOL_DISPATCH` entries did not. Fixed across v0.2.0 PR-0..PR-3 (crash-hardening + `lcm_expand` deferral per ADR-037 + dispatch-adapter layer). | 06 |
 | **M8** | Entity + synthesis pipelines green | Epic 07 closed | 07 |
 | **M9** | All operator commands working; `import-openclaw` migration verified | Epic 08 closed | 08 |
 | **M10** | Eval suite green; drift CI gating in place | Epic 09 closed | 09 |
