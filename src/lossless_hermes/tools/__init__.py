@@ -1,13 +1,20 @@
 """LCM agent tools — schema definitions, dispatch handlers, shared helpers.
 
-This package owns the eight LCM tools (``lcm_grep``, ``lcm_describe``,
-``lcm_expand``, ``lcm_expand_query``, ``lcm_synthesize_around``,
-``lcm_get_entity``, ``lcm_search_entities``, ``lcm_compact``). Each
+This package owns the LCM agent tools. Seven are ports of the LCM
+TypeScript tool factories (``lcm_grep``, ``lcm_describe``,
+``lcm_expand``, ``lcm_synthesize_around``, ``lcm_get_entity``,
+``lcm_search_entities``, ``lcm_compact``; ``lcm_expand_query`` is
+deferred per ADR-012). Two more — ``lcm_status`` and ``lcm_doctor`` —
+are read-only, model-callable diagnostic tools added by
+[ADR-035](../../docs/adr/035-lcm-status-doctor-model-tools.md); they
+wrap the existing ``commands/status.py`` and
+``doctor/shared.py`` read-only bodies and have no TS source. Each
 per-tool module exports an ``LCM_<TOOL>_SCHEMA`` dict (OpenAI
 function-call format) and a handler callable. Issue 06-01 lands the
 **foundation**: the TypeBox -> Python dict translation helpers
 (:mod:`lossless_hermes.tools._typebox`) and the schema registry
-(:func:`get_tool_schemas` below). Per-tool ports land in 06-07..06-14.
+(:func:`get_tool_schemas` below). Per-tool ports land in 06-07..06-14;
+the ADR-035 diagnostic tools land under issue #135.
 
 The package also hosts non-tool shared SQL/conversation/recursion
 helpers that several tools import — e.g. :mod:`entity_shared` (Wave-12
@@ -152,6 +159,12 @@ TOOL_SCHEMAS: Final[list[dict[str, Any]]] = []
 # Ordering note: import order = registration order. Tests rely on the
 # tool list being stable; adding a new per-tool module appends; the
 # 06-02 dispatch table sees the same order.
+#
+# The two diagnostic tools (``status``, ``doctor``) are appended LAST,
+# after the seven ported ``lcm_*`` tools. Per ADR-035 these are NEW
+# tools (no TS source); keeping them at the tail of the import order
+# keeps the seven-tool ported surface contiguous and the registration
+# order stable for tests.
 from lossless_hermes.tools import compact as _compact  # noqa: F401, E402
 from lossless_hermes.tools import describe as _describe  # noqa: F401, E402
 from lossless_hermes.tools import expand as _expand  # noqa: F401, E402
@@ -159,6 +172,12 @@ from lossless_hermes.tools import get_entity as _get_entity  # noqa: F401, E402
 from lossless_hermes.tools import grep as _grep  # noqa: F401, E402
 from lossless_hermes.tools import search_entities as _search_entities  # noqa: F401, E402
 from lossless_hermes.tools import synthesize_around as _synthesize_around  # noqa: F401, E402
+
+# ADR-035 diagnostic tools — read-only, model-callable lcm_status /
+# lcm_doctor. Imported after the seven ported tools so their schemas
+# append to TOOL_SCHEMAS at the tail.
+from lossless_hermes.tools import doctor as _diag_doctor  # noqa: F401, E402
+from lossless_hermes.tools import status as _diag_status  # noqa: F401, E402
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:

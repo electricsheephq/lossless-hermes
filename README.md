@@ -264,7 +264,7 @@ lossless_hermes:
 
 ## Agent tools
 
-LCM registers **7 agent tools** so the model can search and recall compacted history:
+LCM registers **9 agent tools** so the model can search, recall, and self-diagnose:
 
 | Tool | What it does |
 |---|---|
@@ -275,7 +275,13 @@ LCM registers **7 agent tools** so the model can search and recall compacted his
 | `lcm_get_entity` | Look up a tracked entity in the coreference catalog |
 | `lcm_search_entities` | Search / browse the entity catalog, optionally by entity type |
 | `lcm_compact` | Operator-opt-in escape valve — let the agent trigger an LCM compaction pass |
+| `lcm_status` | Read-only self-diagnosis — snapshot LCM's own health (config, counts, context pressure, cache state) mid-turn ([ADR-035](./docs/adr/035-lcm-status-doctor-model-tools.md)) |
+| `lcm_doctor` | Read-only self-diagnosis — scan stored summaries for integrity problems (broken / fallback / truncated); does not repair ([ADR-035](./docs/adr/035-lcm-status-doctor-model-tools.md)) |
 
+> `lcm_status` and `lcm_doctor` are read-only diagnostics — no DB writes, no owner gate. The
+> `/lcm status` and `/lcm doctor` slash commands remain the surface for the write paths
+> (`/lcm doctor apply`, etc.).
+>
 > `lcm_expand_query` (recursive expansion via a bounded sub-agent) is deferred to a future
 > release — see [ADR-012](./docs/adr/012-subagent-defer.md).
 

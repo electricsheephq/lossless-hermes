@@ -277,6 +277,32 @@ TOOL_DISPATCH: Final[Dict[str, Callable[..., str]]] = {}
 
 
 # ---------------------------------------------------------------------------
+# ADR-035 diagnostic tools — register the two read-only, model-callable
+# diagnostic handlers (``lcm_status`` / ``lcm_doctor``).
+# ---------------------------------------------------------------------------
+#
+# Per [ADR-035](../../docs/adr/035-lcm-status-doctor-model-tools.md),
+# ``lcm_status`` and ``lcm_doctor`` are read-only model tools wrapping
+# the existing ``commands/status.py`` + ``doctor/shared.py`` bodies.
+# They register in the dispatch table here — the documented per-tool
+# wiring site (``TOOL_DISPATCH["<name>"] = handle_<name>``). The seven
+# ported ``lcm_*`` tools' handlers are wired by their own per-tool
+# dispatch issues; these two land with issue #135.
+#
+# Both handlers take the ``handler(args, **kwargs)`` shape
+# :meth:`LCMEngine._dispatch_tool_call` calls them with, and read the
+# engine off the ``ctx`` kwarg (see :meth:`handle_tool_call`, which
+# passes ``ctx=self``). Neither tool is owner-gated (read-only) and
+# neither is in :data:`TOKEN_GATE_TOOLS` (a self-diagnosis tool must
+# stay callable when context is near-full).
+from lossless_hermes.tools.doctor import handle_lcm_doctor as _handle_lcm_doctor
+from lossless_hermes.tools.status import handle_lcm_status as _handle_lcm_status
+
+TOOL_DISPATCH["lcm_status"] = _handle_lcm_status
+TOOL_DISPATCH["lcm_doctor"] = _handle_lcm_doctor
+
+
+# ---------------------------------------------------------------------------
 # TOKEN_GATE_TOOLS is re-exported (canonical definition lives in
 # ``lossless_hermes.plugin.needs_compact_gate`` — see import block above
 # and ``__all__``). Per 06-03 (PR #95), the gate's authoritative
@@ -1263,6 +1289,14 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
                 handler-relevant kwargs the caller passed (e.g.
                 ``messages``).
 
+        The engine itself is passed to the handler as the ``ctx``
+        kwarg — the ADR-035 diagnostic handlers (``lcm_status`` /
+        ``lcm_doctor``) read the DB + session state off it. ``ctx`` is
+        only injected if the caller did not already supply it, so a
+        test that passes an explicit ``ctx`` stand-in is respected.
+        Handlers that do not need the engine accept it via ``**kwargs``
+        and ignore it.
+
         Returns:
             The tool's JSON-encoded result string. On unknown names,
             the structured ``{"error": "Unknown LCM tool: ..."}`` JSON
@@ -1271,4 +1305,8 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         handler = TOOL_DISPATCH.get(name)
         if handler is None:
             return json.dumps({"error": f"Unknown LCM tool: {name}"})
+        # ADR-035: hand the engine to the handler as ``ctx`` so the
+        # read-only diagnostic tools can reach the DB + session state.
+        # ``setdefault`` so an explicit caller-supplied ``ctx`` wins.
+        kwargs.setdefault("ctx", self)
         return handler(args, **kwargs)

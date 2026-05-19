@@ -60,17 +60,15 @@ Test taxonomy
   fixture[name]`` byte-identical. Failure prints a ``difflib.unified_diff``
   so the reviewer can read the prose-level delta.
 * :func:`test_no_extra_tools_registered` — the set of registered
-  names is a subset of the v0.1.0 expected set (``lcm_grep``,
-  ``lcm_describe``, ``lcm_expand``, ``lcm_synthesize_around``,
-  ``lcm_get_entity``, ``lcm_search_entities``, ``lcm_compact``).
-  ``lcm_expand_query`` is in the fixture for completeness but the
-  v0.1.0 test skips its registration (ADR-012 defers the sub-agent).
-* :func:`test_no_missing_tools_registered` — the set of expected v0.1.0
-  tools is a subset of the registered set. Together with the
-  no-extras assertion, this pins the registry to the exact 7-tool
-  v0.1.0 surface. Skipped (``xfail``) while per-tool ports
-  (06-07..06-14) are in flight; flips to ``strict`` when the v0.1.0
-  registry stabilizes.
+  names is a subset of the expected set: the seven ported tools
+  (``lcm_grep``, ``lcm_describe``, ``lcm_expand``,
+  ``lcm_synthesize_around``, ``lcm_get_entity``, ``lcm_search_entities``,
+  ``lcm_compact``) plus the two ADR-035 diagnostic tools (``lcm_status``,
+  ``lcm_doctor``). ``lcm_expand_query`` is in the fixture for
+  completeness but is not registered (ADR-012 defers the sub-agent).
+* :func:`test_no_missing_tools_registered` — the set of expected tools
+  is a subset of the registered set. Together with the no-extras
+  assertion, this pins the registry to the exact nine-tool surface.
 * :func:`test_fixture_provenance_matches_source_pin` — the
   ``_provenance`` field in the fixture must match the canonical LCM
   source pin recorded in
@@ -147,10 +145,14 @@ def _load_fixture() -> dict[str, Any]:
 
 _FIXTURE: Final[dict[str, Any]] = _load_fixture()
 
-# v0.1.0 ships seven tools. ``lcm_expand_query`` is in the fixture (for
-# parity with the TS surface and to make future un-deferral mechanical)
-# but the test set excludes it — per ADR-012 the sub-agent is deferred.
-_V01_TOOL_NAMES: Final[frozenset[str]] = frozenset({
+# The model-facing tool surface. Seven tools are ports of the LCM TS
+# tool factories; ``lcm_expand_query`` is in the fixture (for parity
+# with the TS surface and to make future un-deferral mechanical) but is
+# excluded here — per ADR-012 the sub-agent is deferred. Two more —
+# ``lcm_status`` and ``lcm_doctor`` — are read-only model-callable
+# diagnostic tools added by ADR-035 (issue #135); they have no TS
+# source but are pinned the same way (see the fixture's ``_adr035_note``).
+_EXPECTED_TOOL_NAMES: Final[frozenset[str]] = frozenset({
     "lcm_grep",
     "lcm_describe",
     "lcm_expand",
@@ -158,6 +160,9 @@ _V01_TOOL_NAMES: Final[frozenset[str]] = frozenset({
     "lcm_get_entity",
     "lcm_search_entities",
     "lcm_compact",
+    # ADR-035 diagnostic tools.
+    "lcm_status",
+    "lcm_doctor",
 })
 
 
@@ -299,55 +304,44 @@ def test_every_registered_tool_description_matches_fixture(
 
 
 def test_no_extra_tools_registered() -> None:
-    """No tool outside the v0.1.0 expected set is registered.
+    """No tool outside the expected set is registered.
 
     Per [ADR-012](../../docs/adr/012-subagent-defer.md), ``lcm_expand_query``
     is deferred — it's in the fixture (for parity) but must NOT be
-    registered in v0.1.0. Catches accidental registration that would
-    expose the sub-agent to the model.
+    registered. Catches accidental registration that would expose the
+    sub-agent to the model.
 
-    A passing instance of this test when the registry is empty (Wave 5
-    in flight) is informational only — the no-missing test below pins
-    the lower bound.
+    The expected set is the seven ported ``lcm_*`` tools plus the two
+    ADR-035 diagnostic tools (``lcm_status`` / ``lcm_doctor``).
     """
     registered = _registered_tool_names()
-    extras = registered - _V01_TOOL_NAMES
+    extras = registered - _EXPECTED_TOOL_NAMES
     assert not extras, (
-        f"Unexpected tools registered for v0.1.0: {sorted(extras)}. "
-        f"Per ADR-012, the v0.1.0 surface is exactly "
-        f"{sorted(_V01_TOOL_NAMES)}. If a new tool needs to ship, "
-        f"update _V01_TOOL_NAMES here AND add the description to the "
+        f"Unexpected tools registered: {sorted(extras)}. "
+        f"The expected model-facing surface is exactly "
+        f"{sorted(_EXPECTED_TOOL_NAMES)}. If a new tool needs to ship, "
+        f"update _EXPECTED_TOOL_NAMES here AND add the description to the "
         f"verbatim fixture."
     )
 
 
 def test_no_missing_tools_registered() -> None:
-    """All seven v0.1.0 tools are registered.
+    """Every expected tool is registered.
 
-    Marked ``xfail`` while Wave-5 per-tool ports (06-07..06-14) are in
-    flight. Flips to a real assert when the registry stabilizes:
-
-    1. Remove the ``@pytest.mark.xfail`` decorator.
-    2. CI is then a hard gate on the v0.1.0 release readiness.
-
-    The xfail is ``strict=False`` so the test passes once every tool
-    lands without a follow-up PR to flip the marker.
+    The expected surface is the seven ported ``lcm_*`` tools plus the
+    two ADR-035 diagnostic tools. All nine register their schema at
+    import time, so this is a hard assertion — a missing tool is a real
+    regression (a per-tool module that stopped appending to
+    ``TOOL_SCHEMAS``, or an import dropped from ``tools/__init__.py``).
     """
     registered = _registered_tool_names()
-    missing = _V01_TOOL_NAMES - registered
-    if missing:
-        # While per-tool ports are in flight, this is expected. Use
-        # ``xfail`` so the test surfaces in CI ("xfailed: 06-08 grep
-        # pending"). Flip to ``raise AssertionError`` once stable.
-        pytest.xfail(
-            reason=(
-                f"v0.1.0 expects {len(_V01_TOOL_NAMES)} tools registered; "
-                f"missing {sorted(missing)} (per-tool ports 06-07..06-14 "
-                f"in flight). Remove this xfail when Wave 5 closes."
-            )
-        )
-    # Once all 7 tools land, this assertion passes unconditionally.
-    assert not missing
+    missing = _EXPECTED_TOOL_NAMES - registered
+    assert not missing, (
+        f"Expected {len(_EXPECTED_TOOL_NAMES)} tools registered; "
+        f"missing {sorted(missing)}. Each tool module must append its "
+        f"LCM_<TOOL>_SCHEMA to TOOL_SCHEMAS at import, and "
+        f"tools/__init__.py must import the module."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +376,13 @@ _DESCRIPTION_SHA256: Final[dict[str, str]] = {
     "lcm_search_entities": "246c9f6f1d6c4a354f27e8998781700ff03063d24033d04a539b9276689b66ea",
     "lcm_compact": "8f4f484490cf06ad9d2e0b9e20fd847c6b5b05f064c1341fd28052827405bf2a",
     "lcm_expand_query": "ab77cdbb7a9e756591159e3056051405d8e639f9840e8f611ee999b18efecfe7",
+    # ADR-035 (#135) diagnostic tools — no TS source. SHA computed at
+    # implementation time from the LCM_*_DESCRIPTION constants in
+    # src/lossless_hermes/tools/{status,doctor}.py. If the description
+    # prose is intentionally retuned, update the Python constant, the
+    # fixture entry, AND the hash here together.
+    "lcm_status": "0d9ef70df0eab3d3cc44950240f1d87a0a642d45a16c3eee5ba3399627ef4e26",
+    "lcm_doctor": "86ce30d62ee130df4b838ad2a1c7cd582d44629f0ccec8650885ae4327e309c8",
 }
 
 
