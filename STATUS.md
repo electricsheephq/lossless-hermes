@@ -6,14 +6,15 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W5 ready to dispatch** — Wave 4 CLOSED (Epic 03 + Epic 05 complete; 25 Wave-4 PRs merged); Wave 5 = Epic 04 compaction + Epic 06 tools + Epic 07 entity/synth + Epic 08 CLI/ops (max fan-out, up to 8 concurrent executors) |
-| **Current milestone** | M1 ✅, M2 ✅, M3 ✅, **M4 ✅** (per-turn ingest + assembly live: 03-02 ingest body, 03-04..03-08 assembler chain, 03-09 always-on substitution, 03-10 recall-policy, 05-01..05-11 Voyage + vec0 + worker stack); M5 (compaction) + M6 (embeddings lift) + M7 (7 tools) + M8 (entity/synth) + M9 (operator commands) next |
-| **Last merged PR** | [#59](https://github.com/electricsheephq/lossless-hermes/pull/59) `[05-10] embeddings: graceful-degradation contract (4 flags surfaced to callers)` |
-| **Last commit on main** | `1d93355` |
-| **Total PRs merged today** | **59** (Wave 0–4 complete + chores + fix-forwards + spec docs) |
-| **Total tests** | ~2000 passing across 6 OS×Python matrix cells |
+| **Current wave** | **W5 IN PROGRESS** — Epic 04 compaction ✅, Epic 06 tools ✅, Epic 07 entity/synth ✅, Epic 08 CLI/ops ~70% (doctor-shared + semantic-infra + reconcile + worker-orchestrator + eval-runner landed/landing; 08-07 doctor-apply + 08-08 doctor-cleaners pending re-dispatch) |
+| **Current milestone** | M1–M4 ✅; **M5 ✅** (compaction: Epic 04 04-01..04-08 + circuit-breaker); **M7 ✅** (8 tools: describe/get_entity/search_entities/grep+hybrid/compact/expand/synthesize_around + dispatch + token-gate + recursion-guard + verbatim-lint); **M8 ✅** (entity coreference + extractor + synthesis dispatch/cache_key/invalidation/tier-routing/audit); M9 (operator commands) ~70%; M6 (eval lift) → Wave 6 |
+| **Last merged PR** | [#113](https://github.com/electricsheephq/lossless-hermes/pull/113) `[07-09] synthesis: audit module + retention sweeps` |
+| **Last commit on main** | `67d44bd` |
+| **Total PRs merged** | **97** (Wave 0–4 complete + Wave 5 in progress + chores + fix-forwards) |
+| **Open PRs** | #114 (08-10 worker-orchestrator — green, in review), #115 (08-13 eval-runner — salvaged from rate-limited executor, CI running, in review) |
+| **Total tests** | ~3300 passing across 6 OS×Python matrix cells |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
-| **Open blockers** | None — see [`BLOCKERS.md`](./BLOCKERS.md) |
+| **Open blockers** | API rate-limit hit 2026-05-19 — 3 background executors (08-07/08-08/08-13) killed mid-run; 08-13 salvaged by project-lead session into PR #115; 08-07/08-08 to re-dispatch when quota healthy. See [`BLOCKERS.md`](./BLOCKERS.md) |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -66,11 +67,11 @@
 | M2 | DB layer feature-complete | ✅ done | Wave 2 closed 2026-05-13T13:43Z; 13 PRs + 1 chore; 907 tests; schema-diff subset 92/92 |
 | M3 | Engine round-trips messages | ✅ done | Wave 3 closed 2026-05-13; 9 PRs covering 10 issues + 2 fix-forwards; 1101 tests; LCMEngine wired through Hermes ABC + 4 plugin hooks + /lcm slash command |
 | M4 | Per-turn ingest + assembly live | ✅ done | Wave 4 closed 2026-05-13/14; 25 PRs covering Epic 03 (10 issues: 03-01..03-10) + Epic 05 (11 issues: 05-01..05-11); ContextAssembler.assemble() with full 16-step pipeline; preassemble ABC override (Option B) + experimental force-compress (Option A) coexistent per ADR-010; Voyage HTTP client + sqlite-vec store + WorkerLoop + WorkerLock + backfill cron + semantic + hybrid + degraded-modes contract + autostart |
-| M5 | Compaction working | ⏳ pending | Wave 5 — Epic 04 |
-| M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 5 (eval validation; embeddings stack landed in M4) |
-| M7 | 7 tools wired | ⏳ pending | Wave 5 |
-| M8 | Entity + synthesis green | ⏳ pending | Wave 5 |
-| M9 | All operator commands; import-openclaw verified | ⏳ pending | Wave 5 |
+| M5 | Compaction working | ✅ done | Wave 5 — Epic 04 (04-01..04-08 + circuit-breaker; compaction.py ~3000 LOC) |
+| M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 6 (eval validation; embeddings stack landed M4; eval-runner harness PR #115) |
+| M7 | 8 tools wired | ✅ done | Wave 5 — Epic 06 (all per-tool ports + dispatch + token-gate + recursion-guard + SHA-256 verbatim lint) |
+| M8 | Entity + synthesis green | ✅ done | Wave 5 — Epic 07 (coreference, extractor, synthesis dispatch/cache_key/invalidation/tier-routing/audit) |
+| M9 | All operator commands; import-openclaw verified | 🔄 ~70% | Wave 5 — Epic 08 (status/health/purge/backup/reconcile/doctor-shared/semantic-infra/import-openclaw done; doctor-apply/cleaners/worker-orch/eval-runner landing) |
 | M10 | Eval suite green; drift CI live | ⏳ pending | Wave 6 |
 | M11 | v0.1.0 release | ⏳ pending | Wave 6 |
 | M12 | v0.2.0 release (#628 stub-tier) | future | — |
@@ -99,4 +100,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-13 (after Wave 0 close + PR #1 merge)_
+_Last refreshed: 2026-05-19 (Wave 5 in progress — Epics 04/06/07 closed, Epic 08 ~70%; 97 PRs merged; #114 + #115 open in review)_
