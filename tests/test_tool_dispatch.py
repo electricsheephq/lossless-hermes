@@ -100,21 +100,24 @@ def test_tool_dispatch_is_dict() -> None:
     assert isinstance(TOOL_DISPATCH, dict)
 
 
-def test_tool_dispatch_holds_diagnostic_and_pr1_adapted_tools() -> None:
-    """The registry holds the ADR-035 diagnostics + the #156 PR-1 adapters.
+def test_tool_dispatch_holds_diagnostic_and_pr1_pr2_adapted_tools() -> None:
+    """The registry holds the ADR-035 diagnostics + the #156 PR-1/PR-2 adapters.
 
     The dispatch-adapter layer (issue #156) wires the ported ``lcm_*``
-    tools incrementally. After #156 PR-1 the registry holds:
+    tools incrementally. After #156 PR-2 the registry holds:
 
     * the two read-only model-callable diagnostic tools added by ADR-035
       (issue #135): ``lcm_status`` / ``lcm_doctor``;
     * the four Tier-1/2 tools wired by #156 PR-1: ``lcm_get_entity``,
-      ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``.
+      ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``;
+    * the Tier-3 ``lcm_compact`` wired by #156 PR-2 (its
+      ``CompactContext`` shim implements two methods —
+      ``get_agent_compaction_gate_state`` + ``compact``).
 
-    ``lcm_compact`` / ``lcm_synthesize_around`` are still absent (they
-    land in #156 PR-2 / PR-3) and ``lcm_expand`` is deferred per
-    ADR-037. Any other entry — or a PR-2/PR-3 tool appearing early —
-    means a tool was wired before its prerequisites; fail fast.
+    ``lcm_synthesize_around`` is still absent (it lands in #156 PR-3)
+    and ``lcm_expand`` is deferred per ADR-037. Any other entry — or
+    ``lcm_synthesize_around`` appearing early — means a tool was wired
+    before its prerequisites; fail fast.
     """
     assert set(TOOL_DISPATCH) == {
         "lcm_status",
@@ -123,11 +126,12 @@ def test_tool_dispatch_holds_diagnostic_and_pr1_adapted_tools() -> None:
         "lcm_search_entities",
         "lcm_describe",
         "lcm_grep",
+        "lcm_compact",
     }, (
         "TOOL_DISPATCH should hold the two ADR-035 diagnostic tools plus "
         "the four #156 PR-1 adapters (lcm_get_entity, lcm_search_entities, "
-        "lcm_describe, lcm_grep); lcm_compact / lcm_synthesize_around land "
-        f"in #156 PR-2 / PR-3. Got {sorted(TOOL_DISPATCH)}"
+        "lcm_describe, lcm_grep) plus the #156 PR-2 adapter (lcm_compact); "
+        f"lcm_synthesize_around lands in #156 PR-3. Got {sorted(TOOL_DISPATCH)}"
     )
 
 

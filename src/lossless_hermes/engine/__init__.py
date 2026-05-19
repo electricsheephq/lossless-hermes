@@ -348,9 +348,12 @@ TOOL_DISPATCH["lcm_doctor"] = _handle_lcm_doctor
 # registrations live here — the documented ``TOOL_DISPATCH`` wiring site,
 # mirroring ``lcm_status`` / ``lcm_doctor`` above.
 #
-# PR-1 wires four tools; ``lcm_compact`` / ``lcm_synthesize_around`` ship
-# in #156 PR-2 / PR-3, and ``lcm_expand`` is deferred per ADR-037.
+# PR-1 wired four tools; #156 PR-2 adds ``lcm_compact`` (the 2-method
+# ``CompactContext`` shim — see ``_adapters._CompactCtx``);
+# ``lcm_synthesize_around`` ships in PR-3, and ``lcm_expand`` is deferred
+# per ADR-037.
 from lossless_hermes.tools._adapters import (
+    _adapt_lcm_compact,
     _adapt_lcm_describe,
     _adapt_lcm_get_entity,
     _adapt_lcm_grep,
@@ -361,6 +364,7 @@ TOOL_DISPATCH["lcm_get_entity"] = _adapt_lcm_get_entity
 TOOL_DISPATCH["lcm_search_entities"] = _adapt_lcm_search_entities
 TOOL_DISPATCH["lcm_describe"] = _adapt_lcm_describe
 TOOL_DISPATCH["lcm_grep"] = _adapt_lcm_grep
+TOOL_DISPATCH["lcm_compact"] = _adapt_lcm_compact
 
 
 # ---------------------------------------------------------------------------

@@ -820,6 +820,26 @@ def handle_lcm_compact(
 # ===========================================================================
 
 
+#: ``CompactionResult.reason`` substrings that are genuine *failures* —
+#: i.e. the TS ``CompactResult`` envelope returns ``ok: false`` for them
+#: even though they are not auth failures. The match is substring + lower
+#: cased, identical to the keying :func:`_map_engine_reason` uses.
+#:
+#: Currently this is the single ``"missing token budget"`` reason. TS
+#: ``executeCompactionCore`` (``engine.ts:3363-3369``) returns
+#: ``{ok: false, compacted: false, reason: "missing token budget in
+#: compact params"}`` — a *budget* problem, not an auth problem. The
+#: Python ``LCMEngine.compact()`` takes a non-``Optional`` ``int`` budget
+#: so it can never itself emit this reason; the
+#: :class:`~lossless_hermes.tools._adapters._CompactCtx` shim's
+#: missing-budget guard is its sole producer. Listing the reason here
+#: (rather than flipping ``auth_failure``) keeps the failure *honest*:
+#: ``_map_engine_reason`` still maps it to the ``missing-budget`` tool
+#: enum and the agent-facing note still says "needs the host runtime to
+#: provide tokenBudget" — it is not mislabelled as an auth failure.
+_NON_AUTH_FAILURE_REASON_SUBSTRINGS: Final[tuple[str, ...]] = ("missing token budget",)
+
+
 def _result_ok(result: CompactionResult) -> bool:
     """Return the TS-equivalent ``ok`` flag for a :class:`CompactionResult`.
 
@@ -829,9 +849,25 @@ def _result_ok(result: CompactionResult) -> bool:
 
     * ``auth_failure=True`` -> ``ok=False`` (circuit breaker / provider
       auth tripped).
-    * Otherwise -> ``ok=True``.
+    * ``reason`` matching a :data:`_NON_AUTH_FAILURE_REASON_SUBSTRINGS`
+      entry -> ``ok=False``. These are genuine failures that are NOT
+      auth failures — TS returns ``ok: false`` for them too. Currently
+      just ``"missing token budget"``: TS ``executeCompactionCore``
+      (``engine.ts:3363-3369``) returns ``ok: false`` for the
+      missing-budget no-op, so a :class:`CompactionResult` carrying that
+      ``reason`` must report ``ok=False`` — without being mislabelled
+      ``auth_failure`` (it is a budget problem, not an auth problem).
+    * Otherwise -> ``ok=True``. Note the ``"no conversation found"``
+      no-op deliberately stays ``ok=True`` (TS ``engine.ts:7223-7227``
+      likewise returns ``ok: true`` for it) — only genuine failures
+      flip the bit.
     """
-    return not result.auth_failure
+    if result.auth_failure:
+        return False
+    reason = (result.reason or "").lower()
+    if any(sub in reason for sub in _NON_AUTH_FAILURE_REASON_SUBSTRINGS):
+        return False
+    return True
 
 
 def _result_indicates_compaction(result: CompactionResult) -> bool:

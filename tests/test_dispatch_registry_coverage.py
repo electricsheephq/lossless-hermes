@@ -144,7 +144,7 @@ _skip_no_extension_loading = pytest.mark.skipif(
 #
 #   * PR-1 → lcm_get_entity, lcm_search_entities, lcm_describe, lcm_grep
 #     (DONE — wired in PR-1, removed from this set)
-#   * PR-2 → lcm_compact
+#   * PR-2 → lcm_compact (DONE — wired in PR-2, removed from this set)
 #   * PR-3 → lcm_synthesize_around
 #
 # When an adapter lands, its (a)/(b) ``xfail(strict=True)`` markers turn
@@ -153,13 +153,13 @@ _skip_no_extension_loading = pytest.mark.skipif(
 # deferred and absent from ``get_tool_schemas()`` entirely (see
 # ``test_lcm_expand_deferred``).
 #
-# #156 PR-1 (this PR) wired the four Tier-1/2 adapters
-# (``lcm_get_entity``, ``lcm_search_entities``, ``lcm_describe``,
-# ``lcm_grep``) — they are removed from this set and now PASS (a)/(b) as
-# hard assertions. Only ``lcm_compact`` / ``lcm_synthesize_around``
-# remain here, for PR-2 / PR-3.
+# #156 PR-1 wired the four Tier-1/2 adapters (``lcm_get_entity``,
+# ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``). #156 PR-2
+# (this PR) wired the Tier-3 ``lcm_compact`` adapter — the 2-method
+# ``CompactContext`` shim — so ``lcm_compact`` is removed from this set
+# and now PASSes (a)/(b) as hard assertions. Coverage is 7/8. Only
+# ``lcm_synthesize_around`` remains here, for PR-3.
 _NOT_YET_ADAPTED: frozenset[str] = frozenset({
-    "lcm_compact",
     "lcm_synthesize_around",
 })
 
