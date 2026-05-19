@@ -182,12 +182,12 @@ class _AssembleMixin:
         _experimental_always_on_via_compress: bool
         _last_experimental_warn_ts: float
         ignore_session_patterns: List[re.Pattern[str]]
-        # v0.1.2 fix (issue #130, Defect 2). The diff-ingest cursor is
+        # v0.1.3 fix (issue #130, Defect 2). The diff-ingest cursor is
         # initialized on the shell; :meth:`preassemble` resets the
-        # per-session entry after a substitution shortens the live
-        # list. ``_reset_ingest_cursor_after_compaction`` is owned by
-        # the sibling :class:`_CompactMixin` — MRO resolves the
-        # ``self.`` call at runtime (the same pattern by which
+        # per-session entry after a genuine DAG substitution.
+        # ``_reset_ingest_cursor_after_compaction`` is owned by the
+        # sibling :class:`_CompactMixin` — MRO resolves the ``self.``
+        # call at runtime (the same pattern by which
         # :class:`_CompactMixin.compress` calls ``self._assemble``).
         _last_seen_message_idx: Dict[str, int]
 
@@ -197,6 +197,7 @@ class _AssembleMixin:
             original: List[Dict[str, Any]],
             result: List[Dict[str, Any]],
             session_id: str,
+            compaction_occurred: bool,
             source: str,
         ) -> None: ...
 
@@ -277,6 +278,17 @@ class _AssembleMixin:
                 messages, budget_tokens=...
             )
 
+        .. note:: **ADR-032 supersedes ADR-010 and slates ``preassemble``
+           for demotion.** ADR-032 (the ``hermes-lcm`` architecture
+           review) decided per-turn pre-assembly is NOT required — the
+           ingest + threshold/debt-gated compaction path reaches
+           losslessness without an every-turn full-list rewrite. The
+           demotion / removal of ``preassemble`` is separate v0.2.0 work
+           (issue #132); ``preassemble`` is NOT removed here. This
+           method stays a live v0.1.x path, so the issue #130 Defect-2
+           cursor reset below MUST remain correct for it while it
+           exists.
+
         ### Session-id inference
 
         Hermes's ``preassemble`` ABC signature does NOT pass a
@@ -348,27 +360,36 @@ class _AssembleMixin:
             else:
                 effective_budget = _DEFAULT_TOKEN_BUDGET
 
-            substituted = self._assemble(
+            substituted, did_substitute = self._assemble_with_signal(
                 session_id=session_id,
                 messages=messages,
                 token_budget=effective_budget,
                 prompt=None,
             )
 
-            # v0.1.2 fix (issue #130, Defect 2): when the substitution
-            # produced a SHORTER list, reset the diff-ingest cursor to
-            # the new length. ``preassemble`` is the Option B (production)
-            # path that REPLACES the live message list; without the
-            # reset the cursor stays past ``len(substituted)`` and
+            # v0.1.3 fix (issue #130, Defect 2): when the assembler
+            # produced a genuine DAG substitution, reset the diff-ingest
+            # cursor to the new length. ``preassemble`` is the Option B
+            # (production) path that REPLACES the live message list;
+            # without the reset the cursor — an absolute index into the
+            # live list — stays at the pre-substitution length and
             # ``_IngestMixin._do_ingest_history_diff`` early-returns
-            # forever, silently halting ingest. ``session_id`` is
-            # already non-empty here (the ``if not session_id`` guard
-            # above returned early). The helper is owned by
+            # forever, silently halting ingest. The gate is the
+            # ``did_substitute`` signal, NOT a list-length test:
+            # ``_assemble_with_signal`` returns ``did_substitute=False``
+            # whenever it fell back to ``_safe_fallback`` (e.g. the
+            # trailing-``assistant`` strip), which is a non-compaction
+            # reshape that must NOT reset the cursor — and ``True`` for
+            # a real substitution even when the substituted list is the
+            # same length as the live one. ``session_id`` is already
+            # non-empty here (the ``if not session_id`` guard above
+            # returned early). The helper is owned by
             # :class:`_CompactMixin`; ``self.`` resolves it via the MRO.
             self._reset_ingest_cursor_after_compaction(
                 original=messages,
                 result=substituted,
                 session_id=session_id,
+                compaction_occurred=did_substitute,
                 source="preassemble",
             )
             return substituted
@@ -398,6 +419,48 @@ class _AssembleMixin:
     ) -> List[Dict[str, Any]]:
         """Engine-level wrapper around :meth:`ContextAssembler.assemble`.
 
+        Thin list-returning shim over :meth:`_assemble_with_signal` —
+        discards the ``did_substitute`` flag and returns just the
+        message list. This is the surface :meth:`ContextAssembler`-style
+        callers (and the existing direct-call test suite) rely on. The
+        compaction entry points :meth:`preassemble` and
+        :meth:`_CompactMixin.compress` call :meth:`_assemble_with_signal`
+        directly because they also need the substitution signal to
+        decide whether to reset the diff-ingest cursor (issue #130,
+        Defect 2 — the ``did_substitute`` flag is the load-bearing
+        "a genuine DAG substitution occurred" signal that distinguishes
+        a real compaction from a :meth:`_safe_fallback` reshape).
+
+        Args:
+            session_id: Resolved session id. The caller is responsible
+                for resolving this from kwargs / cache.
+            messages: Live in-memory message list. Returned unchanged
+                on any fallback path.
+            token_budget: Budget the assembler walks under.
+            prompt: Optional user prompt for BM25-lite-scored eviction.
+
+        Returns:
+            The assembled message list (post-sanitize, ready for the
+            provider). On any fallback path: the original ``messages``
+            list with assistant-prefill tails stripped per
+            :meth:`_safe_fallback`.
+        """
+        return self._assemble_with_signal(
+            session_id=session_id,
+            messages=messages,
+            token_budget=token_budget,
+            prompt=prompt,
+        )[0]
+
+    def _assemble_with_signal(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        token_budget: int,
+        prompt: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Engine-level assembly + a "did a genuine substitution occur" signal.
+
         Handles the policy that lives above the assembler:
 
         1. Ignored-session bypass → :meth:`_safe_fallback`.
@@ -410,7 +473,7 @@ class _AssembleMixin:
         8. Snapshot ``_previous_assembled_messages_by_conversation`` for
            prefix-stability diagnostics.
         9. Pin stable orphan-stripping ordinal on hot-cache turns.
-        10. Return assembled messages.
+        10. Return ``(assembled messages, True)``.
 
         Wrapped in a try/except so any exception in the body returns
         :meth:`_safe_fallback` instead of crashing the agent loop. The
@@ -426,6 +489,29 @@ class _AssembleMixin:
         the maintenance / telemetry / debug-log sections which are
         Epic 04 territory).
 
+        ### The ``did_substitute`` signal (issue #130, Defect 2)
+
+        The second tuple element is ``True`` **only** when the real
+        :class:`ContextAssembler` produced the returned list — i.e. the
+        DAG-substitution path at step 10. It is ``False`` on every
+        :meth:`_safe_fallback` path (ignored session, no conversation,
+        empty / raw-only context items, empty / no-user-turn assembler
+        output, or any exception). This is the signal the compaction
+        cursor-reset (:meth:`_CompactMixin._reset_ingest_cursor_after_compaction`)
+        gates on: a genuine DAG substitution desyncs the absolute
+        diff-ingest cursor and MUST reset it (even when the substituted
+        list is the *same length* as the live one — N raw turns folded
+        into N summary+tail messages); a :meth:`_safe_fallback` reshape
+        (notably the trailing-``assistant`` strip) is NOT a compaction
+        and must NOT reset the cursor — resetting it there would replay
+        Defect 1 (re-ingest the stripped trailing message with a fresh
+        ``seq``). Length is not a usable discriminator for either case;
+        the path actually taken is. hermes-lcm uses the equivalent
+        signal — a content test (``compressed != original_messages``)
+        at ``engine.py:855-861`` / ``:3483-3486`` and an unconditional
+        post-compaction reset at ``:908`` gated by
+        ``leaf_compacted_this_turn`` — never a list-length test.
+
         Args:
             session_id: Resolved session id. The caller (either
                 :meth:`preassemble` for Option B or
@@ -439,10 +525,10 @@ class _AssembleMixin:
                 eviction. ``None`` falls back to chronological.
 
         Returns:
-            The assembled message list (post-sanitize, ready for the
-            provider). On any fallback path: the original ``messages``
-            list with assistant-prefill tails stripped per
-            :meth:`_safe_fallback`.
+            A ``(messages, did_substitute)`` tuple. ``messages`` is the
+            assembled list on the substitution path, or the
+            :meth:`_safe_fallback` list otherwise. ``did_substitute``
+            is ``True`` iff the real assembler produced ``messages``.
         """
         # ── Ignored-session bypass ─────────────────────────────────
         # The shell's ``ignore_session_patterns`` is the compiled
@@ -451,14 +537,14 @@ class _AssembleMixin:
         # benchmark session prefixes. If ANY pattern matches the
         # session_id, the engine bypasses the entire substitution
         # path and returns the live messages stripped of assistant
-        # prefill tails (TS engine.ts:6666-6668).
+        # prefill tails (TS engine.ts:6666-6668). NOT a substitution.
         for pattern in self.ignore_session_patterns:
             if pattern.search(session_id):
                 logger.debug(
                     "[lcm] assemble: ignore_session_patterns match for session=%s — safe_fallback",
                     session_id,
                 )
-                return self._safe_fallback(messages)
+                return self._safe_fallback(messages), False
 
         # ── Body (wrapped) ────────────────────────────────────────
         # All DB reads + the assembler call live inside this try block
@@ -483,7 +569,9 @@ class _AssembleMixin:
                 session_id,
                 _describe_log_error(err),
             )
-            return self._safe_fallback(messages)
+            # An exception means no assembler substitution landed —
+            # safe_fallback, signal False.
+            return self._safe_fallback(messages), False
 
     def _assemble_locked(
         self,
@@ -491,12 +579,18 @@ class _AssembleMixin:
         messages: List[Dict[str, Any]],
         token_budget: int,
         prompt: Optional[str],
-    ) -> List[Dict[str, Any]]:
-        """Locked body of :meth:`_assemble`.
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Locked body of :meth:`_assemble_with_signal`.
 
         Factored out so the lock-acquisition try/finally lives in the
         public entry point. All DB reads + the assembler dispatch run
-        inside the per-session lock acquired by :meth:`_assemble`.
+        inside the per-session lock acquired by
+        :meth:`_assemble_with_signal`.
+
+        Returns a ``(messages, did_substitute)`` tuple — see
+        :meth:`_assemble_with_signal` for the meaning of the second
+        element. Every ``_safe_fallback`` return here carries ``False``;
+        the single real-assembler return at the end carries ``True``.
         """
         # Defensive: if the lifecycle hasn't fired (no
         # ``on_session_start``), the stores are ``None``. Fall back
@@ -510,7 +604,7 @@ class _AssembleMixin:
                 "not called); session=%s — safe_fallback",
                 session_id,
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         # ── Conversation lookup ───────────────────────────────────
         conversation = self._conversation_store.get_conversation_by_session_id(session_id)
@@ -519,7 +613,7 @@ class _AssembleMixin:
                 "[lcm] assemble: no conversation for session=%s — safe_fallback",
                 session_id,
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         conversation_id = conversation.conversation_id
 
@@ -558,7 +652,7 @@ class _AssembleMixin:
                 conversation_id,
                 session_id,
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         # ── Raw-only-trailing-live guard ─────────────────────────
         # Mirrors TS engine.ts:6736-6743. When the DB has only raw
@@ -573,7 +667,7 @@ class _AssembleMixin:
                 len(context_items),
                 len(messages),
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         # ── Assembler dispatch ───────────────────────────────────
         # Deferred import to avoid the circular ``assembler`` →
@@ -624,7 +718,7 @@ class _AssembleMixin:
                 session_id,
                 effective_budget,
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         has_user_turn = any(m.get("role") == "user" for m in assembled.messages)
         if not has_user_turn and len(messages) > 0:
@@ -636,7 +730,7 @@ class _AssembleMixin:
                 session_id,
                 len(assembled.messages),
             )
-            return self._safe_fallback(messages)
+            return self._safe_fallback(messages), False
 
         # ── Prefix-stability snapshot ────────────────────────────
         # Save the current assembled message list under the
@@ -676,6 +770,11 @@ class _AssembleMixin:
                 )
 
         # ── Done ────────────────────────────────────────────────
+        # This is the ONLY path that returns the real assembler's
+        # output — a genuine DAG substitution. ``did_substitute=True``:
+        # the absolute diff-ingest cursor must be reset after this
+        # (issue #130, Defect 2), regardless of whether the substituted
+        # list is shorter than, equal to, or longer than the live one.
         logger.debug(
             "[lcm] assemble: done conversation=%d session=%s "
             "context_items=%d has_summary=%s live=%d assembled=%d "
@@ -689,7 +788,7 @@ class _AssembleMixin:
             effective_budget,
             assembled.estimated_tokens,
         )
-        return assembled.messages
+        return assembled.messages, True
 
     # ------------------------------------------------------------------
     # _safe_fallback — strip assistant prefill tails

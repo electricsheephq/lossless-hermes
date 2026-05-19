@@ -68,7 +68,7 @@ reimplemented from the production-tested sibling project `hermes-lcm`
   a faithful copy — the schema-diff CI gate is correctly green — so this is
   an ADR overstatement, not a port-fidelity gap. No schema migration is
   added in this patch; the cursor reconciliation fix stands on its own.
-- **`preassemble` is ADR-032-slated for demotion.** [ADR-032](./docs/adr/032-preassemble-and-per-turn-assembly.md)
+- **`preassemble` is ADR-032-slated for demotion.** [ADR-032](./docs/adr/032-per-turn-assembly-not-required.md)
   supersedes ADR-010 and decides per-turn pre-assembly is not required,
   demoting `preassemble`. Its removal is separate v0.2.0 work; this patch
   only makes the compaction cursor reset correct for the `compress()` +

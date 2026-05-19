@@ -514,7 +514,7 @@ class _LifecycleMixin:
         # shell at 02-01.
         self._last_seen_message_idx.clear()
 
-        # v0.1.2 fix (issue #130): clear the restart-reconciliation
+        # v0.1.3 fix (issue #130): clear the restart-reconciliation
         # tracking set in lockstep with the cursor dict. ``/reset``
         # starts a fresh conversation, so the next ingest for any
         # session_id must re-run :meth:`_IngestMixin._reconcile_ingest_cursor`

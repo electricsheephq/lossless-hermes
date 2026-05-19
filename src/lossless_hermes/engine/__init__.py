@@ -190,7 +190,7 @@ class ContextEngineInfo:
     """
 
     name: str = "lcm"
-    version: str = "0.1.2"
+    version: str = "0.1.3"
     owns_compaction: bool = True
 
 
@@ -449,7 +449,7 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         # ``conversation_history[idx:]`` against this on each turn.
         self._last_seen_message_idx: Dict[str, int] = {}
 
-        # v0.1.2 fix (issue #130): the diff-ingest cursor above is
+        # v0.1.3 fix (issue #130): the diff-ingest cursor above is
         # process-local — it is never persisted. On a gateway restart
         # the engine rebinds an *existing* session whose transcript is
         # already in the durable ``messages`` store, but the cursor

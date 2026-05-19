@@ -786,7 +786,7 @@ class _IngestMixin:
 
         snapshot = history or []
 
-        # v0.1.2 fix (issue #130, Defect 1): reconcile the diff cursor
+        # v0.1.3 fix (issue #130, Defect 1): reconcile the diff cursor
         # against the durable store the first time this process sees
         # ``session_id``. On a gateway restart ``_last_seen_message_idx``
         # is empty (it is never persisted) but the conversation's
@@ -875,7 +875,7 @@ class _IngestMixin:
                 )
 
     # ------------------------------------------------------------------
-    # Restart cursor reconciliation — v0.1.2 fix (issue #130, Defect 1)
+    # Restart cursor reconciliation — v0.1.3 fix (issue #130, Defect 1)
     # ------------------------------------------------------------------
 
     def _reconcile_ingest_cursor(
@@ -886,7 +886,7 @@ class _IngestMixin:
     ) -> None:
         """Reconcile the diff cursor against the durable store on rebind.
 
-        v0.1.2 fix for issue #130, Defect 1. ``_last_seen_message_idx``
+        v0.1.3 fix for issue #130, Defect 1. ``_last_seen_message_idx``
         is a process-local dict that is never persisted. On a gateway
         restart the engine rebinds a session whose transcript already
         lives in the ``messages`` store, but the cursor resets to 0.
