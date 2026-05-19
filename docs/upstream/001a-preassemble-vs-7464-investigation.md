@@ -3,7 +3,30 @@
 **Date:** 2026-05-14
 **Investigator:** Claude (parallel-track, while Wave 4 executor agent works mid-build)
 **Status:** **PR #24949 is REDUNDANT** — upstream already provides the substitution seam we need.
-**Action required:** revise ADR-010, retire `docs/upstream/001-preassemble-abc.md`, mark experimental compress-based path as **production**, clean dead code from `engine/assemble.py` (PR #56 / issue 03-09).
+**Action required:** revise ADR-010, retire `docs/upstream/001-preassemble-abc.md`, clean dead code from `engine/assemble.py` (PR #56 / issue 03-09).
+
+> **Correction (2026-05-19, issue [#137](https://github.com/electricsheephq/lossless-hermes/issues/137), review slice S1):**
+> This doc originally concluded the Option-A force-compress path (force
+> `should_compress() == True` so `compress()` runs every turn) was
+> **"production-grade"**. **That conclusion is wrong and is retracted.**
+> Forcing compress every turn rotates the SQLite session ID on every turn —
+> `_compress_context` ends the current session and starts a new one inside
+> every invocation (`run_agent.py:10311`). A fresh `session_id` per turn fires
+> `commit_memory_session(messages)` every turn, so memory providers
+> **re-extract from the same conversation N times** (memory re-extraction
+> spam), and it also corrupts gateway routing / langfuse lineage and trips the
+> compression-count warning in 2–3 turns. This is exactly the breakage
+> spike 002 §"Option A" already documented as **NOT shippable**. The
+> still-correct findings of this doc are narrower: (1) Hermes core PR #7464
+> introduced the `ContextEngine` ABC, whose `compress()` is the upstream
+> message-rewrite seam, so our upstream `preassemble` patch (PR #24949) is
+> redundant; (2) the `preassemble()` override merged in PR #56 is dead code.
+> What is **NOT** correct is calling the *force-every-turn* activation of
+> `compress()` "production". The shippable per-turn path is **not** required at
+> all — see ADR-032 (issue [#132](https://github.com/electricsheephq/lossless-hermes/issues/132)),
+> which supersedes ADR-010 with ingest + threshold/debt-gated compaction
+> instead of per-turn substitution. Read every "production" claim below
+> through this correction.
 
 ---
 
@@ -17,7 +40,15 @@ Upstream Hermes [PR #7464](https://github.com/NousResearch/hermes-agent/pull/746
 
 is **pre-call substituted into every turn** by Hermes core. No `preassemble` ABC method needed.
 
-What ADR-010 called the "Option A experimental fallback" (`compress_every_turn` flag) is actually the **production path**.
+> **Retracted (issue #137, S1):** the sentence below originally claimed the
+> `compress_every_turn` flag is "the production path." It is **not** —
+> forcing `compress()` every turn rotates the session ID every turn
+> (`run_agent.py:10311`) and spams memory re-extraction. The *seam*
+> (`compress()`) is upstream-provided and real; *force-every-turn* is the
+> unshippable activation of it. `compress()` is the correct rewrite seam;
+> the correct trigger is threshold/debt-gated, not every-turn — see ADR-032.
+
+~~What ADR-010 called the "Option A experimental fallback" (`compress_every_turn` flag) is actually the **production path**.~~
 
 ## Evidence
 
@@ -84,29 +115,44 @@ if (
 
 This block runs **before** the LLM API call. `self.context_compressor` is the registered engine instance (line 1310: `self.context_compressor = _selected_engine`). `_compress_context` wraps `compress()`. The whole substitution happens pre-call.
 
-### Why "Option A" (compress-every-turn) is actually production-grade
+### Why `compress()` is the engine API — and why "compress-EVERY-turn" is NOT production-grade
 
-ADR-010 framed the compress-every-turn path as a hacky fallback gated by an `experimental_always_on_via_compress` config flag, with the assumption that a "real" implementation needs `preassemble`. That framing predates PR #7464.
+> **Corrected heading (issue #137, S1).** This section originally read "Why
+> 'Option A' (compress-every-turn) is actually production-grade" and argued
+> force-every-turn was shippable. **That claim is retracted.** The points
+> below are split into what holds (the `compress()` *seam* is the upstream
+> engine API) and what does **not** (forcing it *every turn* is unshippable).
 
-Post-#7464, the compress-every-turn approach is:
+ADR-010 framed the compress-every-turn path as a hacky fallback gated by an `experimental_always_on_via_compress` config flag, with the assumption that a "real" implementation needs `preassemble`. The `preassemble`-ABC assumption predates PR #7464 and is obsolete — but that does NOT make *force-every-turn* production-grade.
+
+What **holds** post-#7464 — `compress()` is the upstream engine rewrite seam:
 - **Officially the engine API** — `compress()` is the only abstract method that returns a new message list.
 - **Called pre-API-call** — preflight runs before the LLM dispatch.
 - **Used by the built-in compressor** — same path as Hermes's own `ContextCompressor`.
-- **No flag needed** — set `threshold_tokens=0` and `should_compress(0)` returns True every turn (the docstring at `context_engine.py` even calls this out: "should_compress(0) never fires" is mentioned as a documented edge case in `run_agent.py:9498`).
 
-There is no second path. `compress` is THE path.
+What does **NOT** hold — the *every-turn* activation is not shippable:
+- **`threshold_tokens=0` / always-True `should_compress` is a hazard, not a feature.** It makes `_compress_context` fire every turn, and `_compress_context` rotates the SQLite session ID every turn (`run_agent.py:10311`). That triggers `commit_memory_session` every turn → **memory providers re-extract the same conversation N times** (re-extraction spam), corrupts gateway/langfuse session lineage, resets the file-read dedup cache, and trips the "session compressed N times" warning within 2–3 turns. Spike 002 §"Option A" documents this in full and rules it **NOT shippable**.
+- `compress` is the right *seam*; the right *trigger* is the engine's real threshold / deferred-compaction-debt gate, **not** every turn. ADR-032 (issue #132) supersedes ADR-010 and adopts ingest + threshold/debt-gated compaction — there is no per-turn-substitution requirement.
 
 ## What this means for our work
 
 ### ADR-010 ("Always-on assembly emulation")
 **Status update:** Proposed → SUPERSEDED.
 
-The decision text needs a follow-up ADR (e.g., ADR-031) that:
+The decision text needs a follow-up ADR. **That ADR is ADR-032** (issue
+[#132](https://github.com/electricsheephq/lossless-hermes/issues/132)), which:
 1. Documents PR #7464 as the upstream-provided seam.
 2. Removes the "Option A vs Option B" framing.
-3. Promotes `compress`-every-turn to canonical.
-4. Documents the `threshold_tokens=0` trick (or just override `should_compress` to return True unconditionally) as the activation mechanism.
-5. References this investigation doc.
+3. Adopts **ingest + threshold/debt-gated compaction** — per-turn assembly is
+   not required.
+
+> **Retracted (issue #137, S1):** items 3–4 of this list originally read
+> "Promotes `compress`-every-turn to canonical" and "Documents the
+> `threshold_tokens=0` trick … as the activation mechanism." Both are wrong —
+> compress-EVERY-turn rotates the session ID every turn and spams memory
+> re-extraction (`run_agent.py:10311`). ADR-032 adopts a threshold/debt-gated
+> trigger, **not** every-turn substitution. The list above is the corrected
+> version.
 
 ADR-010 itself stays in the repo (we don't rewrite ADRs — we supersede them per CLAUDE.md "Don't change an ADR's decision without writing a new ADR that supersedes it").
 
@@ -120,28 +166,51 @@ The merged code includes a `preassemble()` override on `_AssembleMixin`. Per `en
 >
 > **Experimental (Option A)** — when `preassemble` is ABSENT and `experimental_always_on_via_compress` is True, the engine routes substitution via `_CompactMixin.compress`. [...]
 
-**Both statements are now wrong.** The truth is:
+**Both `engine/assemble.py` header statements are wrong** — but **not** in the
+direction this doc originally claimed. The accurate position:
 
-- The `preassemble()` override is **dead code** — Hermes never calls it because the upstream ABC has no `preassemble` method.
-- The compress-based path is the **production path**, not experimental.
-- The `experimental_always_on_via_compress` config flag should default to `True` (or be removed).
-- The "rate-limited per-turn experimental-mode warning" at `engine/assemble.py:_emit_experimental_warning_if_due` is misleading — there's nothing experimental about it.
+- The `preassemble()` override is **dead code** — Hermes never calls it because the upstream ABC has no `preassemble` method. (This bullet was, and remains, correct.)
+- The header's "Production (Option B)" claim is wrong because `preassemble` is dead — **but the fix is NOT to promote force-`compress`-every-turn to "production."** Force-every-turn rotates the session ID every turn (`run_agent.py:10311`) and spams memory re-extraction; it is not shippable (spike 002 §"Option A").
 
-A follow-up issue (filed below as **lossless-hermes#NN**) should:
+> **Retracted (issue #137, S1):** the two bullets that originally followed —
+> "The compress-based path is the **production path**, not experimental" and
+> "the `experimental_always_on_via_compress` flag should default to `True`" —
+> are wrong and are struck. ~~The compress-based path is the production path,
+> not experimental.~~ ~~The `experimental_always_on_via_compress` config flag
+> should default to `True`.~~ The correct resolution is ADR-032 (issue #132):
+> drop the per-turn-substitution model entirely in favour of ingest +
+> threshold/debt-gated compaction.
+
+A follow-up issue should:
 1. Remove the `preassemble()` method (dead code).
-2. Remove the `experimental_always_on_via_compress` config flag (or invert it to a kill-switch).
-3. Remove the `_emit_experimental_warning_if_due` warning.
-4. Update the `engine/assemble.py` module docstring.
-5. Override `should_compress` to return `True` unconditionally (or set `threshold_tokens = 0` in `on_session_start`).
-6. Update the 03-09 spec at `epics/03-ingest-assembly/03-09-always-on-substitution-hook.md`.
+2. Resolve the `experimental_always_on_via_compress` flag and the
+   `_emit_experimental_warning_if_due` warning **per ADR-032** — the engine
+   does not force `compress()` every turn at all; substitution is
+   threshold/debt-gated.
+3. Update the `engine/assemble.py` module docstring to ADR-032's model.
+4. Update the 03-09 spec at `epics/03-ingest-assembly/03-09-always-on-substitution-hook.md`.
+
+> **Retracted (issue #137, S1):** an earlier version of this list included
+> "Override `should_compress` to return `True` unconditionally (or set
+> `threshold_tokens = 0`)." ~~Override `should_compress` to return `True`
+> unconditionally.~~ That is the every-turn hazard above; it is struck. The
+> engine keeps a real `should_compress` gate per ADR-032.
 
 ### Risk of acting now vs deferring
 
-**Acting now (recommended):** clean removal in one PR while the agent is in late Wave 4 / Wave 5. Saves Wave 5 / 6 reviewers from wondering why the experimental path looks production-grade.
+> **Corrected (issue #137, S1):** this section originally implied the cleanup
+> was cosmetic — "the warning log says experimental but it's not." That framing
+> is wrong: the `experimental_always_on_via_compress` path is **correctly
+> labelled experimental** because force-`compress`-every-turn really is
+> unshippable (session-ID rotation per turn, memory re-extraction spam). The
+> real cleanup is not "drop the misleading warning" — it is to adopt ADR-032's
+> threshold/debt-gated model and remove the dead `preassemble()` override.
 
-**Deferring to v0.2:** acceptable. The current code works (compress-every-turn is the experimental path that's actually wired up; `preassemble` is just unused). v0.1.0 ships correctly. The cleanup is "the warning log says experimental but it's not" — a documentation embarrassment, not a runtime bug.
+**Acting now:** clean removal of the dead `preassemble()` override in one PR. The experimental warning stays meaningful until the engine is moved to ADR-032's gated-compaction model.
 
-I recommend a Wave 6 cleanup issue, NOT a Wave 4 hotfix — the agent should stay focused on closing Wave 4.
+**Deferring to v0.2:** acceptable. The dead `preassemble()` override is harmless (just unused). v0.1.0 ships correctly **because v0.1.0 does not rely on force-every-turn substitution** — see ADR-032. The follow-up is the ADR-032 migration, not a log-message tweak.
+
+I recommend a cleanup issue tracked alongside ADR-032 (issue #132), NOT a hotfix.
 
 ## Verification steps the next session should run
 

@@ -28,17 +28,17 @@
 |---|---|---|---|---|---|
 | `apsw` | `==3.53.1.0` | Zlib | `[apsw]` extra (opt-in only) | Alternate SQLite driver if stdlib `sqlite3` lacks `enable_load_extension` (e.g. some custom Python builds, packagers that disabled `--enable-loadable-sqlite-extensions`) | Cross-platform wheels: `macosx_11_0_arm64`, `macosx_10_9_x86_64`, `manylinux2014_*` for Python 3.10-3.13. **API is NOT PEP-249** — swap is a connection-layer rewrite, not a drop-in. Keep `open_lcm_db()` isolated as a single function. See [spike 001](../spike-results/001-sqlite-vec-python.md) §Findings → "apsw on macOS". |
 | `pysqlite3-binary` | **NOT pinned, NOT recommended** | Zlib | — | (Would bundle a newer SQLite than stdlib) | **No macOS wheels exist** (latest `0.5.4.post2` is `manylinux2014_x86_64`-only — confirmed in spike 001). Adding as a hard dep breaks every Mac contributor. We don't need a newer SQLite anyway — Homebrew Python 3.12/3.13/3.14 ship 3.53.0, well above the FTS5-trigram floor (3.34). If a future need arises for a newer SQLite, prefer `apsw` (cross-platform) over `pysqlite3-binary` (Linux-only). |
-| `respx` | `==0.21.1` | BSD-3-Clause | `[dev]` extra | Mock `httpx` for Voyage client unit tests (24 fixtures per spike 004 §"Test fixtures") | Designed by the encode/ team (httpx maintainers) — the canonical `httpx` mock. Used to port `lossless-claw/test/voyage-client.test.ts` (561 LOC) fixture-for-fixture. |
+| `respx` | `==0.22.0` | BSD-3-Clause | `[dev]` extra | Mock `httpx` for Voyage client unit tests (24 fixtures per spike 004 §"Test fixtures") | Designed by the encode/ team (httpx maintainers) — the canonical `httpx` mock. Used to port `lossless-claw/test/voyage-client.test.ts` (561 LOC) fixture-for-fixture. Bumped from `0.21.1`: on `httpx==0.28.1`, `0.21.x` passes a bytes method through `HTTPCoreMocker` and respx's `Method` matcher fails to compare bytes vs str — see the `pyproject.toml` inline comment. |
 
 ## Dev / test dependencies (`[dev]` extra)
 
 | Package | Version pin | License | Purpose |
 |---|---|---|---|
-| `pytest` | `==9.0.2` | MIT | Test runner. **Matches Hermes's pin** for plugin-host coherence. |
+| `pytest` | `==9.0.3` | MIT | Test runner. Pinned **one patch above** Hermes's pin — bumped from `9.0.2` to close a moderate GHSA tmpdir CVE (dependabot #1); see the `pyproject.toml` inline comment. Otherwise tracks Hermes for plugin-host coherence. |
 | `pytest-asyncio` | `==1.3.0` | Apache-2.0 | Async test support (`asyncio_mode = "auto"`). **Matches Hermes's pin.** |
 | `pytest-mock` | `==3.14.0` | MIT | `mocker` fixture for SQLite + filesystem mocks. |
 | `pytest-cov` | `==6.0.0` | MIT | Coverage gate in CI (target: 90%+ for core, 80%+ overall). |
-| `respx` | `==0.21.1` | BSD-3-Clause | `httpx` mock router for Voyage client tests (see Conditional table). |
+| `respx` | `==0.22.0` | BSD-3-Clause | `httpx` mock router for Voyage client tests (see Conditional table). |
 | `ruff` | `==0.15.10` | MIT | Lint + format. **Matches Hermes's pin.** Adopt Hermes's `select = ["PLW1514"]` rule (explicit `encoding=` on `open()` — Windows cp1252 bites otherwise; see Hermes `pyproject.toml` lines 257-275). |
 | `ty` | `==0.0.21` | MIT | Type checker (Astral, sibling of ruff — faster than mypy, **matches Hermes's choice**). Use `ty.environment.python-version = "3.13"` to match Hermes. |
 | `mypy` | `==1.13.0` | MIT | Backup type checker — opt-in only via `[type]` extra, NOT in `[dev]`. `ty` is the primary; `mypy` is for IDE plugins and legacy CI integrations that don't speak ty yet. |
@@ -81,11 +81,11 @@ apsw = ["apsw==3.53.1.0"]
 # Dev/test surface. Pinned to Hermes's versions where overlap exists so
 # plugin authors can run Hermes's test suite alongside ours without conflict.
 dev = [
-    "pytest==9.0.2",              # matches Hermes pin
+    "pytest==9.0.3",              # one patch above Hermes pin — closes a moderate GHSA tmpdir CVE (dependabot #1)
     "pytest-asyncio==1.3.0",      # matches Hermes pin
     "pytest-mock==3.14.0",
     "pytest-cov==6.0.0",
-    "respx==0.21.1",              # httpx mock router for Voyage tests
+    "respx==0.22.0",              # httpx mock router for Voyage tests (bumped from 0.21.1: bytes-vs-str matcher bug on httpx 0.28.1)
     "ruff==0.15.10",              # matches Hermes pin
     "ty==0.0.21",                 # matches Hermes pin
     "pre-commit==4.0.1",

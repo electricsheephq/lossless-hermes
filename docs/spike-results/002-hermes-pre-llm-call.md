@@ -19,6 +19,27 @@ Read in order, citing file:line:
 5. `run_agent.py` lines 10237–10413 (`_compress_context` body — calls `self.context_compressor.compress(messages, …)` and rotates the SQLite session ID).
 6. `agent/context_engine.py` — full ABC (207 lines): `compress`, `should_compress`, `should_compress_preflight`, lifecycle hooks. No `preassemble` / `transform_messages` / `before_prompt_build` method exists.
 7. `plugins/context_engine/__init__.py` lines 199–219 — confirmed `_EngineCollector.register_hook` is an explicit **no-op** (line 212–213): directory-mode context-engine plugins **cannot** register `pre_llm_call` hooks at all. They can only register the engine itself.
+
+   > **Correction (2026-05-19, issue [#137](https://github.com/electricsheephq/lossless-hermes/issues/137)):**
+   > The claim in step 7 — that directory mode "**strips hooks**" / that a
+   > directory-mode context-engine plugin **cannot** register `pre_llm_call`
+   > at all — is **false** and is retracted. The later investigation behind
+   > **ADR-034** / issue [#134](https://github.com/electricsheephq/lossless-hermes/issues/134)
+   > ("Plugin distribution — directory-mode primary, supersedes ADR-001's
+   > false premise") found that directory mode does **not** strip hooks: a
+   > directory-mode plugin can register `pre_llm_call` / `post_llm_call`. The
+   > `_EngineCollector.register_hook` no-op observed here is **not** the only
+   > loader path available to a directory-mode plugin, so it does not gate
+   > directory mode the way step 7 (and ADR-001 Option B, which cites this
+   > step) concluded.
+   > **What in this spike stays valid:** the engine-rewrite analysis — that
+   > `pre_llm_call` is structurally *additive-only* and cannot rewrite the
+   > message list, and that `ContextEngine.compress()` is the only seam that
+   > replaces the in-flight `messages` list — is **unaffected** by this
+   > correction. That analysis is about the *hook semantics*, not about which
+   > distribution mode can register hooks. Only the directory-mode "strips
+   > hooks" conclusion is wrong. ADR-001's Option B and Rationale rest on this
+   > false premise; ADR-034 supersedes ADR-001 accordingly.
 8. `agent/memory_provider.py` lines 202–212 — `on_pre_compress` is a MemoryProvider hook (not in `VALID_HOOKS`); returns a STRING that's inlined into the compression summary prompt. Not a message-list rewrite.
 9. `website/docs/user-guide/features/hooks.md` lines 504–546 — canonical hook docs. "If the callback returns a dict with a `context` key, or a plain non-empty string, the text is appended to the current turn's user message." Also explicitly: `pre_llm_call` is *"the only hook whose return value is used"* for context injection.
 10. `plugins/observability/langfuse/__init__.py` lines 589–620, 870–872 — only real plugin using `pre_llm_call` for context-style work; uses it purely for tracing/observation, never rewrites.
@@ -73,7 +94,7 @@ Hooks that DON'T exist (verified by grep across the whole tree): `before_prompt_
           return self._assemble(messages)
   ```
 
-  Plus `plugin.yaml`-style `register(ctx)` calling `ctx.register_context_engine(LosslessEngine())` (NOT `register_hook` — that's the no-op in `_EngineCollector`).
+  Plus `plugin.yaml`-style `register(ctx)` calling `ctx.register_context_engine(LosslessEngine())`. (This example originally added "NOT `register_hook` — that's the no-op in `_EngineCollector`"; per the **step 7 correction above** that no-op does **not** mean directory mode cannot register hooks — see ADR-034 / issue #134.)
 
 ## The `pre_llm_call` snippet (for the record)
 
