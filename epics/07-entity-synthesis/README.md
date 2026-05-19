@@ -1,5 +1,7 @@
 # Epic 07 — Entity extraction + synthesis dispatch
 
+**Status: closed** — all 10 issues merged (PRs #71, #77, #85–#86, #89, #92, #101, #105–#106, #113); v0.1.0 release gate.
+
 ## Goal
 
 Port LCM's **async, queue-driven entity coreference worker** and its **on-demand tier-dispatched synthesis orchestrator** from TypeScript to Python. Together these two subsystems implement the v4.1 "extract once async, synthesize many times on demand" contract: leaf-writes enqueue background entity work (60s cadence, race-safe upserts against `lcm_entities`), while the synthesis dispatcher serves `lcm_synthesize_around` requests through a 7-field-keyed cache (`lcm_synthesis_cache`) with three supported pass strategies — `single`, `verify_fidelity`, and `best_of_n_judge` — plus a versioned prompt registry (`lcm_prompt_registry`) and forensic audit trail (`lcm_synthesis_audit`). The unifying property is that both halves are **gated on a working LLM client** (Hermes-side adapter over `agent/llm_client.py`), are completely outside the hot path, and both write cache/catalog rows that downstream tools (`lcm_get_entity`, `lcm_search_entities`, `lcm_synthesize_around`) read via suppression-aware CTEs.
@@ -93,11 +95,11 @@ ADR resolved during epic:
 
 ## Verification gates before close
 
-1. `pytest tests/extraction/` + `pytest tests/synthesis/` green on the macOS + Linux CI matrix.
-2. `count_pending_extractions` and `run_coreference_tick`'s selector agree on a synthetic 100-row queue (Wave-10 P2 regression).
-3. Cache UNIQUE-index integration test: same leaf set, two `tier` values (`custom` then `filtered`) → two distinct cache rows (Wave-10 P1 regression).
-4. Verify-fidelity flag test: `UNSUPPORTED: X\nOK rest` does NOT clear the hallucination flag (Wave-4 P0 regression).
-5. Best-of-N cap test: `req.best_of_n=10` clamps to 5 and surfaces `requested=10, capped=true` on the result (Wave-5 P2 regression).
-6. Soft-suppress test: suppressing a leaf DELETES dependent cache rows via `lcm_cache_leaf_refs` lookup (Final.review.3 Loop 2 Leak 2.5 regression).
-7. `grep -rn "# LCM Wave-" src/lossless_hermes/extraction src/lossless_hermes/synthesis` enumerates ≥ 8 Wave-marked sites (ADR-029 audit trail).
-8. `seed_default_prompts(conn)` is idempotent across two consecutive calls; an operator-overridden prompt row is never clobbered.
+- [x] 1. `pytest tests/extraction/` + `pytest tests/synthesis/` green on the macOS + Linux CI matrix. — green on all 6 CI matrix cells; Epic 07 closed at Wave 5.
+- [x] 2. `count_pending_extractions` and `run_coreference_tick`'s selector agree on a synthetic 100-row queue (Wave-10 P2 regression). — 07-02 (#77) coreference worker ships the Wave-10 P2 selector-parity test.
+- [x] 3. Cache UNIQUE-index integration test: same leaf set, two `tier` values (`custom` then `filtered`) → two distinct cache rows (Wave-10 P1 regression). — 07-06 (#101) cache-key derivation ships the Wave-10 P1 regression.
+- [x] 4. Verify-fidelity flag test: `UNSUPPORTED: X\nOK rest` does NOT clear the hallucination flag (Wave-4 P0 regression). — 07-05 (#92) synthesis dispatch ships the Wave-4 P0 verify-fidelity regression.
+- [x] 5. Best-of-N cap test: `req.best_of_n=10` clamps to 5 and surfaces `requested=10, capped=true` on the result (Wave-5 P2 regression). — 07-05 (#92) synthesis dispatch ships the best-of-N cap test.
+- [x] 6. Soft-suppress test: suppressing a leaf DELETES dependent cache rows via `lcm_cache_leaf_refs` lookup (Final.review.3 Loop 2 Leak 2.5 regression). — 07-07 (#105) cache invalidation on leaf change ships the suppression-DELETE regression.
+- [x] 7. `grep -rn "# LCM Wave-" src/lossless_hermes/extraction src/lossless_hermes/synthesis` enumerates ≥ 8 Wave-marked sites (ADR-029 audit trail). — Wave-1/4/7/10 markers present across 07-02 (#77), 07-03 (#86), 07-05 (#92), 07-06 (#101).
+- [x] 8. `seed_default_prompts(conn)` is idempotent across two consecutive calls; an operator-overridden prompt row is never clobbered. — 07-08 (#85) prompt registry ships idempotent seed-if-exists with operator-override protection.

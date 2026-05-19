@@ -1,5 +1,7 @@
 # Epic 03 — Ingest + Assembly
 
+**Status: closed** — all 10 issues merged (PRs #35, #39, #41–#42, #44, #46, #48, #50–#52, #56); v0.1.0 release gate.
+
 End-to-end per-turn ingest from `post_llm_call` hook through the DB, plus the full context-assembly pipeline that produces a prompt-budget-fit message list every turn (post-v0.2.0 substitution path per ADR-030).
 
 ## Goal

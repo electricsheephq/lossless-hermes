@@ -1,5 +1,7 @@
 # Epic 00 — Scaffolding
 
+**Status: closed** — all 8 issues merged (PRs #1–#8); v0.1.0 release gate.
+
 Project setup before any LCM behavior is ported. Result: a green-CI Python distribution that registers with Hermes as a no-op `ContextEngine`, so an operator running `hermes` with `context.engine: lcm` selected gets a clean startup and a round-trip-passthrough engine. Every subsequent epic lands on top of this.
 
 ## Goal
@@ -92,3 +94,9 @@ hermes  # session starts; LCM engine is selected; compress() is a passthrough.
 ```
 
 When this works on at least one operator's machine and CI is green on all 6 matrix cells, Epic 01 is unblocked.
+
+**Closure verification (v0.1.0):**
+
+- [x] All 8 issues merged — 00-01 (#1), 00-02 (#5), 00-03 (#2), 00-04 (#4), 00-05 (#3), 00-06 (#8), 00-07 (#7), 00-08 (#6).
+- [x] CI matrix green on all 6 cells `{macOS-latest, ubuntu-latest} × {python-3.11, 3.12, 3.13}` — latest `main` run all SUCCESS.
+- [x] `pip install -e ".[dev]" && hermes` selects the no-op LCM engine with passthrough `compress()` — 00-06 (#8) wires `register(ctx)` → `ctx.register_context_engine(LCMEngine())`; verified at Wave 1 exit gate.

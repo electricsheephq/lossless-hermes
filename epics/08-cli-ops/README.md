@@ -1,5 +1,7 @@
 # Epic 08 — CLI + Operator Commands + Doctor
 
+**Status: closed** — all 17 issues complete (15 ported via PRs #74, #79–#80, #90, #94, #96, #108, #111–#119; 08-11/08-12 superseded by 05-11/07-04 as annotated in the issue table below); v0.1.0 release gate.
+
 ## Goal
 
 Full operator command surface for `lossless-hermes`: the `/lcm` slash-command dispatcher (12 owner-gated + 7 open subcommands), the doctor toolkit (read-only scan + apply for both summary repair and DB-wide cleaners), the soft-suppression purge cascade with its 10+ read-path invariants, the worker orchestrator (status + force-tick), the autostart loops for embedding-backfill / entity-extraction / semantic-infra, the eval runner, the DB-backup primitive, and the one-shot `lossless-hermes import-openclaw` CLI for migrating existing OpenClaw users (ADR-025). This is where operators interact with the engine — every command in this epic is the front door for diagnosing, repairing, migrating, and observing LCM state in production.
@@ -107,14 +109,14 @@ All accepted at 90%+:
 
 ## Verification gates before close
 
-1. `pytest tests/operator/` and `tests/v41/` green on all CI matrix cells.
-2. `pytest tests/commands/test_owner_gating.py` — mocked `SlashAccessPolicy.deny()` causes every destructive subcommand to return the upstream-rejection text and never invoke the handler body.
-3. `pytest tests/v41/test_suppression_invariants.py` — every read surface (summary-store, conversation-store, embeddings, semantic-search, entity-coreference, tools, health) excludes `suppressed_at IS NOT NULL` rows by default; the `include_suppressed: true` opt-out works on integrity, compaction, and doctor.
-4. `pytest tests/commands/test_purge.py::test_cascade_full_six_steps` — runs `runPurge` against a seeded fixture and asserts each of the six cascade steps (per doctor-ops.md §"runPurge SOFT SUPPRESSION") fired correctly in one `BEGIN IMMEDIATE`.
-5. **OpenClaw migration smoke** — `lossless-hermes import-openclaw --from tests/fixtures/openclaw-mini --validate-rows 100` against a 100-conv fixture: schema migrates, identity-hash sample validates 100/100 matched, `state_meta.lcm_db_imported_at` is written.
-6. **Doctor-apply LLM seam** — `tests/doctor/test_apply.py::test_leaves_first_then_condensed` confirms the override-map ordering: condensed re-summarization reads its leaf children's (possibly rewritten) content from the in-memory `overrides` map.
-7. **Worker-orchestrator tick budget** — `tests/operator/test_worker_orchestrator.py::test_backfill_tick_processes_200` confirms the 200-embedding-per-tick budget bound from TS `worker-orchestrator.ts:tickEmbeddingBackfill`.
-8. `mypy --strict src/lossless_hermes/operator src/lossless_hermes/doctor src/lossless_hermes/plugin/commands.py src/lossless_hermes/cli` passes.
+- [x] 1. `pytest tests/operator/` and `tests/v41/` green on all CI matrix cells. — green on all 6 CI matrix cells; Epic 08 closed at Wave 5.
+- [x] 2. `pytest tests/commands/test_owner_gating.py` — mocked `SlashAccessPolicy.deny()` causes every destructive subcommand to return the upstream-rejection text and never invoke the handler body. — 08-01 (#74) slash-command router ships the owner-gating test against the upstream `SlashAccessPolicy` gate (ADR-013).
+- [x] 3. `pytest tests/v41/test_suppression_invariants.py` — every read surface (summary-store, conversation-store, embeddings, semantic-search, entity-coreference, tools, health) excludes `suppressed_at IS NOT NULL` rows by default; the `include_suppressed: true` opt-out works on integrity, compaction, and doctor. — 08-04 (#96) soft-suppression handler ships the cross-surface invariant regression matrix.
+- [x] 4. `pytest tests/commands/test_purge.py::test_cascade_full_six_steps` — runs `runPurge` against a seeded fixture and asserts each of the six cascade steps (per doctor-ops.md §"runPurge SOFT SUPPRESSION") fired correctly in one `BEGIN IMMEDIATE`. — 08-04 (#96) ports `runPurge` with the six-step cascade test.
+- [x] 5. **OpenClaw migration smoke** — `lossless-hermes import-openclaw --from tests/fixtures/openclaw-mini --validate-rows 100` against a 100-conv fixture: schema migrates, identity-hash sample validates 100/100 matched, `state_meta.lcm_db_imported_at` is written. — 08-15 (#79) `import-openclaw` CLI ships the migration smoke test (ADR-025).
+- [x] 6. **Doctor-apply LLM seam** — `tests/doctor/test_apply.py::test_leaves_first_then_condensed` confirms the override-map ordering: condensed re-summarization reads its leaf children's (possibly rewritten) content from the in-memory `overrides` map. — 08-07 (#117) doctor-apply ships the leaves-then-condensed ordering test.
+- [x] 7. **Worker-orchestrator tick budget** — `tests/operator/test_worker_orchestrator.py::test_backfill_tick_processes_200` confirms the 200-embedding-per-tick budget bound from TS `worker-orchestrator.ts:tickEmbeddingBackfill`. — 08-10 (#114) worker orchestrator ships the 200-per-tick budget test.
+- [x] 8. `mypy --strict src/lossless_hermes/operator src/lossless_hermes/doctor src/lossless_hermes/plugin/commands.py src/lossless_hermes/cli` passes. — `ty check` strict green across operator/doctor/commands/cli on all CI cells.
 
 ## Source of truth
 

@@ -1,5 +1,7 @@
 # Epic 02 — Engine Skeleton
 
+**Status: closed** — all 10 issues merged (PRs #25–#33); v0.1.0 release gate.
+
 Wire `LCMEngine` into Hermes's `ContextEngine` lifecycle. This is the first epic where the plugin actually loads, registers, and shows up as `context.engine: lcm` in a running Hermes session. No real compaction, no real assembly, no tool surface — just the load-bearing skeleton that every later epic plugs into.
 
 ## Goal
@@ -97,3 +99,10 @@ echo "/lcm help" | hermes --config /tmp/test-config.yaml
 ```
 
 No real ingest, no real compaction, no real assembly. That's Epic 03 and 04. This epic proves the wiring is sound.
+
+**Closure verification (v0.1.0):**
+
+- [x] All 10 issues merged — 02-01 (#25), 02-02/02-06 (#33), 02-03 (#30), 02-04 (#27), 02-05 (#29), 02-07 (#32), 02-08 (#26), 02-09 (#28), 02-10 (#31).
+- [x] `pytest tests/test_engine_skeleton.py` green — `LCMEngine` instantiates, all required `ContextEngine` ABC methods round-trip; CI green on all 6 matrix cells (Wave 3 closed, 1101 tests).
+- [x] All 4 Hermes hooks register without errors — 02-07 (#32) wires `post_llm_call` / `pre_llm_call` / `on_session_end` / `subagent_stop`.
+- [x] `/lcm` slash-command dispatcher registers; `/lcm status` + `/lcm help` respond — 02-10 (#31) ships the dispatcher + 19-subcommand stubs.

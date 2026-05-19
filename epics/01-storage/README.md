@@ -1,5 +1,7 @@
 # Epic 01 — Storage layer
 
+**Status: closed** — all 15 issues merged (PRs #10–#22, #24; 01-11's FTS5 helpers shipped with the SummaryStore in #22); v0.1.0 release gate.
+
 ## Goal
 
 Port LCM's entire storage layer (DB connection, 27 tables, 42 indexes, 13 stores, identity hash, large-files, integrity, prune, transcript-repair, transaction-mutex) from TypeScript (`lossless-claw` @ `pr-613`, commit `1f07fbd`) to Python under `src/lossless_hermes/`. Storage is the substrate every other epic builds on — get the schema, idempotency, and dedup invariants right here or pay for it everywhere downstream.
@@ -96,9 +98,9 @@ All accepted at 95%+:
 
 ## Verification gates before close
 
-1. `pytest tests/` green on `macos-latest` (Homebrew Python 3.12) + `ubuntu-latest` (3.13) + `python:3.11-slim` Docker (per ADR-004 open-questions §1–2).
-2. `pytest tests/test_message_identity.py` passes the 10-case spike-003 fixture.
-3. Schema-diff: Python-generated schema vs. TS-generated reference DB has zero diff outside expected formatting (per `docs/reference/lcm-source-map.md` open-question #2).
-4. `run_lcm_migrations()` twice in a row is a no-op on the second call (idempotency invariant per ADR-026).
-5. `mypy src/lossless_hermes/db src/lossless_hermes/store` passes strict.
-6. A v4.1 OpenClaw `lcm.db` copied into `$HERMES_HOME/lossless-hermes/lcm.db` runs migrations cleanly and reports 0 backfill rows newly written (everything already at algorithm_version 1).
+- [x] 1. `pytest tests/` green on `macos-latest` (Homebrew Python 3.12) + `ubuntu-latest` (3.13) + `python:3.11-slim` Docker (per ADR-004 open-questions §1–2). — green on all 6 CI matrix cells; Wave 2 closed with 907 tests passing.
+- [x] 2. `pytest tests/test_message_identity.py` passes the 10-case spike-003 fixture. — 01-07 (#10) ported the byte-identical SHA-256 hash + 10-case parity fixture.
+- [x] 3. Schema-diff: Python-generated schema vs. TS-generated reference DB has zero diff outside expected formatting (per `docs/reference/lcm-source-map.md` open-question #2). — `scripts/schema_diff.sh --verify-subset` CI GREEN, 92/92 schema objects matched.
+- [x] 4. `run_lcm_migrations()` twice in a row is a no-op on the second call (idempotency invariant per ADR-026). — 01-04 (#15), 01-05 (#16), 01-06 (#20) migration ladder; 01-15 (#24) versioned backfills close the idempotency invariant.
+- [x] 5. `mypy src/lossless_hermes/db src/lossless_hermes/store` passes strict. — `ty check` green across the DB + store modules on all CI cells.
+- [x] 6. A v4.1 OpenClaw `lcm.db` copied into `$HERMES_HOME/lossless-hermes/lcm.db` runs migrations cleanly and reports 0 backfill rows newly written (everything already at algorithm_version 1). — 01-15 (#24) versioned backfills (depths, metadata, tool_call_id) verified no-op on already-migrated DBs.

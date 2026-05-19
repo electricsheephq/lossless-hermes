@@ -1,5 +1,7 @@
 # Epic 04: Compaction
 
+**Status: closed** — all 8 issues merged (PRs #70, #73, #75, #81, #83–#84, #91, #93); v0.1.0 release gate.
+
 LCM-style compaction engine: leaf-pass + condensation passes, anti-thrashing guards, fallback model chain, circuit breaker integration, and telemetry write paths. This is the algorithmic heart of LCM — the engine that decides *when* to summarize, runs the summarization safely, and persists the result into the DAG without losing data on auth/timeout/quota failures.
 
 ## Goal
