@@ -6,15 +6,15 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W5 CLOSED → W6 ready to dispatch** — Epics 04 compaction / 06 tools / 07 entity-synth / 08 CLI-ops all complete (50 issues: 8+15+10+15 ported, 08-11/08-12 superseded by 05-11/07-04). Wave 6 = Epic 09 eval + integration soak + v0.1.0 release |
-| **Current milestone** | M1–M5 ✅; **M7 ✅** (8 tools + dispatch + token-gate + recursion-guard + verbatim-lint); **M8 ✅** (entity coreference + extractor + synthesis dispatch/cache_key/invalidation/tier-routing/audit); **M9 ✅** (all operator commands: status/health/purge/backup/reconcile/doctor-{shared,apply,cleaners}/worker-orchestrator/worker-status/rotate/eval-runner/semantic-infra/import-openclaw); M6 (eval +52.5pp lift) + M10 (eval suite + drift CI) + M11 (v0.1.0) → Wave 6 |
-| **Last merged PR** | [#119](https://github.com/electricsheephq/lossless-hermes/pull/119) `[08-16] cli-ops: port /lcm rotate (SQLite-only DB rotation)` |
-| **Last commit on main** | `2374243` |
-| **Total PRs merged** | **103** (Waves 0–5 complete + chores + fix-forwards) |
-| **Open PRs** | None |
-| **Total tests** | ~3800 passing across 6 OS×Python matrix cells |
+| **Current wave** | **W6 in progress** — Epic 09 eval: issues 09-01..09-07 merged (#120-124); **09-08 (terminal issue) is this open PR**. Remaining after 09-08: integration soak + v0.1.0 release. |
+| **Current milestone** | M1–M5 ✅; M7/M8/M9 ✅; **M10 in progress** (eval suite — 09-01..09-07 merged, 09-08 benchmark is this PR); M6 (eval +52.5pp lift) — harness + `fts_only` baseline land in 09-08, the live hybrid number is operator-gated (B-001); M11 (v0.1.0) → after 09-08 + soak |
+| **Last merged PR** | [#124](https://github.com/electricsheephq/lossless-hermes/pull/124) `[09-06] eval: drift-detection thresholds + per-stratum drift surface` (Epic 09 issues 09-01..09-07 all merged: #120-124) |
+| **Last commit on main** | `c5b9174` (`docs(blockers): B-001 — live +52.5pp benchmark gated on unprovisioned VOYAGE_API_KEY`) |
+| **Total PRs merged** | **108** (Waves 0–5 + Epic-09 issues 09-01..09-07 + chores + fix-forwards) |
+| **Open PRs** | `port/09-08-benchmark` — issue 09-08 (Voyage recall benchmark + v41-test-corpus port); terminal Epic-09 issue |
+| **Total tests** | ~3800+ passing across 6 OS×Python matrix cells |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
-| **Open blockers** | None — API rate-limit event (2026-05-19) resolved: 08-13 salvaged into #115, 08-07/08-08 re-dispatched + merged. See [`BLOCKERS.md`](./BLOCKERS.md) |
+| **Open blockers** | **B-001 open** — live +52.5pp Voyage benchmark requires an unprovisioned `VOYAGE_API_KEY`; 09-08 ships the harness + measured `fts_only` baseline, the live hybrid run is operator-gated. See [`BLOCKERS.md`](./BLOCKERS.md). |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -68,11 +68,11 @@
 | M3 | Engine round-trips messages | ✅ done | Wave 3 closed 2026-05-13; 9 PRs covering 10 issues + 2 fix-forwards; 1101 tests; LCMEngine wired through Hermes ABC + 4 plugin hooks + /lcm slash command |
 | M4 | Per-turn ingest + assembly live | ✅ done | Wave 4 closed 2026-05-13/14; 25 PRs covering Epic 03 (10 issues: 03-01..03-10) + Epic 05 (11 issues: 05-01..05-11); ContextAssembler.assemble() with full 16-step pipeline; preassemble ABC override (Option B) + experimental force-compress (Option A) coexistent per ADR-010; Voyage HTTP client + sqlite-vec store + WorkerLoop + WorkerLock + backfill cron + semantic + hybrid + degraded-modes contract + autostart |
 | M5 | Compaction working | ✅ done | Wave 5 — Epic 04 (04-01..04-08 + circuit-breaker; compaction.py ~3000 LOC) |
-| M6 | Embeddings + +52.5pp lift | ⏳ pending | Wave 6 (eval validation; embeddings stack landed M4; eval-runner harness landed #115) |
+| M6 | Embeddings + +52.5pp lift | ⏳ in progress | Wave 6 — 09-08 ships the benchmark harness + measured `fts_only` baseline (paraphrastic R@5 0.0%); the live +52.5pp hybrid number is operator-gated on `VOYAGE_API_KEY` (B-001), documented in `docs/benchmarks/voyage-recall-2026-q2.md` |
 | M7 | 8 tools wired | ✅ done | Wave 5 — Epic 06 (all per-tool ports + dispatch + token-gate + recursion-guard + SHA-256 verbatim lint) |
 | M8 | Entity + synthesis green | ✅ done | Wave 5 — Epic 07 (coreference, extractor, synthesis dispatch/cache_key/invalidation/tier-routing/audit) |
 | M9 | All operator commands; import-openclaw verified | ✅ done | Wave 5 — Epic 08 (15 issues ported: status/health/purge/backup/reconcile/doctor-{shared,apply,cleaners}/worker-orchestrator/worker-status/rotate/eval-runner/semantic-infra/import-openclaw; 08-11/08-12 superseded by 05-11/07-04) |
-| M10 | Eval suite green; drift CI live | ⏳ pending | Wave 6 — Epic 09 |
+| M10 | Eval suite green; drift CI live | ⏳ in progress | Wave 6 — Epic 09: 09-01..09-07 merged (#120-124, incl. drift CI + live-eval workflow); 09-08 benchmark is the terminal issue (this PR) |
 | M11 | v0.1.0 release | ⏳ pending | Wave 6 |
 | M12 | v0.2.0 release (#628 stub-tier) | future | — |
 
@@ -100,4 +100,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-19 (Wave 5 CLOSED — all 4 epics complete, 103 PRs merged, M5/M7/M8/M9 done; next: Wave 6 Epic 09 eval + soak + v0.1.0)_
+_Last refreshed: 2026-05-19 (Wave 6 in progress — Epic 09 issues 09-01..09-07 merged (#120-124), 09-08 Voyage benchmark + v41-test-corpus port is the open terminal PR; B-001 gates the live +52.5pp confirmation on VOYAGE_API_KEY)_
