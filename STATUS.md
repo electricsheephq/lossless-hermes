@@ -6,15 +6,15 @@
 
 | Field | Value |
 |---|---|
-| **Current wave** | **W6 — v0.1.0 release gate** — ALL 122 port issues merged (Epics 00–09 complete; 09-08 terminal issue landed #125). Running the 12-item release-gate verification checklist; then v0.1.0 tag. |
-| **Current milestone** | M1–M5 ✅; M7/M8/M9 ✅; **M10 ✅** (eval suite — Epic 09 09-01..09-08 all merged, incl. drift CI + live-eval workflow + benchmark harness); M6 — `fts_only` baseline measured offline, live +52.5pp hybrid number operator-gated (B-001); **M11 (v0.1.0) in progress** — release-gate checklist running |
-| **Last merged PR** | [#125](https://github.com/electricsheephq/lossless-hermes/pull/125) `[09-08] eval: Voyage recall benchmark + v41-test-corpus Python port` |
-| **Last commit on main** | `66c712e` |
-| **Total PRs merged** | **109** (Waves 0–6 complete: all 122 port issues + chores + fix-forwards) |
+| **Current wave** | **W6 COMPLETE — v0.1.0 released** — ALL 122 port issues merged (Epics 00–09); the 12-item release-gate checklist passed (9 PASS, 3 operator-gated + documented). v0.1.0 tagged. |
+| **Current milestone** | M1–M11 ✅. M0 doc set → M11 v0.1.0 release all done. M6 — `fts_only` baseline measured offline; live +52.5pp hybrid confirmation operator-gated (B-001, accepted). M12 (v0.2.0 — `lcm_expand_query`, #628 stub-tier) is the future track. |
+| **Last merged PR** | [#127](https://github.com/electricsheephq/lossless-hermes/pull/127) `docs(epics): mark all 10 epic READMEs closed for v0.1.0` |
+| **Last commit on main** | `8b71b12` |
+| **Total PRs merged** | **111** (Waves 0–6 complete: all 122 port issues + release-gate docs + chores + fix-forwards) |
 | **Open PRs** | None |
-| **Total tests** | ~4050 passing across 6 OS×Python matrix cells |
+| **Total tests** | ~4050 passing across 6 OS×Python matrix cells; main CI green on HEAD |
 | **Schema-diff** | CI `--verify-subset` GREEN with 92/92 objects matched. |
-| **Open blockers** | **B-001 open** — live +52.5pp Voyage benchmark requires an unprovisioned `VOYAGE_API_KEY`; harness + measured `fts_only` baseline shipped (#125), live hybrid run operator-gated. Recommended for acceptance as a documented v0.1.0 release-gate item. See [`BLOCKERS.md`](./BLOCKERS.md). |
+| **Open blockers** | None — B-001 (live +52.5pp benchmark) and B-002 (24h soak / Eva-DB round-trip) resolved at the release-gate review: accepted as documented operator-gated v0.1.0 items. See [`BLOCKERS.md`](./BLOCKERS.md). |
 | **Upstream PR #24949** | filed; LOW-risk additive; awaiting review |
 | **Dependabot** | ✅ alert #1 (pytest tmpdir CVE) closed by [PR #9](https://github.com/electricsheephq/lossless-hermes/pull/9) |
 
@@ -73,7 +73,7 @@
 | M8 | Entity + synthesis green | ✅ done | Wave 5 — Epic 07 (coreference, extractor, synthesis dispatch/cache_key/invalidation/tier-routing/audit) |
 | M9 | All operator commands; import-openclaw verified | ✅ done | Wave 5 — Epic 08 (15 issues ported: status/health/purge/backup/reconcile/doctor-{shared,apply,cleaners}/worker-orchestrator/worker-status/rotate/eval-runner/semantic-infra/import-openclaw; 08-11/08-12 superseded by 05-11/07-04) |
 | M10 | Eval suite green; drift CI live | ✅ done | Wave 6 — Epic 09: 09-01..09-08 all merged (#115/#120-125, incl. drift CI + live-eval workflow + benchmark harness) |
-| M11 | v0.1.0 release | 🔄 in progress | Wave 6 — all 122 issues merged; running the 12-item release-gate verification checklist |
+| M11 | v0.1.0 release | ✅ done | Wave 6 — 12-item release-gate checklist passed (9 PASS; items 6/7/11 operator-gated + documented per B-001/B-002); v0.1.0 tagged on `8b71b12` |
 | M12 | v0.2.0 release (#628 stub-tier) | future | — |
 
 ## Upstream watch
@@ -100,4 +100,4 @@ See [`docs/upstream/`](./docs/upstream/) for full per-patch status. Quick summar
 
 ---
 
-_Last refreshed: 2026-05-19 (ALL 122 issues merged — Epics 00–09 complete, 109 PRs, main CI green on `66c712e`; in v0.1.0 release-gate verification)_
+_Last refreshed: 2026-05-19 (v0.1.0 RELEASED — all 122 issues merged, 111 PRs, release-gate checklist passed, tagged on `8b71b12`. Next track: v0.2.0 — `lcm_expand_query` + #628 stub-tier.)_
