@@ -20,7 +20,11 @@ Mirrors the five scenarios in the issue spec
    (``EX_CONFIG``), which the workflow maps to a clean skip.
 
 Plus unit coverage for :class:`CostMeter`, the per-stratum drift
-fallback, and the markdown renderers.
+surface, the markdown renderers, and the live-adapter construction
+path (:func:`run_live_eval._build_live_adapters` /
+:func:`run_live_eval._build_fts_search`) — the last with the Voyage
+and DB seams mocked so a symbol-drift in the real FTS / hybrid-search
+APIs they wire is caught here rather than only on a live run.
 """
 
 from __future__ import annotations
@@ -523,11 +527,13 @@ class TestAuthSkip:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "present")
         assert rle.main(["--db", "unused.db"]) == rle.EX_CONFIG
 
-    def test_missing_api_keys_reports_both(self) -> None:
-        """_missing_api_keys lists every absent key, not just the first."""
-        assert rle._missing_api_keys({}) == ["VOYAGE_API_KEY", "ANTHROPIC_API_KEY"]
-        assert rle._missing_api_keys({"VOYAGE_API_KEY": "x"}) == ["ANTHROPIC_API_KEY"]
-        assert rle._missing_api_keys({"VOYAGE_API_KEY": "x", "ANTHROPIC_API_KEY": "y"}) == []
+    def test_api_keys_present_requires_every_key(self) -> None:
+        """_api_keys_present is True only when every required key is set
+        and non-blank — a single missing/blank key flips it to False."""
+        assert rle._api_keys_present({}) is False
+        assert rle._api_keys_present({"VOYAGE_API_KEY": "x"}) is False
+        assert rle._api_keys_present({"VOYAGE_API_KEY": "x", "ANTHROPIC_API_KEY": "  "}) is False
+        assert rle._api_keys_present({"VOYAGE_API_KEY": "x", "ANTHROPIC_API_KEY": "y"}) is True
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +634,9 @@ class TestDriftThreshold:
 
 
 # ---------------------------------------------------------------------------
-# per_stratum_drift local fallback — joins drift details against the set
+# per_stratum_drift — re-exported from lossless_hermes.eval.drift (09-06).
+# These exercise rle.per_stratum_drift, which IS the real drift module's
+# function: the orchestrator no longer carries a local fallback copy.
 # ---------------------------------------------------------------------------
 
 
@@ -644,7 +652,7 @@ def _drift_summary(details: list[DriftDetail], cumulative: float) -> DriftSummar
     )
 
 
-class TestPerStratumDriftFallback:
+class TestPerStratumDrift:
     def test_groups_by_stratum(self) -> None:
         """Details are joined to strata via the query set."""
         query_set = QuerySet(
@@ -661,7 +669,7 @@ class TestPerStratumDriftFallback:
             ],
             cumulative=-0.5,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         assert set(psd.by_stratum) == {"fts-easy", "paraphrastic"}
         assert psd.by_stratum["fts-easy"].cumulative_delta == pytest.approx(0.1)
         assert psd.by_stratum["paraphrastic"].cumulative_delta == pytest.approx(-0.6)
@@ -676,7 +684,7 @@ class TestPerStratumDriftFallback:
             [DriftDetail("p-1", prior_score=1.0, current_score=0.4, delta=-0.6)],
             cumulative=-0.6,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         assert psd.any_stratum_regressed is True
 
     def test_all_positive_deltas_no_regression(self) -> None:
@@ -694,7 +702,7 @@ class TestPerStratumDriftFallback:
             ],
             cumulative=0.6,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         assert psd.any_stratum_regressed is False
 
     def test_unknown_query_bucketed_not_dropped(self) -> None:
@@ -705,7 +713,7 @@ class TestPerStratumDriftFallback:
             [DriftDetail("ghost", prior_score=0.5, current_score=0.4, delta=-0.1)],
             cumulative=-0.1,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         assert "unknown" in psd.by_stratum
         assert psd.by_stratum["unknown"].n_scored == 1
 
@@ -720,7 +728,7 @@ class TestPerStratumDriftFallback:
             [DriftDetail("fe-1", prior_score=None, current_score=0.4, delta=None)],
             cumulative=0.0,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         assert psd.by_stratum["fts-easy"].n_scored == 0
         assert psd.by_stratum["fts-easy"].cumulative_delta == pytest.approx(0.0)
 
@@ -742,9 +750,336 @@ class TestPerStratumDriftFallback:
             ],
             cumulative=0.0,
         )
-        psd = rle._per_stratum_drift_local(summary, query_set)
+        psd = rle.per_stratum_drift(summary, query_set)
         agg = psd.by_stratum["paraphrastic"]
         assert agg.improved + agg.regressed <= agg.drifted
+
+
+# ---------------------------------------------------------------------------
+# Live-adapter construction — _build_fts_search / _build_live_adapters
+#
+# These are the regression guard for the symbol-drift class of bug: the
+# orchestrator's live arms wire FTS5 search + hybrid search + the Voyage
+# cost field, all of which were previously bound to names that did not
+# exist (`fts_search_summaries`, `HybridSearchResult.embed_tokens`). CI's
+# `ty check src scripts` now catches the static side; these tests catch
+# the behavioural side with the Voyage + DB seams mocked — no live calls.
+# ---------------------------------------------------------------------------
+
+
+def _fts5_supported() -> bool:
+    """Whether this Python's sqlite3 was compiled with the FTS5 module."""
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute("CREATE VIRTUAL TABLE _fts5_probe USING fts5(x)")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        probe.close()
+
+
+_FTS5_AVAILABLE = _fts5_supported()
+
+skip_if_no_fts5 = pytest.mark.skipif(
+    not _FTS5_AVAILABLE,
+    reason="sqlite3 built without the FTS5 module — FTS5-backed tests skip cleanly.",
+)
+
+
+@pytest.fixture
+def fts5_db() -> Iterator[sqlite3.Connection]:
+    """In-memory DB migrated with FTS5 on — the live-path migration shape.
+
+    Distinct from the module ``db`` fixture (``fts5_available=False``):
+    ``_build_fts_search`` builds a ``SummaryStore(db, fts5_available=True)``
+    and runs ``mode='full_text'`` queries, so the FTS5 ``summaries_fts``
+    virtual table must exist on the connection.
+
+    ``row_factory`` is left UNSET here on purpose — the live path's
+    ``open_lcm_db`` also leaves it unset, and ``_build_fts_search`` is
+    responsible for setting ``sqlite3.Row`` itself. ``_seed_corpus`` sets
+    it transiently for its own ``SummaryStore`` inserts.
+    """
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.execute("PRAGMA foreign_keys = ON")
+    run_lcm_migrations(conn, fts5_available=True, seed_default_prompts=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _seed_corpus(conn: sqlite3.Connection) -> None:
+    """Seed a conversation + three distinctive-content leaf summaries.
+
+    Inserts via :meth:`SummaryStore.insert_summary` — there is no DB
+    trigger that mirrors ``summaries`` into ``summaries_fts``; the store's
+    ``insert_summary`` does the ``INSERT INTO summaries_fts`` explicitly,
+    so a raw ``INSERT INTO summaries`` would leave the FTS5 index empty.
+
+    Sets ``row_factory = sqlite3.Row`` (SummaryStore requires it). The
+    setting persists on the connection, which is fine — ``sqlite3.Row``
+    is positionally indexable, and ``_build_fts_search`` sets the same
+    value anyway.
+    """
+    from lossless_hermes.store.summary import CreateSummaryInput, SummaryStore
+
+    conn.row_factory = sqlite3.Row
+    conn.execute("INSERT INTO conversations (session_id, session_key) VALUES ('s1', 'sk1')")
+    store = SummaryStore(conn, fts5_available=True)
+    for summary_id, content in (
+        ("sum-alpha", "alpha distinctive rebase conflict resolution"),
+        ("sum-beta", "beta unrelated telemetry dashboard metrics"),
+        ("sum-gamma", "gamma another rebase note about merge"),
+    ):
+        store.insert_summary(
+            CreateSummaryInput(
+                summary_id=summary_id,
+                conversation_id=1,
+                kind="leaf",
+                content=content,
+                token_count=len(content.split()),
+            )
+        )
+
+
+class _FakeVoyage:
+    """A VoyageClient stand-in — no network. ``aclose`` is a no-op.
+
+    Only the surface ``run_hybrid_search`` touches is implemented; the
+    hybrid tests below stub ``run_hybrid_search`` itself, so this fake
+    just has to be a non-None object the adapter can hold and close.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@skip_if_no_fts5
+class TestBuildFtsSearch:
+    """``_build_fts_search`` must produce a working async ``FtsSearchFn``.
+
+    A drift in the real FTS surface it wires — ``SummaryStore``,
+    ``SummarySearchInput``, or the ``FtsHit`` field set — breaks these.
+    """
+
+    def test_returns_async_callable(self, fts5_db: sqlite3.Connection) -> None:
+        """The product is an async callable (the FtsSearchFn contract is
+        ``async def fts_search(query, *, limit, **filters) -> list[FtsHit]``)."""
+        import inspect
+
+        fn = rle._build_fts_search(fts5_db)
+        assert callable(fn)
+        assert inspect.iscoroutinefunction(fn)
+
+    def test_fts_search_returns_fts_hits(self, fts5_db: sqlite3.Connection) -> None:
+        """An FTS query returns real ``FtsHit`` instances, hydrated from
+        the summaries table — every field populated from the row."""
+        import asyncio
+
+        from lossless_hermes.embeddings.hybrid_search import FtsHit
+
+        _seed_corpus(fts5_db)
+        fn = rle._build_fts_search(fts5_db)
+
+        hits = asyncio.run(fn("rebase", limit=10))
+        assert len(hits) >= 1
+        assert all(isinstance(h, FtsHit) for h in hits)
+        # 'rebase' appears in sum-alpha + sum-gamma, not sum-beta.
+        ids = {h.summary_id for h in hits}
+        assert "sum-alpha" in ids
+        assert "sum-gamma" in ids
+        assert "sum-beta" not in ids
+        # Hydration populated the non-FTS fields off the summaries row.
+        alpha = next(h for h in hits if h.summary_id == "sum-alpha")
+        assert alpha.kind == "leaf"
+        assert "rebase" in alpha.content
+        assert alpha.session_key == "sk1"
+        assert alpha.rank == hits.index(alpha)  # 0-indexed FTS rank
+
+    def test_fts_search_respects_limit(self, fts5_db: sqlite3.Connection) -> None:
+        """The ``limit`` kwarg caps the result count."""
+        import asyncio
+
+        _seed_corpus(fts5_db)
+        fn = rle._build_fts_search(fts5_db)
+        hits = asyncio.run(fn("rebase", limit=1))
+        assert len(hits) <= 1
+
+    def test_fts_search_tolerates_surplus_filter_kwargs(self, fts5_db: sqlite3.Connection) -> None:
+        """run_hybrid_search forwards session_keys / since / etc. via
+        **filters — the adapter must accept and ignore them, not raise."""
+        import asyncio
+
+        _seed_corpus(fts5_db)
+        fn = rle._build_fts_search(fts5_db)
+        # These are exactly the kwargs run_hybrid_search passes.
+        hits = asyncio.run(
+            fn(
+                "rebase",
+                limit=10,
+                session_keys=None,
+                conversation_ids=None,
+                since=None,
+                before=None,
+                summary_kinds=None,
+                exclude_suppressed=True,
+            )
+        )
+        assert isinstance(hits, list)
+
+    def test_fts_search_empty_query_set_returns_empty(self, fts5_db: sqlite3.Connection) -> None:
+        """A query with no matches returns ``[]`` — not an error."""
+        import asyncio
+
+        _seed_corpus(fts5_db)
+        fn = rle._build_fts_search(fts5_db)
+        hits = asyncio.run(fn("zzz-nonexistent-token-qqq", limit=10))
+        assert hits == []
+
+
+@skip_if_no_fts5
+class TestBuildLiveAdapters:
+    """``_build_live_adapters`` wires the FTS-only + hybrid adapters.
+
+    The hybrid adapter MUST account Voyage spend from the real
+    ``HybridSearchResult.voyage_tokens_consumed`` field — the previous
+    code read non-existent ``embed_tokens`` / ``rerank_tokens`` via
+    ``getattr(..., 0)``, silently recording the hybrid arm at $0.
+    """
+
+    def test_returns_two_adapters_with_search(self, fts5_db: sqlite3.Connection) -> None:
+        """Both returned objects satisfy the RecallSearchAdapter shape
+        (an async ``search`` method)."""
+        import inspect
+
+        fts_adapter, hybrid_adapter = rle._build_live_adapters(
+            fts5_db, _FakeVoyage(), rle.CostMeter()
+        )
+        for adapter in (fts_adapter, hybrid_adapter):
+            assert hasattr(adapter, "search")
+            assert inspect.iscoroutinefunction(adapter.search)
+
+    def test_fts_only_adapter_returns_summary_ids(self, fts5_db: sqlite3.Connection) -> None:
+        """The FTS-only adapter resolves a QueryRecord to a list of
+        summary-id strings via the FTS5 store — no Voyage budget spent."""
+        import asyncio
+
+        _seed_corpus(fts5_db)
+        cost = rle.CostMeter()
+        fts_adapter, _ = rle._build_live_adapters(fts5_db, _FakeVoyage(), cost)
+
+        query = QueryRecord(
+            query_id="q1",
+            query_text="rebase",
+            stratum="fts-easy",
+            expected_summary_ids=("sum-alpha",),
+        )
+        ids = asyncio.run(fts_adapter.search(query))
+        assert "sum-alpha" in ids
+        assert all(isinstance(i, str) for i in ids)
+        # FTS-only spends no Voyage tokens.
+        assert cost.voyage_tokens == 0
+
+    def test_hybrid_adapter_accounts_voyage_tokens_consumed(
+        self, fts5_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hybrid adapter records cost from the REAL
+        ``HybridSearchResult.voyage_tokens_consumed`` field.
+
+        This is the direct regression guard for the silent-$0 defect.
+        ``run_hybrid_search`` is stubbed to return a genuine
+        ``HybridSearchResult`` carrying ``voyage_tokens_consumed=4242`` —
+        the adapter must surface exactly that into the CostMeter.
+        """
+        import asyncio
+
+        from lossless_hermes.embeddings.hybrid_search import (
+            HybridHit,
+            HybridSearchResult,
+        )
+
+        captured: dict[str, object] = {}
+
+        async def _fake_run_hybrid_search(conn: object, **kwargs: object) -> HybridSearchResult:
+            captured.update(kwargs)
+            captured["conn"] = conn
+            return HybridSearchResult(
+                hits=[
+                    HybridHit(
+                        summary_id="sum-alpha",
+                        conversation_id=1,
+                        session_key="sk1",
+                        kind="leaf",
+                        content="alpha",
+                        token_count=1,
+                        created_at="2026-05-05",
+                        score=0.9,
+                        from_fts=True,
+                        from_semantic=True,
+                        semantic_distance=0.1,
+                        cosine_similarity=0.99,
+                        fts_rank=0,
+                    )
+                ],
+                candidate_count=1,
+                voyage_tokens_consumed=4242,
+            )
+
+        # Patch the name the orchestrator module actually calls.
+        monkeypatch.setattr(rle, "run_hybrid_search", _fake_run_hybrid_search)
+
+        cost = rle.CostMeter()
+        _, hybrid_adapter = rle._build_live_adapters(fts5_db, _FakeVoyage(), cost)
+
+        query = QueryRecord(
+            query_id="q1",
+            query_text="rebase",
+            stratum="paraphrastic",
+            expected_summary_ids=("sum-alpha",),
+        )
+        ids = asyncio.run(hybrid_adapter.search(query))
+
+        assert ids == ["sum-alpha"]
+        # The crux: the real voyage_tokens_consumed field reached the meter.
+        assert cost.voyage_tokens == 4242
+        assert cost.voyage_usd() > 0  # NOT silently zero
+        # And the adapter passed run_hybrid_search a real async FtsSearchFn.
+        import inspect
+
+        fts_fn = captured["fts_search"]
+        assert inspect.iscoroutinefunction(fts_fn)
+        assert captured["rerank"] is True
+        assert captured["conn"] is fts5_db
+
+    def test_hybrid_search_signature_is_satisfied(self, fts5_db: sqlite3.Connection) -> None:
+        """Static guard: the kwargs the hybrid adapter passes to
+        ``run_hybrid_search`` (``query`` / ``fts_search`` / ``voyage`` /
+        ``rerank``) are all real parameters of its current signature.
+
+        A rename of any of those parameters upstream fails here — the
+        complement to ``ty check`` for the call-site contract.
+        """
+        import inspect
+
+        from lossless_hermes.embeddings.hybrid_search import run_hybrid_search
+
+        params = inspect.signature(run_hybrid_search).parameters
+        for kwarg in ("query", "fts_search", "voyage", "rerank"):
+            assert kwarg in params, f"run_hybrid_search lost the '{kwarg}' parameter"
+        # voyage_tokens_consumed must remain a field of HybridSearchResult —
+        # the cost-accounting source of truth.
+        from lossless_hermes.embeddings.hybrid_search import HybridSearchResult
+
+        assert "voyage_tokens_consumed" in HybridSearchResult.__dataclass_fields__
+        # And the fields the old code wrongly reached for must NOT exist
+        # (so a future re-introduction of the silent-$0 bug is caught).
+        assert "embed_tokens" not in HybridSearchResult.__dataclass_fields__
+        assert "rerank_tokens" not in HybridSearchResult.__dataclass_fields__
 
 
 # ---------------------------------------------------------------------------

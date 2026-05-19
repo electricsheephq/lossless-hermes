@@ -66,15 +66,19 @@ repos:
         args: ['--fix']
       - id: ruff-format
 
-  # ty: type-check src/ only (NOT tests/ — type-strictness on test code is
-  # deferred per ADR-008). Local hook because `ty-pre-commit` doesn't exist
-  # upstream as of 2026-05-13 (ty is pre-1.0). The venv must have ty
+  # ty: type-check src/ + scripts/ (NOT tests/ — type-strictness on test
+  # code is deferred per ADR-008). Kept in sync with the CI `ty check src
+  # scripts` step: scripts/ holds standalone CLI entry points (first-party
+  # lossless_hermes + stdlib only, no Hermes-only imports) and type-checking
+  # them catches call-site bugs — e.g. an `await` on a sync function — that
+  # `ty check src` alone misses. Local hook because `ty-pre-commit` doesn't
+  # exist upstream as of 2026-05-13 (ty is pre-1.0). The venv must have ty
   # installed (`pip install -e ".[dev]"` puts ty==0.0.21 on PATH).
   - repo: local
     hooks:
       - id: ty
-        name: ty check (src/)
-        entry: ty check src/
+        name: ty check (src/ + scripts/)
+        entry: ty check src/ scripts/
         language: system
         pass_filenames: false
         types_or: [python, pyi]

@@ -43,20 +43,14 @@ is informational only.
 
 ### Dependency tolerance
 
-This script is written so it imports cleanly even before the sibling
-issues 09-05 (``tests/fixtures/eva_baseline_v2.py``) and 09-06
-(``src/lossless_hermes/eval/drift.py``) have merged to ``main``:
-
-* The eva-baseline-v2 fixture builder is imported lazily inside the
-  live-run path (which only executes with API keys present).
-* The per-stratum drift surface uses :mod:`lossless_hermes.eval.drift`
-  if it is importable, and otherwise falls back to an equivalent local
-  implementation. When 09-06 lands, the real module is used with zero
-  code change here.
-
-Both fallbacks keep the script — and its fully-mocked test suite
-(``tests/scripts/test_run_live_eval.py``) — green on the standard CI
-matrix today, without waiting on the sibling PRs.
+The per-stratum drift surface is imported directly from
+:mod:`lossless_hermes.eval.drift` (issue 09-06, merged to ``main`` as
+PR #124). The eva-baseline-v2 fixture builder is still imported lazily
+inside the live-run path — that path only executes with API keys
+present, and the fixture (issue 09-05) is test-tree code rather than a
+package module, so the lazy import keeps the standard CI matrix (which
+has no API keys) green without depending on the fixture being on the
+import path.
 """
 
 from __future__ import annotations
@@ -65,11 +59,22 @@ import argparse
 import os
 import sqlite3
 import sys
-from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
 
+from lossless_hermes.embeddings.hybrid_search import (
+    FtsHit,
+    FtsSearchFn,
+    run_hybrid_search,
+)
+from lossless_hermes.eval.drift import (
+    PerStratumDrift,
+    StratumDriftAggregate,
+    drift_threshold,
+    is_drifted,
+    per_stratum_drift,
+)
 from lossless_hermes.eval.query_set import (
     QueryRecord,
     QuerySet,
@@ -82,12 +87,12 @@ from lossless_hermes.eval.recall import (
     run_recall_eval,
 )
 from lossless_hermes.eval.run import (
-    DriftDetail,
     DriftSummary,
     EvalRunRecord,
     compute_drift,
     record_eval_run,
 )
+from lossless_hermes.voyage import VoyageClient
 
 __all__ = [
     "EX_CONFIG",
@@ -199,151 +204,11 @@ class CostMeter:
 
 
 # ---------------------------------------------------------------------------
-# Per-stratum drift — uses lossless_hermes.eval.drift (09-06) if importable,
-# else an equivalent local fallback so this script stays self-contained.
+# Per-stratum drift — re-exported from lossless_hermes.eval.drift (09-06,
+# merged to main as PR #124). drift_threshold / is_drifted / per_stratum_drift
+# / PerStratumDrift / StratumDriftAggregate are imported at module top and
+# re-listed in __all__ so this script's public surface is unchanged.
 # ---------------------------------------------------------------------------
-
-
-def drift_threshold(noise_floor_sd: float | None) -> float:
-    """Per architecture-v4.1 §11.1: ``2 x`` empirical SD when calibrated.
-
-    Returns ``0.0`` (any non-zero delta counts as drift) when no noise
-    floor is supplied or the supplied value is non-positive.
-    """
-    if noise_floor_sd is not None and noise_floor_sd > 0:
-        return 2.0 * noise_floor_sd
-    return 0.0
-
-
-def is_drifted(delta: float, threshold: float) -> bool:
-    """Whether ``delta`` counts as drift under ``threshold``."""
-    if threshold > 0:
-        return abs(delta) >= threshold
-    return delta != 0.0
-
-
-@dataclass(frozen=True)
-class StratumDriftAggregate:
-    """Drift counts for one stratum. Mirrors the 09-06 shape."""
-
-    stratum: str
-    drifted: int
-    improved: int
-    regressed: int
-    cumulative_delta: float
-    n_scored: int
-
-
-@dataclass(frozen=True)
-class PerStratumDrift:
-    """Per-stratum drift, joined against the query set. Mirrors 09-06."""
-
-    overall: DriftSummary
-    by_stratum: dict[str, StratumDriftAggregate]
-    threshold_used: float
-
-    @property
-    def any_stratum_regressed(self) -> bool:
-        """True iff any stratum's cumulative delta fell past the threshold."""
-        return any(agg.cumulative_delta < -self.threshold_used for agg in self.by_stratum.values())
-
-
-def _per_stratum_drift_local(
-    summary: DriftSummary,
-    query_set: QuerySet,
-    noise_floor_sd: float | None = None,
-) -> PerStratumDrift:
-    """Local fallback for :func:`lossless_hermes.eval.drift.per_stratum_drift`.
-
-    Joins ``summary.details[*].query_id`` against
-    ``query_set.queries[*].stratum`` and aggregates per stratum. Queries
-    in ``details`` that are absent from ``query_set`` are bucketed under
-    a sentinel ``"unknown"`` stratum (defensive — the CI workflow should
-    not crash on a mid-eval set mutation). Strata with zero scored
-    queries are omitted, matching ``RecallReport.by_stratum``.
-
-    This is byte-for-byte equivalent to the 09-06 module's contract; it
-    exists only so this script (and its mocked tests) run before 09-06
-    lands. When 09-06 is on ``main``, :func:`per_stratum_drift` prefers
-    the real module and this helper is never called.
-    """
-    threshold = drift_threshold(noise_floor_sd)
-    stratum_by_query: dict[str, str] = {q.query_id: q.stratum for q in query_set.queries}
-
-    grouped: dict[str, list[DriftDetail]] = defaultdict(list)
-    for detail in summary.details:
-        stratum = stratum_by_query.get(detail.query_id, "unknown")
-        grouped[stratum].append(detail)
-
-    by_stratum: dict[str, StratumDriftAggregate] = {}
-    for stratum, details in grouped.items():
-        drifted = improved = regressed = n_scored = 0
-        cumulative = 0.0
-        for detail in details:
-            if detail.delta is None:
-                continue
-            n_scored += 1
-            cumulative += detail.delta
-            if is_drifted(detail.delta, threshold):
-                drifted += 1
-                if detail.delta > 0:
-                    improved += 1
-                elif detail.delta < 0:
-                    regressed += 1
-        by_stratum[stratum] = StratumDriftAggregate(
-            stratum=stratum,
-            drifted=drifted,
-            improved=improved,
-            regressed=regressed,
-            cumulative_delta=cumulative,
-            n_scored=n_scored,
-        )
-
-    return PerStratumDrift(
-        overall=summary,
-        by_stratum=by_stratum,
-        threshold_used=threshold,
-    )
-
-
-def per_stratum_drift(
-    summary: DriftSummary,
-    query_set: QuerySet,
-    noise_floor_sd: float | None = None,
-) -> PerStratumDrift:
-    """Per-stratum drift surface.
-
-    Prefers :func:`lossless_hermes.eval.drift.per_stratum_drift` (issue
-    09-06) when that module is importable; otherwise uses the equivalent
-    local fallback :func:`_per_stratum_drift_local`. Either way the
-    return value exposes ``.by_stratum`` and ``.any_stratum_regressed``,
-    which is all the orchestrator depends on.
-    """
-    try:
-        from lossless_hermes.eval import drift as _drift_mod
-    except ImportError:
-        return _per_stratum_drift_local(summary, query_set, noise_floor_sd)
-
-    real = _drift_mod.per_stratum_drift(summary, query_set, noise_floor_sd)
-    # Re-wrap into this module's dataclasses so callers see one stable
-    # shape regardless of which implementation produced it. The 09-06
-    # StratumDriftAggregate carries identical fields.
-    by_stratum = {
-        name: StratumDriftAggregate(
-            stratum=agg.stratum,
-            drifted=agg.drifted,
-            improved=agg.improved,
-            regressed=agg.regressed,
-            cumulative_delta=agg.cumulative_delta,
-            n_scored=agg.n_scored,
-        )
-        for name, agg in real.by_stratum.items()
-    }
-    return PerStratumDrift(
-        overall=summary,
-        by_stratum=by_stratum,
-        threshold_used=real.threshold_used,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -615,57 +480,179 @@ def build_report_markdown(fts: ModeResult, hybrid: ModeResult, cost: CostMeter) 
 # ---------------------------------------------------------------------------
 
 
+def _build_fts_search(db: sqlite3.Connection) -> FtsSearchFn:
+    """Build the async FTS5 search function the hybrid arm needs.
+
+    There is **no importable standalone FTS-search function** in
+    :mod:`lossless_hermes.tools.grep` — the FTS5 search lives there as a
+    nested ``fts_search`` closure inside ``_run_hybrid_lcm_grep`` and is
+    not part of that module's public surface. Rather than reach into a
+    private closure, this builds an equivalent adapter directly on the
+    public :class:`~lossless_hermes.store.summary.SummaryStore` API,
+    mirroring exactly what the ``grep.py`` closure does: a
+    ``mode="full_text"`` query against the FTS5 store, then a hydrate of
+    each result row to the full :class:`FtsHit` shape.
+
+    The returned callable satisfies the
+    :data:`~lossless_hermes.embeddings.hybrid_search.FtsSearchFn`
+    Protocol — ``async def fts_search(query, *, limit, **filters)
+    -> list[FtsHit]`` — so it can be passed straight to
+    :func:`~lossless_hermes.embeddings.hybrid_search.run_hybrid_search`.
+
+    The FTS5 store touch is read-only and spends no API budget.
+
+    Args:
+        db: The open eval-baseline SQLite connection. ``row_factory`` is
+            set to :class:`sqlite3.Row` on it as a side effect — see the
+            note below.
+
+    Returns:
+        An async :data:`FtsSearchFn` over the connection's FTS5 store.
+    """
+    from datetime import datetime
+
+    from lossless_hermes.store.summary import (
+        SummaryStore,
+        SummarySearchInput,
+    )
+
+    # SummaryStore hard-requires ``conn.row_factory = sqlite3.Row`` — its
+    # internal `_row_to_dict` raises TypeError on a tuple-row connection.
+    # `open_lcm_db` does NOT set this (it applies only the 7 PRAGMAs), so
+    # the orchestrator — which owns this connection's lifecycle — sets it
+    # here before constructing the store. `sqlite3.Row` is still
+    # positionally indexable + iterable, so the raw-SQL hydrate query
+    # below (which unpacks rows by position) keeps working unchanged.
+    db.row_factory = sqlite3.Row
+
+    # fts5_available=True: the live-eval DB is migrated with FTS5 on
+    # (see _run_live: run_lcm_migrations(db, fts5_available=True)).
+    store = SummaryStore(db, fts5_available=True)
+
+    async def _fts_search(query: str, *, limit: int, **_filters: object) -> list[FtsHit]:
+        # Surplus filter kwargs (session_keys / conversation_ids / since /
+        # before / summary_kinds / exclude_suppressed) are forwarded by
+        # run_hybrid_search; the eva-baseline corpus is single-session and
+        # unfiltered, so we deliberately ignore them — matching the
+        # narrower contract this orchestrator needs. FtsSearchFn permits
+        # extra kwargs by design (Callable[..., Awaitable[...]]).
+        rows = store.search_summaries(
+            SummarySearchInput(
+                query=query,
+                mode="full_text",
+                limit=limit,
+                sort="relevance",
+            )
+        )
+        if not rows:
+            return []
+        # Hydrate the FtsHit fields the FTS SearchResult does not carry
+        # (session_key, content, token_count) from the summaries table,
+        # filtering suppressed rows — same hydrate-by-id pattern as the
+        # grep.py fts_search closure (grep.py ~lines 1010-1072).
+        ids = [r.summary_id for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        hydrated = db.execute(
+            f"SELECT summary_id, conversation_id, session_key, kind, content, "
+            f"       token_count, created_at "
+            f"  FROM summaries "
+            f"  WHERE summary_id IN ({placeholders}) "
+            f"    AND suppressed_at IS NULL",
+            tuple(ids),
+        ).fetchall()
+        hydrated_by_id = {h[0]: h for h in hydrated}
+        out: list[FtsHit] = []
+        for rank, row in enumerate(rows):
+            h = hydrated_by_id.get(row.summary_id)
+            if h is None:
+                # Suppressed between FTS and hydrate — drop.
+                continue
+            (
+                summary_id,
+                conv_id,
+                session_key_h,
+                kind_h,
+                content,
+                token_count,
+                created_at,
+            ) = h
+            out.append(
+                FtsHit(
+                    summary_id=summary_id,
+                    conversation_id=int(conv_id) if conv_id is not None else 0,
+                    session_key=session_key_h or "",
+                    kind=kind_h,
+                    content=content or "",
+                    token_count=int(token_count) if token_count is not None else 0,
+                    created_at=(
+                        created_at.isoformat()
+                        if isinstance(created_at, datetime)
+                        else (created_at or "")
+                    ),
+                    rank=rank,
+                )
+            )
+        return out
+
+    return _fts_search
+
+
 def _build_live_adapters(
     db: sqlite3.Connection,
-    voyage_api_key: str,
+    voyage: VoyageClient,
     cost: CostMeter,
-) -> tuple[RecallSearchAdapter, RecallSearchAdapter]:  # pragma: no cover - live only
+) -> tuple[RecallSearchAdapter, RecallSearchAdapter]:
     """Construct the FTS-only and hybrid retrieval adapters.
 
-    Reached only on the live path (API keys present). The mocked test
-    suite injects adapters directly into :func:`run_mode` and never calls
-    this function — hence the ``no cover`` pragma.
+    Reached on the live path (API keys present). The mocked test suite
+    injects adapters directly into :func:`run_mode`; the
+    adapter-construction path itself is exercised separately with a
+    fake :class:`~lossless_hermes.voyage.client.VoyageClient` so a
+    symbol-drift in the real APIs this wires (``FtsSearchFn``,
+    ``run_hybrid_search``, ``HybridSearchResult.voyage_tokens_consumed``)
+    is caught by CI rather than only on a live run.
 
-    Both adapters report token usage into ``cost`` so the ceiling check
-    sees real spend. The hybrid adapter wires Voyage embed + rerank; the
-    FTS-only adapter wraps the Epic 06 ``lcm_grep`` FTS5 path and spends
-    no API budget.
+    The hybrid adapter wires Voyage embed + rerank via
+    :func:`~lossless_hermes.embeddings.hybrid_search.run_hybrid_search`
+    and records its measured Voyage spend into ``cost``; the FTS-only
+    adapter runs the FTS5 store directly and spends no API budget.
+
+    Args:
+        db: The open eval-baseline SQLite connection.
+        voyage: A constructed :class:`VoyageClient`. Caller owns the
+            lifecycle (``aclose``).
+        cost: The run's :class:`CostMeter` — the hybrid adapter adds the
+            real Voyage token spend reported by ``run_hybrid_search``.
+
+    Returns:
+        ``(fts_only_adapter, hybrid_adapter)``.
     """
-    from lossless_hermes.embeddings.hybrid_search import FtsHit, run_hybrid_search
-    from lossless_hermes.voyage import VoyageClient
-
-    voyage = VoyageClient(api_key=voyage_api_key)
-
-    def _fts_search(query: str, *, limit: int, **_filters: object) -> object:
-        # Epic 06's lcm_grep glue produces the FtsHit list from the FTS5
-        # store. Imported lazily so a pre-Epic-06 checkout still imports
-        # this module.
-        from lossless_hermes.tools.grep import fts_search_summaries  # type: ignore[attr-defined]
-
-        return fts_search_summaries(db, query=query, limit=limit)
+    fts_search: FtsSearchFn = _build_fts_search(db)
 
     class _FtsOnlyAdapter:
         async def search(self, query: QueryRecord) -> list[str]:
-            hits = await _fts_search(query.query_text, limit=50)
-            return [h.summary_id for h in hits]  # type: ignore[attr-defined]
+            hits = await fts_search(query.query_text, limit=50)
+            return [h.summary_id for h in hits]
 
     class _HybridAdapter:
         async def search(self, query: QueryRecord) -> list[str]:
             result = await run_hybrid_search(
                 db,
                 query=query.query_text,
-                fts_search=_fts_search,  # type: ignore[arg-type]
+                fts_search=fts_search,
                 voyage=voyage,
                 rerank=True,
             )
-            # run_hybrid_search consumes Voyage embed + rerank tokens; the
-            # token totals are surfaced on the result for the cost meter.
-            embed_tokens = getattr(result, "embed_tokens", 0) or 0
-            rerank_tokens = getattr(result, "rerank_tokens", 0) or 0
-            cost.add_voyage(int(embed_tokens) + int(rerank_tokens))
+            # HybridSearchResult.voyage_tokens_consumed is the COMPLETE
+            # Voyage spend for the call: run_hybrid_search sums the
+            # semantic-arm query-embed tokens AND the rerank-call tokens
+            # into this single field (hybrid_search.py lines 554 + 693).
+            # There is no separate embed_tokens / rerank_tokens field —
+            # accounting must read voyage_tokens_consumed or the hybrid
+            # arm's cost records as $0 and the ceiling guardrail is moot.
+            cost.add_voyage(result.voyage_tokens_consumed)
             return [h.summary_id for h in result.hits]
 
-    _ = FtsHit  # imported for the type the lcm_grep glue returns
     return _FtsOnlyAdapter(), _HybridAdapter()
 
 
@@ -681,10 +668,11 @@ def _run_live(  # pragma: no cover - live only
     :func:`run_mode`, :func:`per_stratum_drift`, :func:`build_*_markdown`,
     :class:`CostMeter`, and the cost-ceiling / pass-fail logic directly.
     """
+    import asyncio
+
     from lossless_hermes.db.connection import open_lcm_db
     from lossless_hermes.db.migration import run_lcm_migrations
-    from lossless_hermes.embeddings.backfill import tick_embedding_backfill  # noqa: F401
-    from lossless_hermes.voyage import VoyageClient
+    from lossless_hermes.embeddings.backfill import tick_embedding_backfill
 
     voyage_api_key = os.environ["VOYAGE_API_KEY"]
     cost = CostMeter()
@@ -708,8 +696,6 @@ def _run_live(  # pragma: no cover - live only
         # no docs remain pending; one VoyageClient is shared for the run.
         backfill_voyage = VoyageClient(api_key=voyage_api_key)
         try:
-            import asyncio
-
             while True:
                 result = asyncio.run(
                     tick_embedding_backfill(
@@ -725,14 +711,20 @@ def _run_live(  # pragma: no cover - live only
         finally:
             asyncio.run(backfill_voyage.aclose())
 
-        fts_adapter, hybrid_adapter = _build_live_adapters(db, voyage_api_key, cost)
+        # One VoyageClient for the eval arms (hybrid embed + rerank). The
+        # hybrid adapter records its measured Voyage spend into `cost`.
+        eval_voyage = VoyageClient(api_key=voyage_api_key)
+        try:
+            fts_adapter, hybrid_adapter = _build_live_adapters(db, eval_voyage, cost)
 
-        fts_result = run_mode(
-            db, mode="fts_only", queries=queries, adapter=fts_adapter, query_set=query_set
-        )
-        hybrid_result = run_mode(
-            db, mode="hybrid", queries=queries, adapter=hybrid_adapter, query_set=query_set
-        )
+            fts_result = run_mode(
+                db, mode="fts_only", queries=queries, adapter=fts_adapter, query_set=query_set
+            )
+            hybrid_result = run_mode(
+                db, mode="hybrid", queries=queries, adapter=hybrid_adapter, query_set=query_set
+            )
+        finally:
+            asyncio.run(eval_voyage.aclose())
 
         # Cost guardrail — abort before the run is considered final if the
         # measured spend blew the ceiling. (record_eval_run already ran per
@@ -861,17 +853,6 @@ def _api_keys_present(env: dict[str, str]) -> bool:
         if not bool(env.get(name, "").strip()):
             return False
     return True
-
-
-def _missing_api_keys(env: dict[str, str]) -> list[str]:
-    """Return the names of the required API keys that are absent/blank.
-
-    Thin diagnostic wrapper over :func:`_api_keys_present`, kept for
-    tests and for callers that want the specific missing names. The
-    returned list contains only entries of :data:`REQUIRED_API_KEYS`
-    (literal key *names*), never secret values.
-    """
-    return [name for name in REQUIRED_API_KEYS if not bool(env.get(name, "").strip())]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

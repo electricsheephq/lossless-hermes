@@ -70,7 +70,7 @@ def main() -> int:
 
     # Try to import Python migrations.
     try:
-        from lossless_hermes.db.migration import run_lcm_migrations  # type: ignore
+        from lossless_hermes.db.migration import run_lcm_migrations
     except ImportError:
         print(
             "extract_python_schema: lossless_hermes.db.migration.run_lcm_migrations not yet available.\n"
