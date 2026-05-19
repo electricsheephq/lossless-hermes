@@ -74,6 +74,7 @@ import json
 import logging
 import re
 import sqlite3
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -553,6 +554,10 @@ class _IngestMixin:
         ignore_session_patterns: List[re.Pattern[str]]
         stateless_session_patterns: List[re.Pattern[str]]
         config: Any  # LcmConfig — avoid the circular import for ty
+        # ``hermes_home`` is owned by the shell class (LCMEngine.__init__).
+        # Declared here so the issue #131 ingest-guard helper
+        # :meth:`_large_files_dir` resolves it under the type-checker.
+        hermes_home: Path
 
     # ------------------------------------------------------------------
     # Gate helpers — match TS engine.ts:1932-1959
@@ -1114,6 +1119,101 @@ class _IngestMixin:
             )
 
     # ------------------------------------------------------------------
+    # Ingest-time storage-boundary guard — issue #131 (v0.2.0)
+    # ------------------------------------------------------------------
+
+    def _large_files_dir(self) -> Path:
+        """Return the base directory for externalized large-file blobs.
+
+        Issue #131. Resolves to a ``large-files`` directory that is a
+        **sibling** of ``lcm.db``: for the canonical ADR-002 layout that
+        is ``$HERMES_HOME/lossless-hermes/large-files/``; when an operator
+        overrides ``config.database_path`` the blobs follow the DB so the
+        two never split across filesystems. Mirrors the
+        :class:`~lossless_hermes.large_files.LargeFileManager` docstring's
+        on-disk layout and the TS ``largeFilesDirForConversation`` path
+        shape (``engine.ts:3805-3807``).
+
+        The directory is NOT created here —
+        :meth:`LargeFileManager.externalize_block` creates it (and the
+        per-conversation subdirectory) lazily on first write.
+        """
+        configured = (getattr(self.config, "database_path", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser().parent / "large-files"
+        return Path(self.hermes_home) / "lossless-hermes" / "large-files"
+
+    def _apply_ingest_payload_guard(
+        self,
+        *,
+        message: Dict[str, Any],
+        conversation_id: int,
+    ) -> Dict[str, Any]:
+        """Externalize oversized base64/media payloads before the DB write.
+
+        Issue #131. Runs the :mod:`~lossless_hermes.engine.ingest_guard`
+        storage-boundary guard over one message: any inline ``data:``
+        base64 URI or long stand-alone base64 run is moved out to the
+        :class:`~lossless_hermes.large_files.LargeFileManager` disk +
+        ``large_files``-table sidecar, and replaced inline with a compact
+        ``[LCM Raw Payload: ...]`` placeholder. Returns the protected copy
+        of ``message`` — when nothing matches, that copy is structurally
+        identical to the input.
+
+        Wired into :meth:`_ingest_single` immediately after the
+        conversation row is resolved (the guard needs ``conversation_id``
+        for the ``large_files`` FK) and before content extraction, so
+        ``messages.content``, the ``messages_fts`` shadow, the WAL, and
+        every backup store the placeholder rather than the raw payload.
+
+        **Non-blocking contract.** The guard itself never raises into the
+        ingest path: :func:`ingest_guard.protect_message_for_ingest`
+        swallows per-payload externalization failures. As a final
+        belt-and-suspenders layer this method also catches any unexpected
+        error, logs it, and returns the **original** ``message`` so a
+        guard fault degrades to "raw payload persisted" (a hygiene
+        regression) rather than aborting the ingest (data loss).
+
+        Args:
+            message: The raw message dict from ``conversation_history``.
+            conversation_id: The owning conversation's PK.
+
+        Returns:
+            The guard-protected message copy, or — if the guard raised
+            unexpectedly — the unmodified input ``message``.
+        """
+        if self._db is None:
+            # Defense in depth — :meth:`_ingest_single` only reaches here
+            # with the stores wired, which implies an open ``_db``. If a
+            # teardown race nulled it, skip the guard rather than crash.
+            return message
+        try:
+            # Deferred import: keeps the engine-init import graph flat
+            # (ingest_guard pulls in large_files) and matches the
+            # deferred-import idiom already used for the stores below.
+            from lossless_hermes.engine.ingest_guard import (
+                protect_message_for_ingest,
+            )
+            from lossless_hermes.large_files import LargeFileManager
+
+            manager = LargeFileManager(self._db, self._large_files_dir())
+            return protect_message_for_ingest(
+                message,
+                manager=manager,
+                conversation_id=conversation_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — non-blocking guard contract
+            logger.warning(
+                "[lcm] ingest payload guard raised for conversation_id=%s "
+                "(%s); persisting message unguarded (raw payload may land "
+                "inline — storage hygiene regression, not data loss)",
+                conversation_id,
+                exc,
+                exc_info=True,
+            )
+            return message
+
+    # ------------------------------------------------------------------
     # _ingest_batch / _ingest_single — TS engine.ts:5899-6134 port
     # ------------------------------------------------------------------
 
@@ -1231,14 +1331,6 @@ class _IngestMixin:
             )
             return False
 
-        # Compute the storage triple: db_role / fallback content /
-        # token_count. Done OUTSIDE the transaction so a malformed
-        # message that explodes during content extraction does not
-        # leave the DB partially written.
-        db_role = _to_db_role(message.get("role"))
-        fallback_content = _extract_message_content(message.get("content"))
-        token_count = _estimate_tokens(fallback_content)
-
         # Get-or-create the conversation row. NOT wrapped in
         # :meth:`with_transaction` because the store's own create path
         # has UNIQUE-race recovery (TS engine.ts:5943-5946 — the row
@@ -1260,6 +1352,34 @@ class _IngestMixin:
             )
         conversation = store.get_or_create_conversation(session_id, session_key=session_key)
         conversation_id = conversation.conversation_id
+
+        # Issue #131: ingest-time storage-boundary guard. Externalize any
+        # inline ``data:`` base64 URI or long stand-alone base64 run
+        # BEFORE the message reaches the DB transaction below — otherwise
+        # a ``data:image/...;base64,<huge>`` payload lands raw in
+        # ``messages.content``, the ``messages_fts`` shadow, the WAL, and
+        # every ``db_backup`` copy. Mirrors the interception passes
+        # lossless-claw runs in ``ingestSingle`` before its DB write
+        # (``engine.ts:5950-6022``); reimplemented from
+        # ``hermes-lcm/ingest_protection.py:419-496``. The guard needs the
+        # ``conversation_id`` for the ``large_files`` FK, so it runs here
+        # — after the conversation is resolved, before content extraction.
+        # Non-blocking: a failed externalization leaves the inline payload
+        # untouched (losslessness is never sacrificed to the guard).
+        message = self._apply_ingest_payload_guard(
+            message=message,
+            conversation_id=conversation_id,
+        )
+
+        # Compute the storage triple: db_role / fallback content /
+        # token_count. Done OUTSIDE the transaction so a malformed
+        # message that explodes during content extraction does not
+        # leave the DB partially written. Computed from the
+        # guard-protected ``message`` so ``messages.content`` + the FTS
+        # shadow store the compact placeholder, not the raw payload.
+        db_role = _to_db_role(message.get("role"))
+        fallback_content = _extract_message_content(message.get("content"))
+        token_count = _estimate_tokens(fallback_content)
 
         parts = _build_message_parts(
             session_id=session_id,
