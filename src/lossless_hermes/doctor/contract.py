@@ -56,6 +56,20 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Literal alias for the three cleaner ids — ports the TS ``DoctorCleanerId``
+# union (``lcm-doctor-cleaners.ts:5-8``). Defined at module level (not nested)
+# so both :mod:`lossless_hermes.doctor.cleaners` and any future CLI-render
+# layer can annotate against it.
+DoctorCleanerId = Literal["archived_subagents", "cron_sessions", "null_subagent_context"]
+"""The three predefined doctor cleaner identifiers.
+
+Ports TS ``DoctorCleanerId`` (``lcm-doctor-cleaners.ts:5-8``). The order
+``archived_subagents`` → ``cron_sessions`` → ``null_subagent_context``
+matches the ``CLEANER_DEFINITIONS`` array in the TS source and is the
+order :func:`lossless_hermes.doctor.cleaners.get_doctor_cleaner_filters`
+returns."""
+
+
 __all__ = [
     "FALLBACK_SUMMARY_MARKER",
     "FALLBACK_SUMMARY_MARKER_V41_FULL",
@@ -63,6 +77,12 @@ __all__ = [
     "FALLBACK_SUMMARY_WINDOW",
     "TRUNCATED_SUMMARY_PREFIX",
     "TRUNCATED_SUMMARY_WINDOW",
+    "DoctorCleanerApplyResult",
+    "DoctorCleanerExample",
+    "DoctorCleanerFilter",
+    "DoctorCleanerFilterStat",
+    "DoctorCleanerId",
+    "DoctorCleanerScan",
     "DoctorConversationCounts",
     "DoctorMarkerKind",
     "DoctorSummaryCandidate",
@@ -284,3 +304,175 @@ class DoctorTargetRecord(BaseModel):
     in content), so a row may match INSTR but not actually have a marker
     in a load-bearing position. Re-classification yields the precise kind
     or filters the row out entirely (returns :data:`None`)."""
+
+
+# ---------------------------------------------------------------------------
+# Cleaner contract surface — ports ``lcm-doctor-cleaners.ts`` exported types
+# ---------------------------------------------------------------------------
+#
+# These models back the DB-wide row-deletion path of ``/lcm doctor clean``
+# and ``/lcm doctor clean apply``. Consumed by
+# :mod:`lossless_hermes.doctor.cleaners` (issue 08-08). See
+# ``epics/08-cli-ops/08-08-doctor-cleaners.md`` for the full spec.
+
+
+class DoctorCleanerFilter(BaseModel):
+    """Static metadata for one cleaner (id + label + description).
+
+    Ports the ``Pick<DoctorCleanerFilterStat, "id" | "label" |
+    "description">`` shape returned by TS ``getDoctorCleanerFilters``
+    (``lcm-doctor-cleaners.ts:251-257``). The scan-time counts +
+    examples live on the richer :class:`DoctorCleanerFilterStat`; this
+    bare model is the "what cleaners exist" listing with no DB read.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: DoctorCleanerId
+    """The cleaner identifier (one of the three :data:`DoctorCleanerId`
+    literals)."""
+
+    label: str
+    """Human-readable cleaner name (verbatim from the TS
+    ``CleanerDefinition.label``)."""
+
+    description: str
+    """One-line description of what the cleaner detects (verbatim from
+    the TS ``CleanerDefinition.description``)."""
+
+
+class DoctorCleanerExample(BaseModel):
+    """A single example conversation surfaced by a cleaner scan.
+
+    Ports TS ``DoctorCleanerExample`` (``lcm-doctor-cleaners.ts:10-15``).
+    The scan returns up to three of these per cleaner, sorted
+    ``message_count DESC, created_at DESC, conversation_id DESC``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    conversation_id: int
+    """``conversations.conversation_id`` of the example conversation."""
+
+    session_key: str | None
+    """``conversations.session_key`` — ``None`` for the
+    ``null_subagent_context`` cleaner (which matches NULL-key rows by
+    definition)."""
+
+    message_count: int = Field(ge=0)
+    """Number of ``messages`` rows in the example conversation."""
+
+    first_message_preview: str | None
+    """Normalized preview of the conversation's earliest message
+    (whitespace collapsed, trimmed to 120 chars with a ``"..."``
+    ellipsis if longer). ``None`` when the conversation has no messages
+    or the earliest message is whitespace-only. See
+    :func:`lossless_hermes.doctor.shared.normalize_first_message_preview`."""
+
+
+class DoctorCleanerFilterStat(BaseModel):
+    """Per-cleaner scan result: metadata + counts + top-3 examples.
+
+    Ports TS ``DoctorCleanerFilterStat`` (``lcm-doctor-cleaners.ts:17-24``).
+    Returned (one per selected cleaner) inside :class:`DoctorCleanerScan`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: DoctorCleanerId
+    """The cleaner identifier."""
+
+    label: str
+    """Human-readable cleaner name."""
+
+    description: str
+    """One-line description of what the cleaner detects."""
+
+    conversation_count: int = Field(ge=0)
+    """How many conversations this cleaner would delete."""
+
+    message_count: int = Field(ge=0)
+    """How many ``messages`` rows belong to those conversations (the
+    sum of per-conversation message counts)."""
+
+    examples: list[DoctorCleanerExample] = Field(default_factory=list)
+    """Up to three example conversations, sorted ``message_count DESC,
+    created_at DESC, conversation_id DESC`` (deterministic)."""
+
+
+class DoctorCleanerScan(BaseModel):
+    """Aggregate result of a doctor-cleaner scan (dry run).
+
+    Ports TS ``DoctorCleanerScan`` (``lcm-doctor-cleaners.ts:26-30``).
+    The ``total_distinct_*`` fields deduplicate conversations that match
+    more than one cleaner (so the totals are never an over-count).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    filters: list[DoctorCleanerFilterStat] = Field(default_factory=list)
+    """Per-cleaner stats, in the order the cleaners were requested (or
+    the canonical three-cleaner order when no filter is passed)."""
+
+    total_distinct_conversations: int = Field(default=0, ge=0)
+    """Count of DISTINCT conversations matched across all selected
+    cleaners. Lower than ``sum(f.conversation_count)`` when a
+    conversation matches two cleaners."""
+
+    total_distinct_messages: int = Field(default=0, ge=0)
+    """Count of ``messages`` rows belonging to the distinct matched
+    conversations."""
+
+
+class DoctorCleanerApplyResult(BaseModel):
+    """Result of :func:`lossless_hermes.doctor.cleaners.apply_doctor_cleaners`.
+
+    Ports the TS ``DoctorCleanerApplyResult`` discriminated union
+    (``lcm-doctor-cleaners.ts:32-44``). TS models the two arms as a true
+    union; the Python port collapses them into one model discriminated
+    by :attr:`kind` (matching the spec's ``class
+    DoctorCleanerApplyResult(BaseModel)`` shape with a
+    ``Literal["applied", "unavailable"]`` discriminator).
+
+    * ``kind="applied"`` — the cleaners ran. :attr:`filter_ids`,
+      :attr:`deleted_conversations`, :attr:`deleted_messages`,
+      :attr:`vacuumed`, :attr:`backup_path` are meaningful;
+      :attr:`reason` is :data:`None`.
+    * ``kind="unavailable"`` — the cleaners did NOT run (in-memory DB,
+      no valid filters, or backup path could not be built).
+      :attr:`reason` carries the human-readable explanation; the count
+      fields stay at their ``0`` / ``False`` / ``""`` defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["applied", "unavailable"]
+    """Discriminator. ``"applied"`` when the cleaner cascade ran;
+    ``"unavailable"`` when it was refused before any mutation."""
+
+    filter_ids: list[DoctorCleanerId] = Field(default_factory=list)
+    """The cleaner ids that were applied, in canonical order. Empty on
+    the ``"unavailable"`` arm."""
+
+    deleted_conversations: int = Field(default=0, ge=0)
+    """How many ``conversations`` rows were deleted (``0`` on a no-op
+    apply or the ``"unavailable"`` arm)."""
+
+    deleted_messages: int = Field(default=0, ge=0)
+    """How many ``messages`` rows belonged to the deleted conversations
+    (counted from the staged temp table BEFORE the cascade DELETEs; the
+    ``messages`` rows themselves are removed by the ``ON DELETE
+    CASCADE`` on ``messages.conversation_id``)."""
+
+    vacuumed: bool = False
+    """``True`` only when ``vacuum=True`` was requested AND
+    :attr:`deleted_conversations` ``> 0`` (a no-op apply skips VACUUM so
+    it stays cheap)."""
+
+    backup_path: str = ""
+    """Absolute path of the backup file written BEFORE the destructive
+    transaction. Empty string on the ``"unavailable"`` arm."""
+
+    reason: str | None = None
+    """Set ONLY on the ``"unavailable"`` arm — the human-readable reason
+    the cleaners were refused. :data:`None` on the ``"applied"`` arm."""

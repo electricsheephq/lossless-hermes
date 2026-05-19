@@ -77,10 +77,96 @@ from lossless_hermes.doctor.contract import (
 )
 
 __all__ = [
+    "FIRST_MESSAGE_PREVIEW_LIMIT",
+    "FIRST_MESSAGE_PREVIEW_TRIM",
     "detect_doctor_marker",
     "get_doctor_summary_stats",
     "load_doctor_targets",
+    "normalize_first_message_preview",
 ]
+
+
+# ---------------------------------------------------------------------------
+# First-message preview normalization (shared by cleaners + reconcile-list)
+# ---------------------------------------------------------------------------
+
+FIRST_MESSAGE_PREVIEW_LIMIT = 256
+"""Raw-content prefix length read from ``messages.content`` BEFORE
+normalization. Ports the TS ``SCAN_FIRST_MESSAGE_PREVIEW_LIMIT`` constant
+(``lcm-doctor-cleaners.ts:69``). The cleaner SQL applies ``substr(content,
+1, 256)`` at query time; :func:`normalize_first_message_preview` then
+collapses whitespace and trims to :data:`FIRST_MESSAGE_PREVIEW_TRIM`. The
+256-char SQL prefix bounds how much content the window-function query
+materializes per conversation."""
+
+FIRST_MESSAGE_PREVIEW_TRIM = 120
+"""Final display length of a normalized preview. Ports the ``120`` literal
+in the TS ``truncatePreview`` helper (``lcm-doctor-cleaners.ts:118``).
+Previews longer than this are cut to ``117`` chars + a ``"..."`` ellipsis
+(``117 + 3 == 120`` — the ellipsis is inside the budget, not appended past
+it)."""
+
+_PREVIEW_ELLIPSIS = "..."
+"""Three-character ellipsis appended when a normalized preview exceeds
+:data:`FIRST_MESSAGE_PREVIEW_TRIM`. Spelled with literal dots (not the
+U+2026 single-glyph ellipsis) to byte-match the TS source."""
+
+
+def normalize_first_message_preview(value: str | None) -> Optional[str]:
+    """Normalize a raw ``messages.content`` prefix into a display preview.
+
+    Ports the TS ``truncatePreview`` helper (``lcm-doctor-cleaners.ts:110-119``).
+    This is the single shared normalizer the issue 08-08 spec mandates —
+    consumed by :func:`lossless_hermes.doctor.cleaners.scan_doctor_cleaners`
+    (the ``null_subagent_context`` example previews) and intended for the
+    08-05 reconcile-candidate listing (one helper, multiple consumers, per
+    ``epics/08-cli-ops/08-08-doctor-cleaners.md`` AC "First-message preview
+    normalization is shared with 08-05's reconcile-list").
+
+    Algorithm (byte-for-byte port of the TS):
+
+    1. ``None`` / empty input → ``None``.
+    2. Collapse every run of Unicode whitespace to a single ASCII space
+       (TS ``value.replace(/\\s+/g, " ")``), then strip leading/trailing
+       whitespace (TS ``.trim()``).
+    3. If the collapsed string is now empty → ``None`` (the content was
+       all whitespace).
+    4. If the collapsed string is at most :data:`FIRST_MESSAGE_PREVIEW_TRIM`
+       characters → return it unchanged.
+    5. Otherwise return the first ``FIRST_MESSAGE_PREVIEW_TRIM - 3`` (=117)
+       characters plus a literal ``"..."`` — total length exactly
+       :data:`FIRST_MESSAGE_PREVIEW_TRIM`.
+
+    ### Whitespace-class parity note
+
+    The TS regex ``\\s`` matches the JavaScript whitespace class. Python's
+    :py:meth:`str.split` (no-arg) splits on the Python whitespace class.
+    The two classes are not perfectly identical at the margins (e.g. the
+    zero-width characters), but both cover the common cases — ASCII space,
+    tab, newline, carriage return, form feed, vertical tab — that real
+    message content carries. ``" ".join(value.split())`` is the canonical
+    Python whitespace-collapse-and-trim idiom and is what the port uses.
+
+    Args:
+        value: A raw content string (typically already truncated to the
+            256-char SQL prefix). May be :data:`None`.
+
+    Returns:
+        The normalized, length-bounded preview string, or :data:`None`
+        when the input is empty / whitespace-only.
+    """
+    if not value:
+        return None
+    # Collapse all whitespace runs to a single space AND trim — the
+    # no-arg ``str.split`` discards leading/trailing whitespace and
+    # splits on any whitespace run, so ``" ".join(...)`` reconstructs
+    # the TS ``replace(/\s+/g, " ").trim()`` result exactly.
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    if len(normalized) <= FIRST_MESSAGE_PREVIEW_TRIM:
+        return normalized
+    return normalized[: FIRST_MESSAGE_PREVIEW_TRIM - len(_PREVIEW_ELLIPSIS)] + _PREVIEW_ELLIPSIS
 
 
 # ---------------------------------------------------------------------------
