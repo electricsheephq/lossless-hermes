@@ -100,20 +100,34 @@ def test_tool_dispatch_is_dict() -> None:
     assert isinstance(TOOL_DISPATCH, dict)
 
 
-def test_tool_dispatch_holds_only_adr035_diagnostic_tools() -> None:
-    """The registry holds exactly the two ADR-035 diagnostic tools.
+def test_tool_dispatch_holds_diagnostic_and_pr1_adapted_tools() -> None:
+    """The registry holds the ADR-035 diagnostics + the #156 PR-1 adapters.
 
-    The seven ported ``lcm_*`` tools' dispatch wiring still has not
-    landed (per-tool dispatch issues 06-07..06-14 register
-    ``handle_lcm_<tool>`` — none has). The only entries are the two
-    read-only model-callable diagnostic tools added by ADR-035 (issue
-    #135): ``lcm_status`` and ``lcm_doctor``. Any other entry would
-    mean a per-tool issue landed before its prerequisites — fail fast.
+    The dispatch-adapter layer (issue #156) wires the ported ``lcm_*``
+    tools incrementally. After #156 PR-1 the registry holds:
+
+    * the two read-only model-callable diagnostic tools added by ADR-035
+      (issue #135): ``lcm_status`` / ``lcm_doctor``;
+    * the four Tier-1/2 tools wired by #156 PR-1: ``lcm_get_entity``,
+      ``lcm_search_entities``, ``lcm_describe``, ``lcm_grep``.
+
+    ``lcm_compact`` / ``lcm_synthesize_around`` are still absent (they
+    land in #156 PR-2 / PR-3) and ``lcm_expand`` is deferred per
+    ADR-037. Any other entry — or a PR-2/PR-3 tool appearing early —
+    means a tool was wired before its prerequisites; fail fast.
     """
-    assert set(TOOL_DISPATCH) == {"lcm_status", "lcm_doctor"}, (
-        f"TOOL_DISPATCH should hold exactly the two ADR-035 diagnostic "
-        f"tools (lcm_status, lcm_doctor); the seven ported tools' "
-        f"dispatch wiring lands in 06-07..06-14. Got {sorted(TOOL_DISPATCH)}"
+    assert set(TOOL_DISPATCH) == {
+        "lcm_status",
+        "lcm_doctor",
+        "lcm_get_entity",
+        "lcm_search_entities",
+        "lcm_describe",
+        "lcm_grep",
+    }, (
+        "TOOL_DISPATCH should hold the two ADR-035 diagnostic tools plus "
+        "the four #156 PR-1 adapters (lcm_get_entity, lcm_search_entities, "
+        "lcm_describe, lcm_grep); lcm_compact / lcm_synthesize_around land "
+        f"in #156 PR-2 / PR-3. Got {sorted(TOOL_DISPATCH)}"
     )
 
 

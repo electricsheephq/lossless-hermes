@@ -339,15 +339,19 @@ def test_handle_tool_call_returns_json_error_for_unknown_name() -> None:
 
     Was a ``NotImplementedError`` raise at 02-01 / 03-03 (Epic 06
     pointer). Issue 06-02 lifted the body to the real dispatch table;
-    unknown names now return ``{"error": "Unknown LCM tool: ..."}``
-    per spec — Hermes wraps caller-side failures in its own JSON
-    envelope, so the refusal shape is canonical.
+    unknown names return ``{"error": "Unknown LCM tool: ..."}`` per
+    spec — Hermes wraps caller-side failures in its own JSON envelope,
+    so the refusal shape is canonical.
+
+    Note: the ported ``lcm_*`` tools (``lcm_grep`` etc.) ARE registered
+    after #156 PR-1 — this test uses a genuinely unregistered name to
+    exercise the ``handler is None`` branch.
     """
     import json as _json
 
     engine = LCMEngine()
-    result = engine.handle_tool_call("lcm_grep", {"pattern": "foo"})
-    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
+    result = engine.handle_tool_call("lcm_not_a_real_tool", {"pattern": "foo"})
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_not_a_real_tool"}
 
 
 def test_handle_tool_call_includes_name_in_error_payload() -> None:
@@ -355,8 +359,8 @@ def test_handle_tool_call_includes_name_in_error_payload() -> None:
     import json as _json
 
     engine = LCMEngine()
-    result = engine.handle_tool_call("lcm_grep", {})
-    assert _json.loads(result)["error"] == "Unknown LCM tool: lcm_grep"
+    result = engine.handle_tool_call("lcm_not_a_real_tool", {})
+    assert _json.loads(result)["error"] == "Unknown LCM tool: lcm_not_a_real_tool"
 
 
 # ---------------------------------------------------------------------------
