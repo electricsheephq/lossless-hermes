@@ -129,7 +129,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Final, Optional, Protocol
 
 from lossless_hermes.store.conversation import ConversationStore
-from lossless_hermes.tools import TOOL_SCHEMAS
+
+# NOTE: ``lossless_hermes.tools.TOOL_SCHEMAS`` is intentionally NOT
+# imported here. Per ADR-037 (issue #156) ``lcm_expand`` is deferred —
+# its schema is not registered. The other six ported tool modules still
+# ``from lossless_hermes.tools import TOOL_SCHEMAS`` and append; this
+# module deliberately does not. Future un-deferral re-adds the import +
+# the ``TOOL_SCHEMAS.append(LCM_EXPAND_SCHEMA)`` call below.
 from lossless_hermes.tools._common import (
     read_bool_param,
     read_string_param,
@@ -246,11 +252,30 @@ every field — the schema-validator doesn't enforce the
 "at-least-one-of" constraint; the handler does."""
 
 
-# Register at module import time per the TOOL_SCHEMAS contract documented
-# in tools/__init__.py. The 06-02 dispatch table reads via
-# ``get_tool_schemas()`` so this side-effect is what makes the tool
-# discoverable to the LCMEngine.
-TOOL_SCHEMAS.append(LCM_EXPAND_SCHEMA)
+# ADR-037 / issue #156: ``lcm_expand`` is DEFERRED to post-v0.2.0 — its
+# schema is intentionally NOT registered in ``TOOL_SCHEMAS``.
+#
+# The other six ported tools register here at module import time per
+# the TOOL_SCHEMAS contract documented in tools/__init__.py. ``lcm_expand``
+# deliberately does NOT — the line that *would* go here is:
+#
+#     from lossless_hermes.tools import TOOL_SCHEMAS
+#     TOOL_SCHEMAS.append(LCM_EXPAND_SCHEMA)
+#
+# ``LCM_EXPAND_SCHEMA`` above is retained for the future port, but the
+# tool is NOT advertised to the model. ``lcm_expand``'s context
+# collaborators — ``ExpansionOrchestrator``, ``Retrieval``, and the
+# grant ledger (``expansion_auth``) — are Protocol-only with no
+# production implementation in ``src/``; wiring it would require
+# porting ~1,175 LOC of unported TS (a multi-issue epic, not a
+# dispatch-adapter PR). The tool is also operationally dead without the
+# ADR-012-deferred sub-agent delegation path (it refuses all main-agent
+# calls). Advertising an unusable tool is the very #156 bug, so the
+# registration is removed until the deferral epic lands.
+#
+# ``handle_lcm_expand`` (below) and this whole module are deliberately
+# kept — only the ``TOOL_SCHEMAS.append(...)`` advertisement is removed.
+# See ``docs/adr/037-lcm-expand-deferred.md`` for the full record.
 
 
 # ===========================================================================

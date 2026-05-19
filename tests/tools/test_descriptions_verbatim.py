@@ -60,15 +60,16 @@ Test taxonomy
   fixture[name]`` byte-identical. Failure prints a ``difflib.unified_diff``
   so the reviewer can read the prose-level delta.
 * :func:`test_no_extra_tools_registered` — the set of registered
-  names is a subset of the expected set: the seven ported tools
-  (``lcm_grep``, ``lcm_describe``, ``lcm_expand``,
-  ``lcm_synthesize_around``, ``lcm_get_entity``, ``lcm_search_entities``,
-  ``lcm_compact``) plus the two ADR-035 diagnostic tools (``lcm_status``,
-  ``lcm_doctor``). ``lcm_expand_query`` is in the fixture for
-  completeness but is not registered (ADR-012 defers the sub-agent).
+  names is a subset of the expected set: the six registered ported
+  tools (``lcm_grep``, ``lcm_describe``, ``lcm_synthesize_around``,
+  ``lcm_get_entity``, ``lcm_search_entities``, ``lcm_compact``) plus
+  the two ADR-035 diagnostic tools (``lcm_status``, ``lcm_doctor``).
+  ``lcm_expand_query`` (ADR-012) and ``lcm_expand`` (ADR-037, issue
+  #156) are in the fixture for completeness but are not registered —
+  both are deferred.
 * :func:`test_no_missing_tools_registered` — the set of expected tools
   is a subset of the registered set. Together with the no-extras
-  assertion, this pins the registry to the exact nine-tool surface.
+  assertion, this pins the registry to the exact eight-tool surface.
 * :func:`test_fixture_provenance_matches_source_pin` — the
   ``_provenance`` field in the fixture must match the canonical LCM
   source pin recorded in
@@ -145,17 +146,27 @@ def _load_fixture() -> dict[str, Any]:
 
 _FIXTURE: Final[dict[str, Any]] = _load_fixture()
 
-# The model-facing tool surface. Seven tools are ports of the LCM TS
-# tool factories; ``lcm_expand_query`` is in the fixture (for parity
-# with the TS surface and to make future un-deferral mechanical) but is
-# excluded here — per ADR-012 the sub-agent is deferred. Two more —
-# ``lcm_status`` and ``lcm_doctor`` — are read-only model-callable
-# diagnostic tools added by ADR-035 (issue #135); they have no TS
-# source but are pinned the same way (see the fixture's ``_adr035_note``).
+# The model-facing tool surface. Six tools are ports of the LCM TS
+# tool factories that are *registered*. Two TS-ported tools are in the
+# fixture (for parity with the TS surface and to make future
+# un-deferral mechanical) but are NOT registered, so they are excluded
+# here:
+#   * ``lcm_expand_query`` — the sub-agent is deferred per ADR-012.
+#   * ``lcm_expand`` — DEFERRED to post-v0.2.0 per ADR-037 (issue #156):
+#     its ``ExpansionOrchestrator`` / ``Retrieval`` / grant-ledger
+#     collaborators are Protocol-only with no production impl in
+#     ``src/`` (~1,175 LOC of unported TS), and it is operationally
+#     dead without the ADR-012-deferred delegation path. The
+#     ``LCM_EXPAND_SCHEMA`` is no longer appended to ``TOOL_SCHEMAS``;
+#     the fixture entry + its SHA-256 lock are retained (the fixture is
+#     the TS-source snapshot, untouched by the deferral).
+# Two more — ``lcm_status`` and ``lcm_doctor`` — are read-only
+# model-callable diagnostic tools added by ADR-035 (issue #135); they
+# have no TS source but are pinned the same way (see the fixture's
+# ``_adr035_note``).
 _EXPECTED_TOOL_NAMES: Final[frozenset[str]] = frozenset({
     "lcm_grep",
     "lcm_describe",
-    "lcm_expand",
     "lcm_synthesize_around",
     "lcm_get_entity",
     "lcm_search_entities",
@@ -308,11 +319,13 @@ def test_no_extra_tools_registered() -> None:
 
     Per [ADR-012](../../docs/adr/012-subagent-defer.md), ``lcm_expand_query``
     is deferred — it's in the fixture (for parity) but must NOT be
-    registered. Catches accidental registration that would expose the
-    sub-agent to the model.
+    registered. Per [ADR-037](../../docs/adr/037-lcm-expand-deferred.md)
+    (issue #156), ``lcm_expand`` is likewise deferred and must NOT be
+    registered. Catches accidental registration that would expose a
+    non-functional tool to the model.
 
-    The expected set is the seven ported ``lcm_*`` tools plus the two
-    ADR-035 diagnostic tools (``lcm_status`` / ``lcm_doctor``).
+    The expected set is the six registered ported ``lcm_*`` tools plus
+    the two ADR-035 diagnostic tools (``lcm_status`` / ``lcm_doctor``).
     """
     registered = _registered_tool_names()
     extras = registered - _EXPECTED_TOOL_NAMES
@@ -328,8 +341,9 @@ def test_no_extra_tools_registered() -> None:
 def test_no_missing_tools_registered() -> None:
     """Every expected tool is registered.
 
-    The expected surface is the seven ported ``lcm_*`` tools plus the
-    two ADR-035 diagnostic tools. All nine register their schema at
+    The expected surface is the six registered ported ``lcm_*`` tools
+    plus the two ADR-035 diagnostic tools (``lcm_expand`` is deferred
+    per ADR-037 and excluded). All eight register their schema at
     import time, so this is a hard assertion — a missing tool is a real
     regression (a per-tool module that stopped appending to
     ``TOOL_SCHEMAS``, or an import dropped from ``tools/__init__.py``).
