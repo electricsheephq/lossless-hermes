@@ -1,10 +1,10 @@
 # ADR-001: Plugin distribution model — entry-point vs directory-mode
 
-**Status:** Accepted
+**Status:** Superseded by ADR-034
 **Date:** 2026-05-13
 **Confidence:** 95%
 **Supersedes:** —
-**Superseded by:** —
+**Superseded by:** ADR-034
 
 ## Context
 
