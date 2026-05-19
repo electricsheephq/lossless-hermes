@@ -93,7 +93,7 @@ cp ~/.openclaw/lcm.db "$HERMES_HOME/lossless-hermes/lcm.db"
 lossless-hermes import-openclaw
 ```
 
-`import-openclaw` runs the migration ladder idempotently, refuses to overwrite an existing destination without `--force`, and sample-validates `identity_hash` on migrated rows. See `lossless-hermes import-openclaw --help` for `--source`, `--force`, and `--validate-rows` options.
+`import-openclaw` runs the migration ladder idempotently, refuses to overwrite an existing destination without `--force`, and sample-validates `identity_hash` on migrated rows. See `lossless-hermes import-openclaw --help` for the `--from`, `--to`, `--force`, `--validate-rows`, and `--dry-run` options.
 
 ## Platform support
 
