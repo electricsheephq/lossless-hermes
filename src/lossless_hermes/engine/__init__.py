@@ -328,6 +328,42 @@ TOOL_DISPATCH["lcm_doctor"] = _handle_lcm_doctor
 
 
 # ---------------------------------------------------------------------------
+# Issue #156 PR-1 — dispatch adapters for the first four ported tools.
+# ---------------------------------------------------------------------------
+#
+# The ported ``lcm_*`` handlers (``handle_lcm_get_entity`` etc.) take
+# strict keyword-only typed ``ctx: XContext`` Protocols — plus, for
+# ``lcm_describe`` / ``lcm_grep``, a ``deps: LcmDependencies`` — that the
+# engine cannot satisfy directly. ``_dispatch_tool_call`` invokes every
+# registered callable as ``handler(args, **kwargs)`` with kwargs the
+# ported handlers do not declare, so a direct
+# ``TOOL_DISPATCH["lcm_grep"] = handle_lcm_grep`` would ``TypeError`` on
+# the first call (the P0 of issue #156).
+#
+# The fix is the dispatch-adapter layer in ``tools/_adapters.py``: each
+# ``_adapt_lcm_<tool>`` carries the uniform ``adapter(args, **kwargs) ->
+# str`` shape ``_dispatch_tool_call`` expects, reads the engine off
+# ``kwargs["ctx"]``, builds the tool's typed ``*Context`` (and ``deps``
+# where needed), and calls the real ``handle_lcm_<tool>``. The
+# registrations live here — the documented ``TOOL_DISPATCH`` wiring site,
+# mirroring ``lcm_status`` / ``lcm_doctor`` above.
+#
+# PR-1 wires four tools; ``lcm_compact`` / ``lcm_synthesize_around`` ship
+# in #156 PR-2 / PR-3, and ``lcm_expand`` is deferred per ADR-037.
+from lossless_hermes.tools._adapters import (
+    _adapt_lcm_describe,
+    _adapt_lcm_get_entity,
+    _adapt_lcm_grep,
+    _adapt_lcm_search_entities,
+)
+
+TOOL_DISPATCH["lcm_get_entity"] = _adapt_lcm_get_entity
+TOOL_DISPATCH["lcm_search_entities"] = _adapt_lcm_search_entities
+TOOL_DISPATCH["lcm_describe"] = _adapt_lcm_describe
+TOOL_DISPATCH["lcm_grep"] = _adapt_lcm_grep
+
+
+# ---------------------------------------------------------------------------
 # TOKEN_GATE_TOOLS is re-exported (canonical definition lives in
 # ``lossless_hermes.plugin.needs_compact_gate`` — see import block above
 # and ``__all__``). Per 06-03 (PR #95), the gate's authoritative
@@ -1159,10 +1195,15 @@ class LCMEngine(_LifecycleMixin, _CompactMixin, _AssembleMixin, _IngestMixin, Co
         Tool dispatch: per 06-02, :meth:`_dispatch_tool_call` looks up
         :data:`TOOL_DISPATCH` and returns
         ``json.dumps({"error": f"Unknown LCM tool: {name}"})`` for an
-        unregistered name. Real handlers land per-tool in 06-07..06-14.
-        The middleware wrap remains intact: the gate runs first, and if
-        the dispatch raises, the wrapper taps an error-shaped payload
-        into the token-state cache before re-raising (Wave-12 W2A1 P1).
+        unregistered name. The ported ``lcm_*`` handlers are wired via
+        the issue-#156 dispatch-adapter layer (``tools/_adapters.py``).
+        The middleware wrap remains intact: the gate runs first; per
+        issue #156 PR-0 crash-hardening, :meth:`_dispatch_tool_call`
+        converts a handler crash into a structured tool-error string
+        rather than letting it escape, and the token-gate wrapper's
+        Wave-12 W2A1 P1 throw-tap still records an error-shaped payload
+        in the token-state cache for any exception that does propagate
+        out of the gate machinery itself.
 
         **Sync, not async.** Hermes's ``run_agent.py:11249`` calls this
         method synchronously inside the tool-dispatch loop. The

@@ -138,11 +138,12 @@ _skip_no_extension_loading = pytest.mark.skipif(
 # The not-yet-adapted ratchet set
 # ---------------------------------------------------------------------------
 #
-# The six ported ``lcm_*`` tools whose dispatch-adapter has NOT landed
-# yet. PR-1..PR-3 of the #156 sequence remove tools from this set as
-# their adapters ship:
+# The ported ``lcm_*`` tools whose dispatch-adapter has NOT landed yet.
+# PR-1..PR-3 of the #156 sequence remove tools from this set as their
+# adapters ship:
 #
 #   * PR-1 → lcm_get_entity, lcm_search_entities, lcm_describe, lcm_grep
+#     (DONE — wired in PR-1, removed from this set)
 #   * PR-2 → lcm_compact
 #   * PR-3 → lcm_synthesize_around
 #
@@ -151,11 +152,13 @@ _skip_no_extension_loading = pytest.mark.skipif(
 # this set in the same PR. ``lcm_expand`` is NOT here: per ADR-037 it is
 # deferred and absent from ``get_tool_schemas()`` entirely (see
 # ``test_lcm_expand_deferred``).
+#
+# #156 PR-1 (this PR) wired the four Tier-1/2 adapters
+# (``lcm_get_entity``, ``lcm_search_entities``, ``lcm_describe``,
+# ``lcm_grep``) — they are removed from this set and now PASS (a)/(b) as
+# hard assertions. Only ``lcm_compact`` / ``lcm_synthesize_around``
+# remain here, for PR-2 / PR-3.
 _NOT_YET_ADAPTED: frozenset[str] = frozenset({
-    "lcm_grep",
-    "lcm_describe",
-    "lcm_get_entity",
-    "lcm_search_entities",
     "lcm_compact",
     "lcm_synthesize_around",
 })

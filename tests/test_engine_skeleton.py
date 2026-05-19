@@ -394,16 +394,20 @@ def test_handle_tool_call_unknown_returns_json_error() -> None:
     """Issue 06-02 lifted dispatch from the Epic-06-pointer stub to the
     real :data:`TOOL_DISPATCH` table.
 
-    Unknown tool names now return the structured JSON error string per
-    spec — handlers land in 06-07..06-14 and register into the table
-    at import time. The 02-01 ``NotImplementedError`` semantics moved
-    to "registered but unimplemented" instead of "any name raises".
+    Unknown tool names return the structured JSON error string per spec.
+    The 02-01 ``NotImplementedError`` semantics moved to "registered but
+    unimplemented" instead of "any name raises".
+
+    Note: ``lcm_grep`` and the other ported ``lcm_*`` tools ARE
+    registered after #156 PR-1 — so this test uses a genuinely
+    unregistered name (``lcm_not_a_real_tool``) to exercise the
+    ``handler is None`` unknown-tool branch specifically.
     """
     import json as _json
 
     engine = LCMEngine()
-    result = engine.handle_tool_call("lcm_grep", {})
-    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
+    result = engine.handle_tool_call("lcm_not_a_real_tool", {})
+    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_not_a_real_tool"}
 
 
 # ---------------------------------------------------------------------------

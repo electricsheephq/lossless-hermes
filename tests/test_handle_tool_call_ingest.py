@@ -417,16 +417,25 @@ def test_no_kwargs_at_all_returns_json_error(tmp_home: Path) -> None:
     """Existing 02-01 test shape — ``handle_tool_call("lcm_grep", {})``.
 
     Issue 06-02 lifted dispatch from the 03-03 ``NotImplementedError``
-    stub to the real dispatch table. ``lcm_grep`` is still unknown
-    (06-07 not yet landed) so the call returns the structured JSON
-    error string. The prelude is a no-op when ``messages`` is absent.
-    No DB open required.
+    stub to the real dispatch table. After #156 PR-1 ``lcm_grep`` IS
+    registered (its dispatch adapter landed), so the call no longer
+    returns the unknown-tool error — instead the adapter runs and, on
+    this **bare** engine (no ``on_session_start``, so ``_db is None``),
+    degrades gracefully to a structured "engine state not initialised"
+    tool-error. The invariant under test is unchanged: the call returns
+    a structured JSON error string and never raises. The prelude is a
+    no-op when ``messages`` is absent. No DB open required.
     """
     import json as _json
 
     eng = LCMEngine(hermes_home=tmp_home / ".hermes", config=LcmConfig())
     result = eng.handle_tool_call("lcm_grep", {})
-    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
+    parsed = _json.loads(result)
+    assert isinstance(parsed, dict)
+    # PR-1: lcm_grep dispatches; its adapter degrades gracefully when the
+    # engine has no DB (on_session_start was never run).
+    assert "engine state is not initialised" in parsed["error"]
+    assert not parsed["error"].startswith("Unknown LCM tool:")
 
 
 # ---------------------------------------------------------------------------
@@ -534,12 +543,16 @@ def test_prelude_with_no_stores_is_safe(tmp_home: Path) -> None:
     assert eng._conversation_store is None  # pre-condition
 
     messages = [{"role": "user", "content": "hi"}]
-    # The prelude is a no-op when stores are missing; the dispatch
-    # returns the structured JSON error (lcm_grep unknown — 06-07
-    # not yet landed). The test asserts NO unexpected exception leaks
-    # from the prelude.
+    # The prelude is a no-op when stores are missing. After #156 PR-1
+    # ``lcm_grep`` dispatches via its adapter, which (stores being
+    # ``None``) degrades gracefully to a structured "engine state not
+    # initialised" tool-error. The test asserts NO unexpected exception
+    # leaks from the prelude OR the dispatch — the result is a
+    # structured JSON error string, and the prelude recorded nothing.
     result = eng.handle_tool_call("lcm_grep", {}, messages=messages, session_id="sess-A")
-    assert _json.loads(result) == {"error": "Unknown LCM tool: lcm_grep"}
+    parsed = _json.loads(result)
+    assert isinstance(parsed, dict)
+    assert "engine state is not initialised" in parsed["error"]
     assert "sess-A" not in eng._last_seen_message_idx
 
 
