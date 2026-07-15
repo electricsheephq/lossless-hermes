@@ -1,10 +1,16 @@
 # Related work
 
+> **Historical document (repo archived 2026-07-15).** This positioning analysis predates our decision
+> to contribute LCM features directly to [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm)
+> instead of maintaining a parallel plugin. The feature gaps it describes are the ones we are now
+> upstreaming there (tracker [hermes-lcm#375](https://github.com/stephenschoettler/hermes-lcm/issues/375)).
+> Kept for engineering history; do not read it as current guidance.
+
 > **Purpose:** catalog the related-work landscape around `lossless-hermes` so the v0.1.0 README, ARCHITECTURE.md, and future reviewers see a coherent positioning story. Closes issue [#67](https://github.com/electricsheephq/lossless-hermes/issues/67).
 
 ## TL;DR
 
-`lossless-hermes` is a faithful port of the LCM v4.1 TypeScript codebase (`lossless-claw` `pr-613` @ `1f07fbd`) to a Hermes-Agent plugin. The closest neighbor is `stephenschoettler/hermes-lcm`, an independent Python plugin written from the LCM paper that ships today but covers ~50–60% of v4.1 feature surface. We differentiate on **byte-compat OpenClaw migration**, **Voyage embeddings + hybrid search** (which *targets* the +52.5pp Eva recall lift — a TS-baseline figure not yet reproduced in the Python port; see [`docs/benchmarks/voyage-recall-2026-q2.md`](./benchmarks/voyage-recall-2026-q2.md)), **Wave-N audit-fix preservation**, and **schema-diff CI** that prevents drift from the canonical LCM SQLite shape.
+`lossless-hermes` was a faithful port of the LCM v4.1 TypeScript codebase (`lossless-claw` `pr-613` @ `1f07fbd`) to a Hermes-Agent plugin. The closest neighbor is `stephenschoettler/hermes-lcm`, an independent, shipping Python plugin written from the LCM paper. This port explored **byte-compat OpenClaw migration**, **Voyage embeddings + hybrid search** (which *targeted* the +52.5pp Eva recall lift — a TS-baseline figure never reproduced in this Python port; see [`docs/benchmarks/voyage-recall-2026-q2.md`](./benchmarks/voyage-recall-2026-q2.md)), **Wave-N audit-fix preservation**, and **schema-diff CI**. Those capabilities are now being contributed upstream to `hermes-lcm` rather than shipped here.
 
 ---
 
@@ -126,11 +132,11 @@ Two-sentence form:
 
 > `lossless-hermes` is the LCM v4.1 algorithm ported verbatim from `lossless-claw` TypeScript, preserving 12 waves of audit fixes, the byte-compat OpenClaw migration path, and the full Voyage embeddings stack that *targets* a +52.5pp recall lift on the Eva benchmark (a TS-baseline figure not yet reproduced in the Python port).
 >
-> If you want a simpler shipping-today Hermes-LCM plugin without embeddings, see [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm); if you need byte-compat OpenClaw migration, the Voyage embeddings option (targeting the +52.5pp recall lift — a TS-baseline figure not yet reproduced in Python), and the audit-trail-preserving port, you want this.
+> For Lossless Context Management on Hermes, use [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm) — the shipping, actively-maintained plugin. The capabilities this port explored (OpenClaw migration, embeddings + hybrid search, the v4.1 audit-fix lineage) are being contributed there: [hermes-lcm#375](https://github.com/stephenschoettler/hermes-lcm/issues/375).
 
-Three-sentence form (for "Why not just fork hermes-lcm?" in FAQ):
+Three-sentence form (historical — for "Why not just fork hermes-lcm?" in the planned v0.1.0 FAQ):
 
-> `hermes-lcm` is a strong, independent implementation written from the LCM paper. It covers ~50–60% of LCM v4.1's surface and ships today. We chose a verbatim port from `lossless-claw` to (a) inherit the 12-wave audit-fix scar tissue that took LCM 14 weeks to earn in production, (b) preserve byte-compat with OpenClaw's `lcm.db` so existing OpenClaw users can migrate without data loss, and (c) carry over the Voyage embeddings + hybrid-search stack that hermes-lcm explicitly doesn't have. Both plugins target the same Hermes core PR #7464 plugin slot; they can coexist in the wider community and serve different user needs.
+> `hermes-lcm` is a strong, independent implementation written from the LCM paper, and it ships today. This port instead started from `lossless-claw`'s TypeScript to (a) inherit the 12-wave audit-fix scar tissue that took LCM 14 weeks to earn in production, (b) preserve byte-compat with OpenClaw's `lcm.db` for lossless migration, and (c) carry the Voyage embeddings + hybrid-search stack. In the end the better answer for the ecosystem was one plugin, not two: those capabilities are being upstreamed into `hermes-lcm` and this repository is archived.
 
 ---
 

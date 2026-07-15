@@ -5,6 +5,14 @@
 [![Python 3.11 – 3.13](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
+> [!IMPORTANT]
+> **This repository is archived (2026-07-15).** It was an exploratory verbatim port of LCM v4.1 and
+> was never run in production. Rather than maintain a parallel plugin, we now contribute LCM features
+> directly to **[stephenschoettler/hermes-lcm](https://github.com/stephenschoettler/hermes-lcm)** — the
+> shipping, actively-maintained LCM plugin for Hermes — see the porting tracker
+> [hermes-lcm#375](https://github.com/stephenschoettler/hermes-lcm/issues/375). If you want Lossless
+> Context Management for Hermes, use `hermes-lcm`.
+
 **Lossless Context Management for [Hermes-agent](https://github.com/NousResearch/hermes-agent).**
 
 > The context window stays bounded. The memory doesn't. Nothing is ever dropped.
